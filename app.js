@@ -280,12 +280,11 @@ function renderPending() {
 function navItems() {
   const r = State.profile.role;
   const items = [
-    { v: "dashboard", label: "Dashboard", icon: ICON.home }
+    { v: "dashboard", label: "Dashboard", icon: ICON.home },
+    { v: "new", label: "New Permit", icon: ICON.newdoc },
+    { v: "permits", label: "Permit Register", icon: ICON.list },
+    { v: "equipment", label: "Equipment", icon: ICON.cube }
   ];
-  // Isolators cannot raise permits, so the New Permit entry is hidden for them.
-  if (r !== "isolator") items.push({ v: "new", label: "New Permit", icon: ICON.newdoc });
-  items.push({ v: "permits", label: "Permit Register", icon: ICON.list });
-  items.push({ v: "equipment", label: "Equipment", icon: ICON.cube });
   if (r === "admin") items.push({ v: "admin", label: "Administration", icon: ICON.gear });
   return items;
 }
@@ -377,11 +376,10 @@ async function refreshPendingBadge() {
 
 /* -------------------- 5a. Dashboard -------------------- */
 async function viewDashboard(m) {
-  const canRaise = State.profile.role !== "isolator";
   m.innerHTML = `<div class="page-head"><div><div class="kick">Overview</div><h2>Welcome, ${esc(State.profile.name.split(" ")[0])}</h2></div>
-    <div class="actions">${canRaise ? `<button class="btn btn-accent" onclick="">+ New Permit</button>` : ""}</div></div>
+    <div class="actions"><button class="btn btn-accent" onclick="">+ New Permit</button></div></div>
     <div id="dash">Loading…</div>`;
-  if (canRaise) m.querySelector(".actions .btn").onclick = () => go("new");
+  m.querySelector(".actions .btn").onclick = () => go("new");
   const permits = await fetchPermits();
   const equip = await fetchEquipment();
   const isoAll = await fetchIsolations();
@@ -439,9 +437,8 @@ function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = ()
 
 /* -------------------- 5b. Permit Register -------------------- */
 async function viewPermits(m) {
-  const canRaise = State.profile.role !== "isolator";
   m.innerHTML = `<div class="page-head"><div><div class="kick">Records</div><h2>Permit Register</h2></div>
-    <div class="actions">${canRaise ? `<button class="btn btn-accent" id="np">+ New Permit</button>` : ""}</div></div>
+    <div class="actions"><button class="btn btn-accent" id="np">+ New Permit</button></div></div>
     ${tabsHtml("p")}
     <div class="filters">
       <input class="search" id="q" placeholder="Search permit no, equipment, work…">
@@ -451,7 +448,7 @@ async function viewPermits(m) {
       <select id="fDept"><option value="">All departments</option></select>
     </div>
     <div class="card pad0" id="ptable">Loading…</div>`;
-  const npBtn = $("#np"); if (npBtn) npBtn.onclick = () => go("new");
+  $("#np").onclick = () => go("new");
   bindTabs();
   $("#fType").innerHTML += State.config.permitTypes.map((t) => `<option value="${t.code}">${esc(t.name)}</option>`).join("");
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
@@ -477,7 +474,6 @@ async function viewPermits(m) {
 /* -------------------- 5c. New Permit -------------------- */
 async function viewNewPermit(m) {
   if (!State.profile.active) { m.innerHTML = `<div class="danger-box">Your account is not active yet.</div>`; return; }
-  if (State.profile.role === "isolator") { m.innerHTML = `<div class="danger-box">Isolators cannot raise permits. Your isolation tasks are shown on the Dashboard.</div>`; return; }
   const cfg = State.config;
   const equip = await fetchEquipment();
   let type = cfg.permitTypes[0];
