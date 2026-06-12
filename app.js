@@ -1322,11 +1322,13 @@ async function viewIsolationDetail(m) {
     $("[data-ok]").onclick = async () => {
       if (!$("#ckAll").checked) return toast("Tick the confirmation statement", "err");
       const pts = (iso.points || []).map((pt, i) => ({ ...pt, lockTag: $(`[data-lk="${i}"]`)?.value.trim() || pt.lockTag || "" }));
-      await updateDoc(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
-      if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
-      for (const p of attached) if (p.status === "awaitingIsolation")
-        await updateDoc(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
-      closeModal(); toast("Isolation confirmed — waiting permits activated", "ok"); go("isodetail", { id });
+      try {
+        await updateDoc(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
+        if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
+        for (const p of attached) if (p.status === "awaitingIsolation")
+          await updateDoc(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
+        closeModal(); toast("Isolation confirmed — waiting permits activated", "ok"); go("isodetail", { id });
+      } catch (e) { toast(e.message || "Could not confirm isolation", "err"); }
     };
   };
 

@@ -23,6 +23,14 @@ service cloud.firestore {
     function noUsersYet() {
       return !exists(/databases/$(database)/documents/meta/init);
     }
+    // True when the signed-in user is the isolation (or de-isolation) assignee
+    // on the given certificate — used to let an Isolator update the equipment
+    // status when confirming isolation / de-isolation.
+    function isoAssignee(isoId) {
+      let iso = get(/databases/$(database)/documents/isolations/$(isoId)).data;
+      return (iso.assignedTo != null && iso.assignedTo.uid == request.auth.uid) ||
+             (iso.removalAssignedTo != null && iso.removalAssignedTo.uid == request.auth.uid);
+    }
 
     // ---- users ----
     match /users/{uid} {
@@ -52,8 +60,15 @@ service cloud.firestore {
     // ---- equipment ----
     match /equipment/{id} {
       allow read: if signedIn();
-      // Issuer/Admin create & maintain equipment; status updates also by issuer
-      allow create, update: if canIssue() && isActive();
+      // Issuer/Admin create & maintain equipment.
+      allow create: if canIssue() && isActive();
+      // Issuer/Admin may update freely; the Isolator assigned to the item's
+      // active certificate may also update it (e.g. set isolated / available
+      // when confirming isolation or de-isolation).
+      allow update: if isActive() && (
+        canIssue() ||
+        (resource.data.activeIsolationId != null && isoAssignee(resource.data.activeIsolationId))
+      );
       allow delete: if isAdmin();
     }
 
