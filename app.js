@@ -120,13 +120,25 @@ window.addEventListener("offline", () => updateOfflineBar());
 
 onAuthStateChanged(auth, async (user) => {
   State.user = user;
+  // Clear any previous session's profile/role immediately. Until the new
+  // user's role is confirmed from Firestore, State.profile is null so no
+  // role-dependent UI (e.g. the Admin menu) can be rendered — not even for
+  // a split second from a prior Admin session's stale state.
+  State.profile = null;
+  State.config = null;
+  State.view = "dashboard";
   if (!user) return renderLogin();
+  // Neutral loading screen while the role is fetched — nothing role-gated
+  // is shown until the profile is fully loaded below.
+  renderLoading();
   try {
     const snap = await getDoc(doc(db, "users", user.uid));
     if (snap.exists()) {
-      State.profile = { id: user.uid, ...snap.data() };
-      if (!State.profile.active) return renderPending();
+      const profile = { id: user.uid, ...snap.data() };
+      if (!profile.active) return renderPending();
       await loadConfig();
+      // Commit the profile and render only after the role is fully loaded.
+      State.profile = profile;
       renderApp();
     } else {
       // No profile yet → bootstrap or pending self-signup
@@ -142,6 +154,22 @@ onAuthStateChanged(auth, async (user) => {
 async function loadConfig() {
   const c = await getDoc(doc(db, "config", "app"));
   State.config = c.exists() ? c.data() : DEFAULT_CONFIG;
+}
+
+// Neutral loading screen shown while the signed-in user's role is being
+// fetched. It is intentionally free of any role-dependent UI.
+function renderLoading() {
+  $("#app").innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand">
+      <div class="mark">${ICON.lock}</div>
+      <div><div class="t1">${esc(appBranding.appName)}</div>
+        <div class="t2">${esc(appBranding.company)}</div></div>
+    </div>
+    <div class="sub" style="display:flex;align-items:center;gap:.6rem">
+      <span class="spinner" aria-hidden="true"></span>
+      <span>Loading your workspace…</span>
+    </div>
+  </div></div>`;
 }
 
 function renderLogin(error = "") {
@@ -277,15 +305,20 @@ function renderPending() {
 }
 
 /* -------------------- 4. App shell & router -------------------- */
+// True only when a profile with a confirmed Admin role is loaded.
+// Used to gate every Admin-only menu item and view.
+function isAdmin() { return State.profile?.role === "admin"; }
+
 function navItems() {
-  const r = State.profile.role;
+  // Guard: never build navigation before the role is confirmed.
+  if (!State.profile) return [];
   const items = [
     { v: "dashboard", label: "Dashboard", icon: ICON.home },
     { v: "new", label: "New Permit", icon: ICON.newdoc },
     { v: "permits", label: "Permit Register", icon: ICON.list },
     { v: "equipment", label: "Equipment", icon: ICON.cube }
   ];
-  if (r === "admin") items.push({ v: "admin", label: "Administration", icon: ICON.gear });
+  if (isAdmin()) items.push({ v: "admin", label: "Administration", icon: ICON.gear });
   return items;
 }
 
@@ -333,6 +366,9 @@ function renderApp() {
 }
 
 function go(view, params = {}) {
+  // Hard guard: the Administration view is Admin-only. Even if navigation is
+  // triggered some other way, a non-Admin can never render Admin controls.
+  if (view === "admin" && !isAdmin()) view = "dashboard";
   State.view = view; State.params = params;
   const hv = ["isolations", "isodetail", "detail"].includes(view) ? "permits" : view;
   $$(".navitem,.bn-item").forEach((n) => n.classList.toggle("active", n.dataset.v === hv));
