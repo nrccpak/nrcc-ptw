@@ -511,9 +511,12 @@ async function viewDashboard(m) {
     ${stat(mine.length, "My permits", ICON.cube)}</div>`;
 
   const me = State.profile.id;
+  // Any Isolator sees all open isolation / de-isolation tasks (not just ones
+  // assigned to them by name) so whoever is on shift can action them.
+  const isIso = State.profile.role === "isolator";
   const tasks = isoAll.filter((i) =>
-    (i.status === "assigned" && (isIssuer || i.assignedTo?.uid === me)) ||
-    (i.status === "removalPending" && (isIssuer || i.removalAssignedTo?.uid === me)));
+    (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
+    (i.status === "removalPending" && (isIssuer || isIso || i.removalAssignedTo?.uid === me)));
   if (tasks.length) {
     html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Isolation tasks</h3></div>
       <table class="tbl"><thead><tr><th>Certificate</th><th>Equipment</th><th>Status</th><th>Assigned to</th></tr></thead><tbody>
@@ -1277,8 +1280,11 @@ async function viewIsolationDetail(m) {
   const permits = await fetchPermits();
   const attached = permits.filter((p) => p.isolationRef === id);
   const me = State.profile.id, canI = ["issuer", "admin"].includes(State.profile.role);
-  const canConfirm = iso.status === "assigned" && (canI || iso.assignedTo?.uid === me);
-  const canRemove = iso.status === "removalPending" && (canI || iso.removalAssignedTo?.uid === me);
+  // Any active Isolator may confirm — the lockout is done by whoever is on
+  // shift, not only the named assignee. The actual signer is stamped below.
+  const isIso = State.profile.role === "isolator";
+  const canConfirm = iso.status === "assigned" && (canI || isIso || iso.assignedTo?.uid === me);
+  const canRemove = iso.status === "removalPending" && (canI || isIso || iso.removalAssignedTo?.uid === me);
   // An active certificate with no open permits is orphaned — let an
   // Issuer/Admin release it directly to return the equipment to service.
   const openAttached = attached.filter((p) => ["draft", "submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
