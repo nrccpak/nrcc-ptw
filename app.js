@@ -945,8 +945,9 @@ async function closePermit(p, equip) {
   const last = iso && remaining.length === 0;
 
   let body = `<label class="field"><span>Closure remarks</span><textarea id="crem" placeholder="Work complete, area cleared…"></textarea></label>`;
+  let users = [];
   if (last && iso.status === "active") {
-    const users = await isolatorUsers();
+    users = await isolatorUsers();
     const deisoBlock = users.length
       ? `<label class="checkline"><input type="radio" name="deiso" value="assign" checked> Assign de-isolation to:</label>
       <select id="deisoUser" style="margin:.2rem 0 .6rem">${users.map((u) => `<option value="${u.id}">${esc(u.name)}${(u.jobTitle || u.position) ? " — " + esc(u.jobTitle || u.position) : ""}</option>`).join("")}</select>
@@ -1278,10 +1279,15 @@ async function viewIsolationDetail(m) {
   const me = State.profile.id, canI = ["issuer", "admin"].includes(State.profile.role);
   const canConfirm = iso.status === "assigned" && (canI || iso.assignedTo?.uid === me);
   const canRemove = iso.status === "removalPending" && (canI || iso.removalAssignedTo?.uid === me);
+  // An active certificate with no open permits is orphaned — let an
+  // Issuer/Admin release it directly to return the equipment to service.
+  const openAttached = attached.filter((p) => ["draft", "submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
+  const canRelease = canI && iso.status === "active" && openAttached.length === 0;
 
   let actions = "";
   if (canConfirm) actions += `<button class="btn btn-success" id="conf">Confirm isolation applied</button>`;
   if (canRemove) actions += `<button class="btn btn-success" id="rem">Confirm de-isolation complete</button>`;
+  if (canRelease) actions += `<button class="btn btn-danger" id="release">Release isolation (return to service)</button>`;
   actions += `<button class="btn btn-ghost no-print" id="ipdf">${ICON.pdf} Print / PDF</button>`;
 
   const kv = (k, v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`;
@@ -1291,6 +1297,7 @@ async function viewIsolationDetail(m) {
       <div class="actions">${actions}</div></div>
     ${iso.status === "assigned" ? `<div class="warn-box">Awaiting confirmation by <b>${personHTML(iso.assignedTo?.name, iso.assignedTo)}</b>. Work must not start until the isolation is confirmed.</div>` : ""}
     ${iso.status === "removalPending" ? `<div class="warn-box">De-isolation assigned to <b>${iso.removalAssignedTo ? personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) : "(unassigned — Issuer to action)"}</b>. Locks are still ON.</div>` : ""}
+    ${canRelease ? `<div class="warn-box">This certificate is still <b>active</b> but has <b>no open permits</b>. As Issuer/Admin you can release it to return <b>${esc(iso.equipmentTag)}</b> to service.</div>` : ""}
     <div class="cols cols-2">
       <div class="card"><h3>Certificate</h3>
         ${kv("Equipment", `<span class="mono">${esc(iso.equipmentTag)}</span>${equip ? " · " + esc(equip.line) + " / " + esc(equip.area) : ""}`)}
@@ -1339,6 +1346,14 @@ async function viewIsolationDetail(m) {
       if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
       closeModal(); toast("De-isolation confirmed — equipment available", "ok"); go("isodetail", { id });
     });
+
+  if (canRelease) $("#release").onclick = () => confirmBoxHTML("Release isolation",
+    `<p>This certificate has <b>no open permits</b>. Confirm all locks and tags are removed from <b>${esc(iso.equipmentTag)}</b> and return it to <b>Available</b>?</p>`,
+    "Release isolation", async () => {
+      await updateDoc(doc(db, "isolations", id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
+      if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      closeModal(); toast("Isolation released — equipment available", "ok"); go("isodetail", { id });
+    }, true);
 }
 
 function printIsolation(iso, equip, attached) {
