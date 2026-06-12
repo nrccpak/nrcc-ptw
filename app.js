@@ -524,14 +524,17 @@ async function viewDashboard(m) {
     ${stat(mine.length, "My permits", ICON.cube)}</div>`;
 
   const me = State.profile.id;
+  const isAdmin = State.profile.role === "admin";
   // Any Isolator sees all open isolation / de-isolation tasks (not just ones
   // assigned to them by name) so whoever is on shift can action them. A cert
   // becomes a de-isolation task automatically once all its crews report done.
+  // De-isolation is a physical lockout job, so it is an Isolator task only —
+  // the Issuer does NOT de-isolate (Admin is kept as a system superuser).
   const isIso = State.profile.role === "isolator";
   const tasks = isoAll.filter((i) =>
     (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
-    (i.status === "removalPending" && (isIssuer || isIso || i.removalAssignedTo?.uid === me)) ||
-    (isoReadyForDeiso(i, permits) && (isIssuer || isIso)));
+    (i.status === "removalPending" && (isIso || isAdmin || i.removalAssignedTo?.uid === me)) ||
+    (isoReadyForDeiso(i, permits) && (isIso || isAdmin)));
   if (tasks.length) {
     html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Isolation tasks</h3></div>
       <table class="tbl"><thead><tr><th>Certificate</th><th>Equipment</th><th>Status</th><th>Assigned to</th></tr></thead><tbody>
@@ -783,6 +786,8 @@ async function viewPermitDetail(m) {
   const p = { id, ...snap.data() };
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
   const isOwner = p.requester?.uid === State.profile.id;
+  // De-isolation is the Isolator's job; Admin kept only as a superuser fallback.
+  const isIsoOrAdmin = ["isolator", "admin"].includes(State.profile.role);
   const eqSnap = await getDoc(doc(db, "equipment", p.equipmentRef)).catch(() => null);
   const equip = eqSnap && eqSnap.exists() ? { id: eqSnap.id, ...eqSnap.data() } : null;
   const isoSnap = p.isolationRef ? await getDoc(doc(db, "isolations", p.isolationRef)).catch(() => null) : null;
@@ -808,7 +813,7 @@ async function viewPermitDetail(m) {
   // The requester signs off that the work is finished and the equipment is safe
   // to return to service. The Issuer can only close after de-isolation.
   if (["active", "extended"].includes(p.status) && isOwner && !p.workCompletion) actions += `<button class="btn btn-success" id="workdone">Confirm work complete</button>`;
-  if (awaitingDeiso && deisoReady) actions += `<button class="btn btn-accent" id="godeiso">Go to de-isolation</button>`;
+  if (awaitingDeiso && deisoReady && isIsoOrAdmin) actions += `<button class="btn btn-accent" id="godeiso">Go to de-isolation</button>`;
   if (["active", "extended"].includes(p.status) && isIssuer) {
     actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
     if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
@@ -1314,6 +1319,7 @@ async function viewIsolationDetail(m) {
   const permits = await fetchPermits();
   const attached = permits.filter((p) => p.isolationRef === id);
   const me = State.profile.id, canI = ["issuer", "admin"].includes(State.profile.role);
+  const isAdmin = State.profile.role === "admin";
   // Any active Isolator may confirm — the lockout is done by whoever is on
   // shift, not only the named assignee. The actual signer is stamped below.
   const isIso = State.profile.role === "isolator";
@@ -1321,8 +1327,10 @@ async function viewIsolationDetail(m) {
   // De-isolation opens automatically once all crews on a confirmed certificate
   // have signed off their work complete (readyForDeiso), as well as for any
   // certificate explicitly put into removalPending by an older flow.
+  // De-isolation is the Isolator's physical job — the Issuer does NOT de-isolate
+  // (Admin is kept only as a system superuser fallback).
   const readyForDeiso = isoReadyForDeiso(iso, permits);
-  const canRemove = (iso.status === "removalPending" || readyForDeiso) && (canI || isIso || iso.removalAssignedTo?.uid === me);
+  const canRemove = (iso.status === "removalPending" || readyForDeiso) && (isIso || isAdmin || iso.removalAssignedTo?.uid === me);
   // An active certificate with no open permits is orphaned — let an
   // Issuer/Admin release it directly to return the equipment to service.
   const openAttached = attached.filter((p) => ["draft", "submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
