@@ -11,7 +11,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getAuth, onAuthStateChanged, signInWithEmailAndPassword,
-  createUserWithEmailAndPassword, signOut
+  createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
@@ -227,6 +227,7 @@ function renderLogin(error = "") {
       <div id="lf"></div>
       <label class="field"><span>Email</span><input type="email" id="email" autocomplete="username" placeholder="name@nrcc.com"></label>
       <label class="field"><span>Password</span><input type="password" id="pass" autocomplete="current-password" placeholder="••••••••"></label>
+      ${mode === "signin" ? `<div style="text-align:right;margin:-.55rem 0 1rem"><a href="#" id="forgot" style="font-size:.82rem">Forgot password?</a></div>` : ""}
       ${mode === "signup" ? `
         <label class="field"><span>Full name <span class="req">*</span></span><input type="text" id="fname" placeholder="e.g. Fiaz Ahmed"></label>
         <div class="grid-2">
@@ -243,6 +244,14 @@ function renderLogin(error = "") {
     $("#toggle").onclick = (e) => { e.preventDefault(); mode = mode === "signin" ? "signup" : "signin"; error = ""; draw(); };
     $("#go").onclick = submit;
     root.querySelector("#pass").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    const fp = $("#forgot");
+    if (fp) fp.onclick = async (e) => {
+      e.preventDefault();
+      const email = $("#email").value.trim();
+      if (!email) return toast("Enter your email above, then click Forgot password", "err");
+      try { await sendPasswordResetEmail(auth, email); toast(`Password reset link sent to ${email}`, "ok"); }
+      catch (err) { toast(friendlyAuthError(err), "err"); }
+    };
   };
   async function submit() {
     const email = $("#email").value.trim(), pass = $("#pass").value;
@@ -1137,13 +1146,26 @@ async function viewAdmin(m) {
       <td><select data-role="${u.id}" ${u.id === State.profile.id ? "disabled" : ""}>
         ${["requester", "issuer", "admin", "isolator"].map((r) => `<option ${u.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></td>
       <td><label class="checkline" style="padding:0"><input type="checkbox" data-active="${u.id}" ${u.active ? "checked" : ""} ${u.id === State.profile.id ? "disabled" : ""}></label></td>
-      <td><button class="btn btn-ghost btn-sm" data-saveu="${u.id}">Save</button></td></tr>`).join("")}</tbody></table></div>`;
+      <td style="white-space:nowrap"><button class="btn btn-ghost btn-sm" data-saveu="${u.id}">Save</button>
+        ${u.email ? `<button class="btn btn-ghost btn-sm" data-resetu="${esc(u.email)}">Reset PW</button>` : ""}
+        ${u.id === State.profile.id ? "" : `<button class="btn btn-danger btn-sm" data-delu="${u.id}" data-name="${esc(u.name || u.email || "this user")}">Delete</button>`}
+      </td></tr>`).join("")}</tbody></table></div>`;
   $$("[data-saveu]").forEach((b) => b.onclick = async () => {
     const id = b.dataset.saveu;
     const role = $(`[data-role="${id}"]`).value, active = $(`[data-active="${id}"]`).checked;
     const jobTitle = $(`[data-jt="${id}"]`).value, department = $(`[data-dp="${id}"]`).value, employeeNumber = $(`[data-en="${id}"]`).value.trim();
     try { await updateDoc(doc(db, "users", id), { role, active, jobTitle, department, employeeNumber }); toast("User updated", "ok"); } catch (e) { toast(e.message, "err"); }
   });
+  $$("[data-resetu]").forEach((b) => b.onclick = async () => {
+    try { await sendPasswordResetEmail(auth, b.dataset.resetu); toast(`Password reset email sent to ${b.dataset.resetu}`, "ok"); }
+    catch (e) { toast(friendlyAuthError(e), "err"); }
+  });
+  $$("[data-delu]").forEach((b) => b.onclick = () => confirmBox(
+    "Delete user",
+    `Remove ${b.dataset.name} from the system? They lose all access immediately. Their sign-in credential remains but is inert until an Admin re-approves them.`,
+    "Delete user",
+    async () => { await deleteDoc(doc(db, "users", b.dataset.delu)); closeModal(); toast("User deleted", "ok"); go("admin"); },
+    true));
   // config save
   $("#saveCfg").onclick = async () => {
     const lines = $("#cLines").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
