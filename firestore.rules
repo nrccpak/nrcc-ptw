@@ -15,6 +15,7 @@ service cloud.firestore {
     function role() { return hasUser() ? userDoc().role : 'none'; }
     function isAdmin()  { return signedIn() && role() == 'admin'; }
     function isIssuer() { return signedIn() && role() == 'issuer'; }
+    function isIsolator() { return signedIn() && role() == 'isolator'; }
     // Issuer-or-Admin can do everything an Issuer can:
     function canIssue() { return isAdmin() || isIssuer(); }
     function isActive() { return hasUser() && userDoc().active == true; }
@@ -23,15 +24,6 @@ service cloud.firestore {
     function noUsersYet() {
       return !exists(/databases/$(database)/documents/meta/init);
     }
-    // True when the signed-in user is the isolation (or de-isolation) assignee
-    // on the given certificate — used to let an Isolator update the equipment
-    // status when confirming isolation / de-isolation.
-    function isoAssignee(isoId) {
-      let iso = get(/databases/$(database)/documents/isolations/$(isoId)).data;
-      return (iso.assignedTo != null && iso.assignedTo.uid == request.auth.uid) ||
-             (iso.removalAssignedTo != null && iso.removalAssignedTo.uid == request.auth.uid);
-    }
-
     // ---- users ----
     match /users/{uid} {
       allow read: if signedIn();
@@ -62,12 +54,13 @@ service cloud.firestore {
       allow read: if signedIn();
       // Issuer/Admin create & maintain equipment.
       allow create: if canIssue() && isActive();
-      // Issuer/Admin may update freely; the Isolator assigned to the item's
-      // active certificate may also update it (e.g. set isolated / available
-      // when confirming isolation or de-isolation).
+      // Issuer/Admin may update freely; any active Isolator may update an item
+      // that is part of an isolation lifecycle (i.e. has an active certificate)
+      // so they can set isolated / available when confirming isolation or
+      // de-isolation. They cannot touch equipment with no active isolation.
       allow update: if isActive() && (
         canIssue() ||
-        (resource.data.activeIsolationId != null && isoAssignee(resource.data.activeIsolationId))
+        (isIsolator() && resource.data.activeIsolationId != null)
       );
       allow delete: if isAdmin();
     }
@@ -76,15 +69,10 @@ service cloud.firestore {
     match /isolations/{id} {
       allow read: if signedIn();
       allow create: if canIssue() && isActive();
-      // Issuer/Admin manage certificates; additionally the assigned person may
-      // confirm the isolation, and the removal-assignee may confirm de-isolation.
-      allow update: if isActive() && (
-        canIssue() ||
-        (('assignedTo' in resource.data) && resource.data.assignedTo != null &&
-          resource.data.assignedTo.uid == request.auth.uid) ||
-        (('removalAssignedTo' in resource.data) && resource.data.removalAssignedTo != null &&
-          resource.data.removalAssignedTo.uid == request.auth.uid)
-      );
+      // Issuer/Admin manage certificates; additionally any active Isolator may
+      // confirm the isolation or de-isolation (whoever is on shift), not just
+      // the named assignee.
+      allow update: if isActive() && (canIssue() || isIsolator());
       allow delete: if isAdmin();
     }
 
@@ -95,15 +83,14 @@ service cloud.firestore {
       allow create: if signedIn() && isActive()
                     && request.resource.data.requester.uid == request.auth.uid;
       // Requester may edit their own DRAFT/SUBMITTED permit; Issuer/Admin may edit any;
-      // the isolation assignee may activate permits waiting on their certificate.
+      // any active Isolator may activate a permit waiting on isolation when they
+      // confirm the certificate it is attached to.
       allow update: if isActive() && (
         canIssue() ||
         (resource.data.requester.uid == request.auth.uid &&
          resource.data.status in ['draft','submitted']) ||
-        (resource.data.status == 'awaitingIsolation' &&
-         resource.data.isolationRef != null &&
-         get(/databases/$(database)/documents/isolations/$(resource.data.isolationRef))
-           .data.assignedTo.uid == request.auth.uid)
+        (isIsolator() && resource.data.status == 'awaitingIsolation' &&
+         resource.data.isolationRef != null)
       );
       allow delete: if isAdmin();
     }
