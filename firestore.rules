@@ -76,8 +76,8 @@ service cloud.firestore {
     // ---- permits ----
     match /permits/{id} {
       allow read: if signedIn();
-      // Any active user may raise a permit (they are the requester).
-      allow create: if signedIn() && isActive()
+      // Any active user except an Isolator may raise a permit (they are the requester).
+      allow create: if signedIn() && isActive() && role() != 'isolator'
                     && request.resource.data.requester.uid == request.auth.uid;
       // Requester may edit their own DRAFT/SUBMITTED permit; Issuer/Admin may edit any;
       // the isolation assignee may activate permits waiting on their certificate.

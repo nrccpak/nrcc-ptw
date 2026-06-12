@@ -280,11 +280,12 @@ function renderPending() {
 function navItems() {
   const r = State.profile.role;
   const items = [
-    { v: "dashboard", label: "Dashboard", icon: ICON.home },
-    { v: "new", label: "New Permit", icon: ICON.newdoc },
-    { v: "permits", label: "Permit Register", icon: ICON.list },
-    { v: "equipment", label: "Equipment", icon: ICON.cube }
+    { v: "dashboard", label: "Dashboard", icon: ICON.home }
   ];
+  // Isolators cannot raise permits, so the New Permit entry is hidden for them.
+  if (r !== "isolator") items.push({ v: "new", label: "New Permit", icon: ICON.newdoc });
+  items.push({ v: "permits", label: "Permit Register", icon: ICON.list });
+  items.push({ v: "equipment", label: "Equipment", icon: ICON.cube });
   if (r === "admin") items.push({ v: "admin", label: "Administration", icon: ICON.gear });
   return items;
 }
@@ -361,6 +362,8 @@ async function fetchPermits() { const a = await fetchAll("permits"); a.sort((x, 
 async function fetchEquipment() { const a = await fetchAll("equipment"); a.sort((x, y) => (x.tag || "").localeCompare(y.tag || "")); return a; }
 async function fetchIsolations() { const a = await fetchAll("isolations"); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
 async function activeUsers() { const u = await fetchAll("users"); return u.filter((x) => x.active).sort((a, b) => (a.name || "").localeCompare(b.name || "")); }
+// Only active users holding the Isolator role — used for isolation / de-isolation assignment.
+async function isolatorUsers() { return (await activeUsers()).filter((x) => x.role === "isolator"); }
 
 async function refreshPendingBadge() {
   if (!["issuer", "admin"].includes(State.profile.role)) return;
@@ -374,10 +377,11 @@ async function refreshPendingBadge() {
 
 /* -------------------- 5a. Dashboard -------------------- */
 async function viewDashboard(m) {
+  const canRaise = State.profile.role !== "isolator";
   m.innerHTML = `<div class="page-head"><div><div class="kick">Overview</div><h2>Welcome, ${esc(State.profile.name.split(" ")[0])}</h2></div>
-    <div class="actions"><button class="btn btn-accent" onclick="">+ New Permit</button></div></div>
+    <div class="actions">${canRaise ? `<button class="btn btn-accent" onclick="">+ New Permit</button>` : ""}</div></div>
     <div id="dash">Loading…</div>`;
-  m.querySelector(".actions .btn").onclick = () => go("new");
+  if (canRaise) m.querySelector(".actions .btn").onclick = () => go("new");
   const permits = await fetchPermits();
   const equip = await fetchEquipment();
   const isoAll = await fetchIsolations();
@@ -435,8 +439,9 @@ function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = ()
 
 /* -------------------- 5b. Permit Register -------------------- */
 async function viewPermits(m) {
+  const canRaise = State.profile.role !== "isolator";
   m.innerHTML = `<div class="page-head"><div><div class="kick">Records</div><h2>Permit Register</h2></div>
-    <div class="actions"><button class="btn btn-accent" id="np">+ New Permit</button></div></div>
+    <div class="actions">${canRaise ? `<button class="btn btn-accent" id="np">+ New Permit</button>` : ""}</div></div>
     ${tabsHtml("p")}
     <div class="filters">
       <input class="search" id="q" placeholder="Search permit no, equipment, work…">
@@ -446,7 +451,7 @@ async function viewPermits(m) {
       <select id="fDept"><option value="">All departments</option></select>
     </div>
     <div class="card pad0" id="ptable">Loading…</div>`;
-  $("#np").onclick = () => go("new");
+  const npBtn = $("#np"); if (npBtn) npBtn.onclick = () => go("new");
   bindTabs();
   $("#fType").innerHTML += State.config.permitTypes.map((t) => `<option value="${t.code}">${esc(t.name)}</option>`).join("");
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
@@ -472,6 +477,7 @@ async function viewPermits(m) {
 /* -------------------- 5c. New Permit -------------------- */
 async function viewNewPermit(m) {
   if (!State.profile.active) { m.innerHTML = `<div class="danger-box">Your account is not active yet.</div>`; return; }
+  if (State.profile.role === "isolator") { m.innerHTML = `<div class="danger-box">Isolators cannot raise permits. Your isolation tasks are shown on the Dashboard.</div>`; return; }
   const cfg = State.config;
   const equip = await fetchEquipment();
   let type = cfg.permitTypes[0];
@@ -791,7 +797,8 @@ async function approvePermit(p, equip) {
   }
 
   // no usable isolation → create a new certificate and assign it
-  const users = await activeUsers();
+  const users = await isolatorUsers();
+  if (!users.length) return toast("No active Isolator users found. Ask an Admin to assign the Isolator role to a user first.", "err");
   modal({ title: "Approve & create isolation certificate", wide: true, body: `
     <div class="info-box">A new <b>isolation certificate</b> with its own reference number will be created for <b>${esc(equip?.tag || "")}</b>. The permit stays <b>Awaiting Isolation</b> until the assigned person confirms in the app that the isolation is physically applied.</div>
     <div class="section-title">Isolation points (from the permit)</div>
@@ -829,12 +836,16 @@ async function closePermit(p, equip) {
 
   let body = `<label class="field"><span>Closure remarks</span><textarea id="crem" placeholder="Work complete, area cleared…"></textarea></label>`;
   if (last && iso.status === "active") {
-    const users = await activeUsers();
+    const users = await isolatorUsers();
+    const deisoBlock = users.length
+      ? `<label class="checkline"><input type="radio" name="deiso" value="assign" checked> Assign de-isolation to:</label>
+      <select id="deisoUser" style="margin:.2rem 0 .6rem">${users.map((u) => `<option value="${u.id}|${esc(u.name)}">${esc(u.name)}${u.position ? " — " + esc(u.position) : ""}</option>`).join("")}</select>
+      <label class="checkline"><input type="radio" name="deiso" value="now"> Locks already removed — I confirm de-isolation now</label>`
+      : `<div class="help">No active Isolator users available to assign — ask an Admin to assign the Isolator role to a user, or confirm de-isolation directly below.</div>
+      <label class="checkline"><input type="radio" name="deiso" value="now" checked> Locks already removed — I confirm de-isolation now</label>`;
     body = `<div class="info-box">This is the <b>last permit</b> on isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b>. Decide how <b>${esc(equip?.tag || "the equipment")}</b> is de-isolated and returned to service.</div>` + body + `
       <div class="section-title">De-isolation</div>
-      <label class="checkline"><input type="radio" name="deiso" value="assign" checked> Assign de-isolation to:</label>
-      <select id="deisoUser" style="margin:.2rem 0 .6rem">${users.map((u) => `<option value="${u.id}|${esc(u.name)}">${esc(u.name)}${u.position ? " — " + esc(u.position) : ""}</option>`).join("")}</select>
-      <label class="checkline"><input type="radio" name="deiso" value="now"> Locks already removed — I confirm de-isolation now</label>`;
+      ${deisoBlock}`;
   } else if (last && iso.status === "assigned") {
     body = `<div class="info-box">Isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b> was never confirmed; it will be cancelled and ${esc(equip?.tag || "the equipment")} returned to Available.</div>` + body;
   } else if (iso && !last) {
@@ -1018,7 +1029,7 @@ async function viewAdmin(m) {
   $("#users").innerHTML = `<table class="tbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Active</th><th></th></tr></thead><tbody>
     ${users.map((u) => `<tr><td>${esc(u.name)}</td><td>${esc(u.email || "—")}</td>
       <td><select data-role="${u.id}" ${u.id === State.profile.id ? "disabled" : ""}>
-        ${["requester", "issuer", "admin"].map((r) => `<option ${u.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></td>
+        ${["requester", "issuer", "admin", "isolator"].map((r) => `<option ${u.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></td>
       <td><label class="checkline" style="padding:0"><input type="checkbox" data-active="${u.id}" ${u.active ? "checked" : ""} ${u.id === State.profile.id ? "disabled" : ""}></label></td>
       <td><button class="btn btn-ghost btn-sm" data-saveu="${u.id}">Save</button></td></tr>`).join("")}</tbody></table>`;
   $$("[data-saveu]").forEach((b) => b.onclick = async () => {
