@@ -1,0 +1,11 @@
+tag,description,line,area
+362FN1,Raw Mill Circulation Fan,Line 1,Raw Mill + Pre-heater
+362BM1,Raw Mill Main Drive,Line 1,Raw Mill + Pre-heater
+441KL1,Kiln Main Drive,Line 1,Kiln
+451CC1,Clinker Cooler Fan 1,Line 1,Cooler
+541CM1,Cement Mill Main Drive,Line 1,Cement Mill
+561BE1,Bucket Elevator - Silo Feed,Line 1,Silo
+611PK1,Packer Machine 1,Line 1,Packing Plant
+121CR1,Limestone Crusher Main Drive,Line 2,Crusher
+131ST1,Stacker Boom Conveyor,Line 2,Stacker
+362FN2,Raw Mill Circulation Fan,Line 2,Raw Mill + Pre-heater

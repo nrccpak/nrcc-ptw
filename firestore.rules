@@ -1,0 +1,96 @@
+rules_version = '2';
+
+// ============================================================
+//  NRCC Work Permit System — Firestore Security Rules
+//  Deploy with: firebase deploy --only firestore:rules
+//  (or paste into Firebase Console → Firestore → Rules)
+// ============================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- helpers ----
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function hasUser() { return exists(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function role() { return hasUser() ? userDoc().role : 'none'; }
+    function isAdmin()  { return signedIn() && role() == 'admin'; }
+    function isIssuer() { return signedIn() && role() == 'issuer'; }
+    // Issuer-or-Admin can do everything an Issuer can:
+    function canIssue() { return isAdmin() || isIssuer(); }
+    function isActive() { return hasUser() && userDoc().active == true; }
+    // True only before any user exists — used to let the very first
+    // signed-in account bootstrap itself as Administrator.
+    function noUsersYet() {
+      return !exists(/databases/$(database)/documents/meta/init);
+    }
+
+    // ---- users ----
+    match /users/{uid} {
+      allow read: if signedIn();
+      // A person may create their own profile. They may set role 'admin'
+      // ONLY during first-run bootstrap; otherwise self-signups are 'requester'.
+      allow create: if signedIn() && request.auth.uid == uid && (
+        (noUsersYet() && request.resource.data.role == 'admin') ||
+        request.resource.data.role == 'requester'
+      );
+      // Only an Admin can change roles / activate users.
+      allow update, delete: if isAdmin();
+    }
+
+    // ---- meta (bootstrap marker, written once) ----
+    match /meta/{doc} {
+      allow read: if signedIn();
+      allow write: if isAdmin() || (signedIn() && doc == 'init' && noUsersYet());
+    }
+
+    // ---- config (permit types, lines, areas, departments) ----
+    match /config/{doc} {
+      allow read: if signedIn();
+      allow write: if isAdmin() || (signedIn() && noUsersYet()); // seed at bootstrap
+    }
+
+    // ---- equipment ----
+    match /equipment/{id} {
+      allow read: if signedIn();
+      // Issuer/Admin create & maintain equipment; status updates also by issuer
+      allow create, update: if canIssue() && isActive();
+      allow delete: if isAdmin();
+    }
+
+    // ---- isolations (certificates) ----
+    match /isolations/{id} {
+      allow read: if signedIn();
+      allow create: if canIssue() && isActive();
+      // Issuer/Admin manage certificates; additionally the assigned person may
+      // confirm the isolation, and the removal-assignee may confirm de-isolation.
+      allow update: if isActive() && (
+        canIssue() ||
+        (('assignedTo' in resource.data) && resource.data.assignedTo != null &&
+          resource.data.assignedTo.uid == request.auth.uid) ||
+        (('removalAssignedTo' in resource.data) && resource.data.removalAssignedTo != null &&
+          resource.data.removalAssignedTo.uid == request.auth.uid)
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ---- permits ----
+    match /permits/{id} {
+      allow read: if signedIn();
+      // Any active user may raise a permit (they are the requester).
+      allow create: if signedIn() && isActive()
+                    && request.resource.data.requester.uid == request.auth.uid;
+      // Requester may edit their own DRAFT/SUBMITTED permit; Issuer/Admin may edit any;
+      // the isolation assignee may activate permits waiting on their certificate.
+      allow update: if isActive() && (
+        canIssue() ||
+        (resource.data.requester.uid == request.auth.uid &&
+         resource.data.status in ['draft','submitted']) ||
+        (resource.data.status == 'awaitingIsolation' &&
+         resource.data.isolationRef != null &&
+         get(/databases/$(database)/documents/isolations/$(resource.data.isolationRef))
+           .data.assignedTo.uid == request.auth.uid)
+      );
+      allow delete: if isAdmin();
+    }
+  }
+}
