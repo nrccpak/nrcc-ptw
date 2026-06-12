@@ -778,7 +778,13 @@ async function viewPermitDetail(m) {
   if (p.status === "submitted" && isIssuer) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
   if (["submitted", "awaitingIsolation"].includes(p.status) && isIssuer) actions += `<button class="btn btn-danger" id="reject">Reject</button>`;
   if (["draft"].includes(p.status) && isOwner) actions += `<button class="btn btn-accent" id="submitNow">Submit for approval</button>`;
-  if (["active", "extended"].includes(p.status) && isIssuer) actions += `<button class="btn btn-ghost" id="extend">Extend</button><button class="btn btn-primary" id="close">Close permit</button>`;
+  // The requester signs off that the work is finished and the equipment is safe
+  // to return to service. The Issuer can only close once this is recorded.
+  if (["active", "extended"].includes(p.status) && isOwner && !p.workCompletion) actions += `<button class="btn btn-success" id="workdone">Confirm work complete</button>`;
+  if (["active", "extended"].includes(p.status) && isIssuer) {
+    actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
+    if (p.workCompletion) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
+  }
   if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
   actions += `<button class="btn btn-ghost no-print" id="pdf">${ICON.pdf} Print / PDF</button>`;
 
@@ -790,6 +796,8 @@ async function viewPermitDetail(m) {
     ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
     ${equip && equip.isolationStatus === "trialRun" ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — equipment ${esc(equip.tag)} is ENERGISED.</b></div>` : ""}
     ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
+    ${["active", "extended"].includes(p.status) && p.workCompletion ? `<div class="ok-box"><b>Work complete — confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)}</b> · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} The Issuer may now close the permit.</div>` : ""}
+    ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed."}</div>` : ""}
 
     <div class="cols cols-2">
       <div class="card"><h3>Details</h3>
@@ -802,6 +810,7 @@ async function viewPermitDetail(m) {
         ${kv("Valid from", fmt(p.validity?.start))}
         ${kv("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
         ${p.approval ? kv("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
+        ${p.workCompletion ? kv("Work completed", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
         ${p.closure ? kv("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
       </div>
       <div class="card"><h3>Hazard checklist</h3>
@@ -860,6 +869,7 @@ async function viewPermitDetail(m) {
       closeModal(); toast("Permit extended", "ok"); go("detail", { id });
     };
   });
+  $("#workdone") && ($("#workdone").onclick = () => confirmWorkComplete(p, equip));
   $("#close") && ($("#close").onclick = () => closePermit(p, equip));
   $("#trial") && ($("#trial").onclick = () => trialRun(p, equip));
 }
@@ -937,7 +947,31 @@ async function approvePermit(p, equip) {
   };
 }
 
+// Requester's written sign-off that the job is finished and the equipment is
+// safe to return to service. The permit cannot be closed until this is on record.
+async function confirmWorkComplete(p, equip) {
+  modal({ title: "Confirm work complete", wide: true, body: `
+    <div class="info-box">Confirm the work under permit <b class="mono">${esc(p.permitNo)}</b> on <b>${esc(p.equipmentTag || "")}</b> is finished and the equipment is safe to return to service. The Issuer can close the permit only after this confirmation.</div>
+    <label class="field"><span>Completion remarks <span class="req">*</span></span><textarea id="wcRemarks" placeholder="Work completed, tools and personnel removed, area cleared…"></textarea></label>
+    <label class="checkline"><input type="checkbox" id="wcAck"> I confirm the work is complete and <b>${esc(p.equipmentTag || "the equipment")}</b> is safe to return to service.</label>`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-success" data-ok>Confirm work complete</button>` });
+  $("[data-c]").onclick = closeModal;
+  $("[data-ok]").onclick = async () => {
+    const remarks = $("#wcRemarks").value.trim();
+    if (!remarks) return toast("Enter completion remarks", "err");
+    if (!$("#wcAck").checked) return toast("Tick the confirmation statement", "err");
+    try {
+      await updateDoc(doc(db, "permits", p.id), {
+        workCompletion: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, safeToReturn: true, timestamp: nowISO() },
+        updatedAt: nowISO()
+      });
+      closeModal(); toast("Work completion confirmed — Issuer can now close the permit", "ok"); go("detail", { id: p.id });
+    } catch (e) { toast(e.message || "Could not confirm work completion", "err"); }
+  };
+}
+
 async function closePermit(p, equip) {
+  if (!p.workCompletion) return toast("The requester must confirm the work is complete before closing.", "err");
   let iso = null;
   if (p.isolationRef) {
     const s = await getDoc(doc(db, "isolations", p.isolationRef));
@@ -1208,6 +1242,7 @@ function printPermit(p, equip) {
         ${row("Valid from", fmt(p.validity?.start))}
         ${row("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
         ${p.approval ? row("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
+        ${p.workCompletion ? row("Work completed / safe to return", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
         ${p.closure ? row("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp)) : ""}
       </table>
       <div style="margin-top:14px;font-weight:800;color:#2A6F97;font-size:13px">HAZARD CHECKLIST</div>

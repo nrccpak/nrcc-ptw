@@ -83,12 +83,17 @@ service cloud.firestore {
       allow create: if signedIn() && isActive()
                     && request.resource.data.requester.uid == request.auth.uid;
       // Requester may edit their own DRAFT/SUBMITTED permit; Issuer/Admin may edit any;
-      // any active Isolator may activate a permit waiting on isolation when they
-      // confirm the certificate it is attached to.
+      // the requester may also record their work-completion sign-off on their own
+      // ACTIVE/EXTENDED permit (without changing its status); and any active
+      // Isolator may activate a permit waiting on isolation when they confirm the
+      // certificate it is attached to.
       allow update: if isActive() && (
         canIssue() ||
         (resource.data.requester.uid == request.auth.uid &&
          resource.data.status in ['draft','submitted']) ||
+        (resource.data.requester.uid == request.auth.uid &&
+         resource.data.status in ['active','extended'] &&
+         request.resource.data.status == resource.data.status) ||
         (isIsolator() && resource.data.status == 'awaitingIsolation' &&
          resource.data.isolationRef != null)
       );

@@ -209,6 +209,8 @@ table.tbl tr:last-child td{border-bottom:none}
   border-radius:var(--radius-xs);padding:.9rem 1rem;font-size:.86rem;color:#9b2c2c;margin-bottom:1rem}
 .info-box{background:var(--steel-soft);border:1px solid #C9DEEC;border-left:4px solid var(--steel);
   border-radius:var(--radius-xs);padding:.9rem 1rem;font-size:.86rem;color:#1d4d6b;margin-bottom:1rem}
+.ok-box{background:var(--green-soft);border:1px solid #BFE3C9;border-left:4px solid var(--green);
+  border-radius:var(--radius-xs);padding:.9rem 1rem;font-size:.86rem;color:#1d6b3a;margin-bottom:1rem}
 .iso-row{display:flex;gap:.5rem;margin-bottom:.5rem}
 .iso-row input{flex:1}
 .attached-list{display:flex;flex-direction:column;gap:.4rem}
