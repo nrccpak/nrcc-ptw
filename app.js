@@ -229,7 +229,11 @@ function renderLogin(error = "") {
       <label class="field"><span>Password</span><input type="password" id="pass" autocomplete="current-password" placeholder="••••••••"></label>
       ${mode === "signup" ? `
         <label class="field"><span>Full name <span class="req">*</span></span><input type="text" id="fname" placeholder="e.g. Fiaz Ahmed"></label>
-        <div class="help">Department, job title and employee number are completed on the next step.</div>` : ""}
+        <div class="grid-2">
+          <label class="field"><span>Department <span class="req">*</span></span><select id="fdept">${optionList(departmentNames(), "")}</select></label>
+          <label class="field"><span>Job Title <span class="req">*</span></span><select id="fjob">${optionList(jobTitles(), "")}</select></label>
+        </div>
+        <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="femp" placeholder="e.g. EMP-1042"></label>` : ""}
       <button class="btn btn-accent btn-block" id="go">${mode === "signin" ? "Sign in" : "Create account"}</button>
       <div style="text-align:center;margin-top:1rem;font-size:.85rem;color:var(--muted)">
         ${mode === "signin" ? "New here?" : "Already registered?"}
@@ -249,9 +253,13 @@ function renderLogin(error = "") {
         await signInWithEmailAndPassword(auth, email, pass);
       } else {
         const name = $("#fname").value.trim();
+        const department = $("#fdept").value, jobTitle = $("#fjob").value, employeeNumber = $("#femp").value.trim();
         if (!name) { $("#go").disabled = false; return toast("Full name is required", "err"); }
+        if (!department) { $("#go").disabled = false; return toast("Select your department", "err"); }
+        if (!jobTitle) { $("#go").disabled = false; return toast("Select your job title", "err"); }
+        if (!employeeNumber) { $("#go").disabled = false; return toast("Employee number is required", "err"); }
         const cred = await createUserWithEmailAndPassword(auth, email, pass);
-        sessionStorage.setItem("signup", JSON.stringify({ name }));
+        sessionStorage.setItem("signup", JSON.stringify({ name, department, jobTitle, employeeNumber }));
         // onAuthStateChanged will route to bootstrap/complete-profile
       }
     } catch (e) {
@@ -279,10 +287,10 @@ function renderBootstrap(user) {
       (permit types, lines, areas, departments) and make <b>${esc(user.email)}</b> the <b>Administrator</b>.</div>
     <label class="field"><span>Your name <span class="req">*</span></span><input type="text" id="bn" value="${esc(su.name || "")}"></label>
     <div class="grid-2">
-      <label class="field"><span>Department <span class="req">*</span></span><select id="bd">${optionList(DEFAULT_CONFIG.departments.map((d) => d.name), "")}</select></label>
-      <label class="field"><span>Job Title <span class="req">*</span></span><select id="bj">${optionList(DEFAULT_JOB_TITLES, "")}</select></label>
+      <label class="field"><span>Department <span class="req">*</span></span><select id="bd">${optionList(DEFAULT_CONFIG.departments.map((d) => d.name), su.department || "")}</select></label>
+      <label class="field"><span>Job Title <span class="req">*</span></span><select id="bj">${optionList(DEFAULT_JOB_TITLES, su.jobTitle || "")}</select></label>
     </div>
-    <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="be" placeholder="e.g. EMP-1042"></label>
+    <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="be" placeholder="e.g. EMP-1042" value="${esc(su.employeeNumber || "")}"></label>
     <button class="btn btn-accent btn-block" id="binit">Initialise system as Administrator</button>
     <div style="text-align:center;margin-top:.9rem"><a href="#" id="bso">Sign out</a></div>
   </div></div>`;
@@ -313,6 +321,18 @@ async function renderCompleteProfile(user) {
   // Departments and job titles come from config/app — load it so the
   // dropdowns reflect the configured lists (never invent new departments).
   if (!State.config) { try { await loadConfig(); } catch { State.config = DEFAULT_CONFIG; } }
+  // The sign-up screen already collects name, department, job title and
+  // employee number — finalise the profile directly, no second form.
+  if (su.name && su.department && su.jobTitle && su.employeeNumber) {
+    try {
+      await setDoc(doc(db, "users", user.uid), {
+        name: su.name, email: user.email, role: "requester", active: false,
+        department: su.department, jobTitle: su.jobTitle, employeeNumber: su.employeeNumber, createdAt: nowISO()
+      });
+      sessionStorage.removeItem("signup");
+      return renderPending();
+    } catch (e) { toast(e.message, "err"); /* fall through to the manual form */ }
+  }
   const root = $("#app");
   root.innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand"><div class="mark">${ICON.lock}</div>
@@ -320,10 +340,10 @@ async function renderCompleteProfile(user) {
     <div class="info-box">Your account will be created as <b>pending</b>. An administrator must activate it and assign your role before you can raise permits.</div>
     <label class="field"><span>Your name <span class="req">*</span></span><input type="text" id="cn" value="${esc(su.name || "")}"></label>
     <div class="grid-2">
-      <label class="field"><span>Department <span class="req">*</span></span><select id="cd">${optionList(departmentNames(), "")}</select></label>
-      <label class="field"><span>Job Title <span class="req">*</span></span><select id="cj">${optionList(jobTitles(), "")}</select></label>
+      <label class="field"><span>Department <span class="req">*</span></span><select id="cd">${optionList(departmentNames(), su.department || "")}</select></label>
+      <label class="field"><span>Job Title <span class="req">*</span></span><select id="cj">${optionList(jobTitles(), su.jobTitle || "")}</select></label>
     </div>
-    <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="ce" placeholder="e.g. EMP-1042"></label>
+    <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="ce" placeholder="e.g. EMP-1042" value="${esc(su.employeeNumber || "")}"></label>
     <button class="btn btn-accent btn-block" id="csave">Submit for approval</button>
     <div style="text-align:center;margin-top:.9rem"><a href="#" id="cso">Sign out</a></div>
   </div></div>`;
