@@ -29,6 +29,14 @@ const db = initializeFirestore(fbApp, {
 /* -------------------- 2. State & helpers -------------------- */
 const State = { user: null, profile: null, config: null, view: "dashboard", params: {} };
 
+// Master job-title list (exact order). Stored in config/app so Admins can
+// add/remove entries; this is the seed/default when config has none.
+const DEFAULT_JOB_TITLES = [
+  "Technician", "Foreman", "Supervisor", "CCR Operator", "Shift Engineer",
+  "Patrolman", "Engineer", "Chief Engineer", "Manager", "Shift Supervisor",
+  "PPM Inspector", "Quality Supervisor", "Lab Technician", "Safety Officer", "Officer"
+];
+
 const DEFAULT_CONFIG = {
   permitTypes: [
     { code: "general", name: "General / Cold Work", abbr: "GEN", requiresIsolation: false, requiresGasTest: false,
@@ -47,7 +55,8 @@ const DEFAULT_CONFIG = {
     { name: "Production", subUnits: [] },
     { name: "Quality Control", subUnits: [] }
   ],
-  ppeList: ["Helmet", "Safety shoes", "Gloves", "Eye protection", "Ear protection", "Face shield", "Respirator", "Full body harness", "FR coverall", "Insulating gloves"]
+  ppeList: ["Helmet", "Safety shoes", "Gloves", "Eye protection", "Ear protection", "Face shield", "Respirator", "Full body harness", "FR coverall", "Insulating gloves"],
+  jobTitles: [...DEFAULT_JOB_TITLES]
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -62,6 +71,36 @@ function fmt(iso) {
 }
 function fmtDate(iso) { if (!iso) return "—"; const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleDateString([], { year: "numeric", month: "short", day: "2-digit" }); }
 function initials(name) { return (name || "?").split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase(); }
+
+/* -------------------- People & roles -------------------- */
+// Job titles available in the app — config overrides the built-in default.
+function jobTitles() { return (State.config?.jobTitles?.length ? State.config.jobTitles : DEFAULT_JOB_TITLES); }
+// Department names from config (kept exactly as configured — never recreated here).
+function departmentNames() { return (State.config?.departments || DEFAULT_CONFIG.departments).map((d) => d.name); }
+
+// Identity meta stamped alongside a person's name on permits / certificates.
+function myMeta() {
+  const p = State.profile || {};
+  return { jobTitle: p.jobTitle || "", department: p.department || "", employeeNumber: p.employeeNumber || "" };
+}
+function userMeta(u) {
+  u = u || {};
+  return { jobTitle: u.jobTitle || u.position || "", department: u.department || "", employeeNumber: u.employeeNumber || "" };
+}
+// "Full Name / Job Title / Department / Employee No." — blank parts skipped.
+function personText(name, meta) {
+  const parts = [name, meta?.jobTitle, meta?.department, meta?.employeeNumber]
+    .map((x) => (x == null ? "" : String(x)).trim()).filter(Boolean);
+  return parts.length ? parts.join(" / ") : "—";
+}
+// HTML-escaped variant for on-screen rendering.
+function personHTML(name, meta) { return esc(personText(name, meta)); }
+// <option> list helper that always keeps the current value selectable.
+function optionList(items, selected) {
+  const arr = [...items];
+  if (selected && !arr.includes(selected)) arr.unshift(selected);
+  return `<option value="">Select…</option>` + arr.map((x) => `<option ${x === selected ? "selected" : ""}>${esc(x)}</option>`).join("");
+}
 
 const TYPE_CLASS = { general: "permit-type-general", hot: "permit-type-hot", loto: "permit-type-loto", confined: "permit-type-confined" };
 const TYPE_DOT = { general: "var(--steel)", hot: "var(--red)", loto: "var(--amber)", confined: "var(--green)" };
@@ -190,10 +229,7 @@ function renderLogin(error = "") {
       <label class="field"><span>Password</span><input type="password" id="pass" autocomplete="current-password" placeholder="••••••••"></label>
       ${mode === "signup" ? `
         <label class="field"><span>Full name <span class="req">*</span></span><input type="text" id="fname" placeholder="e.g. Fiaz Ahmed"></label>
-        <div class="grid-2">
-          <label class="field"><span>Department</span><input type="text" id="fdept" placeholder="e.g. Maintenance"></label>
-          <label class="field"><span>Position</span><input type="text" id="fpos" placeholder="e.g. Shift Engineer"></label>
-        </div>` : ""}
+        <div class="help">Department, job title and employee number are completed on the next step.</div>` : ""}
       <button class="btn btn-accent btn-block" id="go">${mode === "signin" ? "Sign in" : "Create account"}</button>
       <div style="text-align:center;margin-top:1rem;font-size:.85rem;color:var(--muted)">
         ${mode === "signin" ? "New here?" : "Already registered?"}
@@ -215,7 +251,7 @@ function renderLogin(error = "") {
         const name = $("#fname").value.trim();
         if (!name) { $("#go").disabled = false; return toast("Full name is required", "err"); }
         const cred = await createUserWithEmailAndPassword(auth, email, pass);
-        sessionStorage.setItem("signup", JSON.stringify({ name, dept: $("#fdept").value.trim(), pos: $("#fpos").value.trim() }));
+        sessionStorage.setItem("signup", JSON.stringify({ name }));
         // onAuthStateChanged will route to bootstrap/complete-profile
       }
     } catch (e) {
@@ -243,32 +279,40 @@ function renderBootstrap(user) {
       (permit types, lines, areas, departments) and make <b>${esc(user.email)}</b> the <b>Administrator</b>.</div>
     <label class="field"><span>Your name <span class="req">*</span></span><input type="text" id="bn" value="${esc(su.name || "")}"></label>
     <div class="grid-2">
-      <label class="field"><span>Department</span><input type="text" id="bd" value="${esc(su.dept || "")}"></label>
-      <label class="field"><span>Position</span><input type="text" id="bp" value="${esc(su.pos || "")}"></label>
+      <label class="field"><span>Department <span class="req">*</span></span><select id="bd">${optionList(DEFAULT_CONFIG.departments.map((d) => d.name), "")}</select></label>
+      <label class="field"><span>Job Title <span class="req">*</span></span><select id="bj">${optionList(DEFAULT_JOB_TITLES, "")}</select></label>
     </div>
+    <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="be" placeholder="e.g. EMP-1042"></label>
     <button class="btn btn-accent btn-block" id="binit">Initialise system as Administrator</button>
     <div style="text-align:center;margin-top:.9rem"><a href="#" id="bso">Sign out</a></div>
   </div></div>`;
   $("#bso").onclick = (e) => { e.preventDefault(); signOut(auth); };
   $("#binit").onclick = async () => {
-    const name = $("#bn").value.trim(); if (!name) return toast("Enter your name", "err");
+    const name = $("#bn").value.trim(), department = $("#bd").value, jobTitle = $("#bj").value, employeeNumber = $("#be").value.trim();
+    if (!name) return toast("Enter your name", "err");
+    if (!department) return toast("Select your department", "err");
+    if (!jobTitle) return toast("Select your job title", "err");
+    if (!employeeNumber) return toast("Enter your employee number", "err");
     $("#binit").disabled = true;
     try {
       await setDoc(doc(db, "config", "app"), DEFAULT_CONFIG);
       await setDoc(doc(db, "users", user.uid), {
         name, email: user.email, role: "admin", active: true,
-        department: $("#bd").value.trim(), position: $("#bp").value.trim(), createdAt: nowISO()
+        department, jobTitle, employeeNumber, createdAt: nowISO()
       });
       await setDoc(doc(db, "meta", "init"), { initialisedBy: user.uid, at: nowISO() });
       sessionStorage.removeItem("signup");
-      State.profile = { id: user.uid, name, role: "admin", active: true };
+      State.profile = { id: user.uid, name, role: "admin", active: true, department, jobTitle, employeeNumber };
       await loadConfig(); renderApp(); toast("System initialised", "ok");
     } catch (e) { $("#binit").disabled = false; toast(e.message, "err"); }
   };
 }
 
-function renderCompleteProfile(user) {
+async function renderCompleteProfile(user) {
   const su = JSON.parse(sessionStorage.getItem("signup") || "{}");
+  // Departments and job titles come from config/app — load it so the
+  // dropdowns reflect the configured lists (never invent new departments).
+  if (!State.config) { try { await loadConfig(); } catch { State.config = DEFAULT_CONFIG; } }
   const root = $("#app");
   root.innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand"><div class="mark">${ICON.lock}</div>
@@ -276,19 +320,24 @@ function renderCompleteProfile(user) {
     <div class="info-box">Your account will be created as <b>pending</b>. An administrator must activate it and assign your role before you can raise permits.</div>
     <label class="field"><span>Your name <span class="req">*</span></span><input type="text" id="cn" value="${esc(su.name || "")}"></label>
     <div class="grid-2">
-      <label class="field"><span>Department</span><input type="text" id="cd" value="${esc(su.dept || "")}"></label>
-      <label class="field"><span>Position</span><input type="text" id="cp" value="${esc(su.pos || "")}"></label>
+      <label class="field"><span>Department <span class="req">*</span></span><select id="cd">${optionList(departmentNames(), "")}</select></label>
+      <label class="field"><span>Job Title <span class="req">*</span></span><select id="cj">${optionList(jobTitles(), "")}</select></label>
     </div>
+    <label class="field"><span>Employee Number <span class="req">*</span></span><input type="text" id="ce" placeholder="e.g. EMP-1042"></label>
     <button class="btn btn-accent btn-block" id="csave">Submit for approval</button>
     <div style="text-align:center;margin-top:.9rem"><a href="#" id="cso">Sign out</a></div>
   </div></div>`;
   $("#cso").onclick = (e) => { e.preventDefault(); signOut(auth); };
   $("#csave").onclick = async () => {
-    const name = $("#cn").value.trim(); if (!name) return toast("Enter your name", "err");
+    const name = $("#cn").value.trim(), department = $("#cd").value, jobTitle = $("#cj").value, employeeNumber = $("#ce").value.trim();
+    if (!name) return toast("Enter your name", "err");
+    if (!department) return toast("Select your department", "err");
+    if (!jobTitle) return toast("Select your job title", "err");
+    if (!employeeNumber) return toast("Enter your employee number", "err");
     try {
       await setDoc(doc(db, "users", user.uid), {
         name, email: user.email, role: "requester", active: false,
-        department: $("#cd").value.trim(), position: $("#cp").value.trim(), createdAt: nowISO()
+        department, jobTitle, employeeNumber, createdAt: nowISO()
       });
       sessionStorage.removeItem("signup"); renderPending();
     } catch (e) { toast(e.message, "err"); }
@@ -655,7 +704,7 @@ async function viewNewPermit(m) {
       status,
       equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
       isolationRef: null, isoNo: null,
-      requester: { uid: State.profile.id, name: State.profile.name },
+      requester: { uid: State.profile.id, name: State.profile.name, ...myMeta() },
       requestingDepartment: { department: $("#dept").value, subUnit: $("#subunit").value || null },
       workDescription: desc, location: $("#loc").value.trim(),
       validity: { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: null },
@@ -706,22 +755,22 @@ async function viewPermitDetail(m) {
       <h2 style="display:flex;align-items:center;gap:.6rem"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}</h2></div>
       <div class="actions">${actions}</div></div>
 
-    ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${esc(p.rejection.byName || "")}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
+    ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
     ${equip && equip.isolationStatus === "trialRun" ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — equipment ${esc(equip.tag)} is ENERGISED.</b></div>` : ""}
-    ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${esc(isoDoc?.assignedTo?.name || "—")}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
+    ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
 
     <div class="cols cols-2">
       <div class="card"><h3>Details</h3>
         ${kv("Equipment", `<span class="mono">${esc(p.equipmentTag)}</span> ${equip ? "· " + esc(equip.line) + " / " + esc(equip.area) : ""}`)}
         ${p.isoNo ? kv("Isolation cert.", `<a href="#" data-isolink class="mono">${esc(p.isoNo)}</a>`) : ""}
-        ${kv("Requester", esc(p.requester?.name))}
+        ${kv("Requester", personHTML(p.requester?.name, p.requester))}
         ${kv("Department", esc(p.requestingDepartment?.department || "—") + (p.requestingDepartment?.subUnit ? " · " + esc(p.requestingDepartment.subUnit) : ""))}
         ${kv("Work", esc(p.workDescription))}
         ${p.location ? kv("Location", esc(p.location)) : ""}
         ${kv("Valid from", fmt(p.validity?.start))}
         ${kv("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
-        ${p.approval ? kv("Approved by", esc(p.approval.issuerName) + " · " + fmt(p.approval.timestamp)) : ""}
-        ${p.closure ? kv("Closed by", esc(p.closure.name) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
+        ${p.approval ? kv("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
+        ${p.closure ? kv("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
       </div>
       <div class="card"><h3>Hazard checklist</h3>
         ${(p.checklist || []).map((c) => `<div class="checkline">${c.checked ? "☑" : "☐"} ${esc(c.item)}</div>`).join("") || "<div class='help'>None</div>"}
@@ -734,14 +783,14 @@ async function viewPermitDetail(m) {
     </div>
 
     ${p.isolationPoints?.length || p.isolationRef ? `<div class="card"><h3>Isolation / LOTO</h3>
-      ${p.isolationRef ? `<div class="info-box">Isolation certificate <a href="#" data-isolink2 class="mono">${esc(p.isoNo || p.isolationRef)}</a> on ${esc(p.equipmentTag)}${isoDoc ? " — " + (isoDoc.status === "assigned" ? "awaiting confirmation by " + esc(isoDoc.assignedTo?.name || "") : "status: " + esc(isoDoc.status)) : ""}.</div>` : ""}
+      ${p.isolationRef ? `<div class="info-box">Isolation certificate <a href="#" data-isolink2 class="mono">${esc(p.isoNo || p.isolationRef)}</a> on ${esc(p.equipmentTag)}${isoDoc ? " — " + (isoDoc.status === "assigned" ? "awaiting confirmation by " + personHTML(isoDoc.assignedTo?.name, isoDoc.assignedTo) : "status: " + esc(isoDoc.status)) : ""}.</div>` : ""}
       <table class="tbl"><thead><tr><th>Point</th><th>Method</th><th>Lock / tag</th></tr></thead><tbody>
         ${(p.isolationPoints || []).map((i) => `<tr><td>${esc(i.point)}</td><td>${esc(i.method || "—")}</td><td>${esc(i.lockTag || "—")}</td></tr>`).join("") || `<tr><td colspan="3" class="empty">No points listed</td></tr>`}
       </tbody></table></div>` : ""}
 
     ${p.trialRuns?.length ? `<div class="card"><h3>Trial run log</h3>
       ${p.trialRuns.map((t) => `<div class="kv"><div class="k">${fmt(t.authorisedAt || t.requestedAt)}</div>
-        <div class="v">Authorised by ${esc(t.authorisedBy || "—")} · ${t.reIsolatedAt ? "Re-isolated " + fmt(t.reIsolatedAt) : "OPEN"}</div></div>`).join("")}</div>` : ""}
+        <div class="v">Authorised by ${personHTML(t.authorisedBy, t.authorisedByMeta)} · ${t.reIsolatedAt ? "Re-isolated " + fmt(t.reIsolatedAt) : "OPEN"}</div></div>`).join("")}</div>` : ""}
   `;
 
   // bind actions
@@ -753,7 +802,7 @@ async function viewPermitDetail(m) {
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Reject</button>` });
     $("[data-c]").onclick = closeModal;
     $("[data-ok]").onclick = async () => {
-      await updateDoc(doc(db, "permits", id), { status: "rejected", rejection: { by: State.profile.id, byName: State.profile.name, reason: $("#rr").value.trim(), timestamp: nowISO() }, updatedAt: nowISO() });
+      await updateDoc(doc(db, "permits", id), { status: "rejected", rejection: { by: State.profile.id, byName: State.profile.name, ...myMeta(), reason: $("#rr").value.trim(), timestamp: nowISO() }, updatedAt: nowISO() });
       if (p.isolationRef) {
         const s = await getDoc(doc(db, "isolations", p.isolationRef));
         if (s.exists()) {
@@ -761,7 +810,7 @@ async function viewPermitDetail(m) {
           const rem = (isoX.attachedPermitIds || []).filter((x) => x !== id);
           if (rem.length) await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: rem });
           else if (isoX.status === "assigned") {
-            await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name }, removalNote: "Cancelled — permit rejected before isolation" });
+            await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled — permit rejected before isolation" });
             await updateDoc(doc(db, "equipment", p.equipmentRef), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
           } else await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: [], status: "removalPending" });
         }
@@ -786,7 +835,7 @@ async function viewPermitDetail(m) {
 /* -------------------- 6. Permit + isolation logic -------------------- */
 async function approvePermit(p, equip) {
   const type = State.config.permitTypes.find((t) => t.code === p.type);
-  const approval = () => ({ issuerUid: State.profile.id, issuerName: State.profile.name, timestamp: nowISO() });
+  const approval = () => ({ issuerUid: State.profile.id, issuerName: State.profile.name, ...myMeta(), timestamp: nowISO() });
 
   // --- non-isolation permits: approve straight to Active ---
   if (!type.requiresIsolation) {
@@ -836,23 +885,23 @@ async function approvePermit(p, equip) {
     <div class="section-title">Isolation points (from the permit)</div>
     ${(p.isolationPoints || []).map((i) => `<div class="checkline">• ${esc(i.point)}${i.method ? " — " + esc(i.method) : ""}${i.lockTag ? " · " + esc(i.lockTag) : ""}</div>`).join("") || "<div class='help'>No points listed — they can be completed at confirmation.</div>"}
     <label class="field" style="margin-top:.8rem"><span>Assign isolation to <span class="req">*</span></span>
-      <select id="assignTo">${users.map((u) => `<option value="${u.id}|${esc(u.name)}">${esc(u.name)}${u.position ? " — " + esc(u.position) : ""}</option>`).join("")}</select></label>`,
+      <select id="assignTo">${users.map((u) => `<option value="${u.id}">${esc(u.name)}${(u.jobTitle || u.position) ? " — " + esc(u.jobTitle || u.position) : ""}</option>`).join("")}</select></label>`,
     footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-success" data-ok>Approve & assign isolation</button>` });
   $("[data-c]").onclick = closeModal;
   $("[data-ok]").onclick = async () => {
-    const [auid, aname] = $("#assignTo").value.split("|");
+    const au = users.find((u) => u.id === $("#assignTo").value);
     const isoId = uid(); const isoNo = makeIsoNo();
     await setDoc(doc(db, "isolations", isoId), {
       isoNo, equipmentRef: equip.id, equipmentTag: equip.tag,
       points: p.isolationPoints || [], status: "assigned",
-      assignedTo: { uid: auid, name: aname }, assignedBy: { uid: State.profile.id, name: State.profile.name }, assignedAt: nowISO(),
+      assignedTo: { uid: au?.id || null, name: au?.name || "", ...userMeta(au) }, assignedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, assignedAt: nowISO(),
       confirmedBy: null, confirmedAt: null,
       removalAssignedTo: null, removalAssignedAt: null, removalConfirmedBy: null, removedAt: null,
-      attachedPermitIds: [p.id], createdBy: State.profile.name, createdAt: nowISO()
+      attachedPermitIds: [p.id], createdBy: State.profile.name, createdByMeta: myMeta(), createdAt: nowISO()
     });
     await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "pending", activeIsolationId: isoId, updatedAt: nowISO() });
     await updateDoc(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: isoId, isoNo, approval: approval(), updatedAt: nowISO() });
-    closeModal(); toast(`Certificate ${isoNo} assigned to ${aname}`, "ok"); go("detail", { id: p.id }); refreshPendingBadge();
+    closeModal(); toast(`Certificate ${isoNo} assigned to ${au?.name || ""}`, "ok"); go("detail", { id: p.id }); refreshPendingBadge();
   };
 }
 
@@ -871,7 +920,7 @@ async function closePermit(p, equip) {
     const users = await isolatorUsers();
     const deisoBlock = users.length
       ? `<label class="checkline"><input type="radio" name="deiso" value="assign" checked> Assign de-isolation to:</label>
-      <select id="deisoUser" style="margin:.2rem 0 .6rem">${users.map((u) => `<option value="${u.id}|${esc(u.name)}">${esc(u.name)}${u.position ? " — " + esc(u.position) : ""}</option>`).join("")}</select>
+      <select id="deisoUser" style="margin:.2rem 0 .6rem">${users.map((u) => `<option value="${u.id}">${esc(u.name)}${(u.jobTitle || u.position) ? " — " + esc(u.jobTitle || u.position) : ""}</option>`).join("")}</select>
       <label class="checkline"><input type="radio" name="deiso" value="now"> Locks already removed — I confirm de-isolation now</label>`
       : `<div class="help">No active Isolator users available to assign — ask an Admin to assign the Isolator role to a user, or confirm de-isolation directly below.</div>
       <label class="checkline"><input type="radio" name="deiso" value="now" checked> Locks already removed — I confirm de-isolation now</label>`;
@@ -886,21 +935,21 @@ async function closePermit(p, equip) {
 
   confirmBoxHTML("Close permit", body, "Close permit", async () => {
     const remarks = $("#crem")?.value.trim() || "";
-    await updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, remarks, timestamp: nowISO() }, updatedAt: nowISO() });
+    await updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() });
     if (iso) {
       if (!last) {
         await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: remaining });
       } else if (iso.status === "assigned") {
-        await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name }, removalNote: "Cancelled before isolation was applied" });
+        await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled before isolation was applied" });
         if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
       } else {
         const mode = document.querySelector('input[name="deiso"]:checked')?.value || "now";
         if (mode === "now") {
-          await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name } });
+          await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() } });
           if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
         } else {
-          const [ruid, rname] = $("#deisoUser").value.split("|");
-          await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removalPending", removalAssignedTo: { uid: ruid, name: rname }, removalAssignedAt: nowISO() });
+          const ru = users.find((u) => u.id === $("#deisoUser").value);
+          await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removalPending", removalAssignedTo: { uid: ru?.id || null, name: ru?.name || "", ...userMeta(ru) }, removalAssignedAt: nowISO() });
           // equipment stays Isolated (locks still on) until the assignee confirms removal
         }
       }
@@ -923,7 +972,7 @@ async function trialRun(p, equip) {
   $("[data-c]").onclick = closeModal;
   $("[data-ok]").onclick = async () => {
     if (!($("#clr1").checked && $("#clr2").checked && $("#clr3").checked)) return toast("Confirm all three checks", "err");
-    const tr = { requestedBy: State.profile.name, requestedAt: nowISO(), authorisedBy: State.profile.name, authorisedAt: nowISO(), reIsolatedAt: null, status: "open" };
+    const tr = { requestedBy: State.profile.name, requestedAt: nowISO(), authorisedBy: State.profile.name, authorisedByMeta: myMeta(), authorisedAt: nowISO(), reIsolatedAt: null, status: "open" };
     await updateDoc(doc(db, "permits", p.id), { trialRuns: [...(p.trialRuns || []), tr], updatedAt: nowISO() });
     if (isoRef) await updateDoc(isoRef, { status: "trialRun" });
     if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
@@ -1054,32 +1103,39 @@ async function viewAdmin(m) {
       <textarea id="cDepts" rows="4">${esc((State.config.departments || []).map((d) => d.name + (d.subUnits?.length ? ": " + d.subUnits.join(", ") : "")).join("\n"))}</textarea>
       <div class="section-title">PPE options</div>
       <textarea id="cPpe" rows="3">${esc((State.config.ppeList || []).join("\n"))}</textarea>
+      <div class="section-title">Job Titles (one per line — order is preserved; used in sign-up and user management)</div>
+      <textarea id="cTitles" rows="6">${esc(jobTitles().join("\n"))}</textarea>
       <div style="margin-top:1rem;text-align:right"><button class="btn btn-accent" id="saveCfg">Save configuration</button></div>
     </div>`;
   // users
   const users = await fetchAll("users");
-  $("#users").innerHTML = `<table class="tbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Active</th><th></th></tr></thead><tbody>
+  $("#users").innerHTML = `<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Name</th><th>Email</th><th>Job Title</th><th>Department</th><th>Employee No.</th><th>Role</th><th>Active</th><th></th></tr></thead><tbody>
     ${users.map((u) => `<tr><td>${esc(u.name)}</td><td>${esc(u.email || "—")}</td>
+      <td><select data-jt="${u.id}">${optionList(jobTitles(), u.jobTitle || u.position || "")}</select></td>
+      <td><select data-dp="${u.id}">${optionList(departmentNames(), u.department || "")}</select></td>
+      <td><input type="text" data-en="${u.id}" value="${esc(u.employeeNumber || "")}" placeholder="EMP-…" style="min-width:110px"></td>
       <td><select data-role="${u.id}" ${u.id === State.profile.id ? "disabled" : ""}>
         ${["requester", "issuer", "admin", "isolator"].map((r) => `<option ${u.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></td>
       <td><label class="checkline" style="padding:0"><input type="checkbox" data-active="${u.id}" ${u.active ? "checked" : ""} ${u.id === State.profile.id ? "disabled" : ""}></label></td>
-      <td><button class="btn btn-ghost btn-sm" data-saveu="${u.id}">Save</button></td></tr>`).join("")}</tbody></table>`;
+      <td><button class="btn btn-ghost btn-sm" data-saveu="${u.id}">Save</button></td></tr>`).join("")}</tbody></table></div>`;
   $$("[data-saveu]").forEach((b) => b.onclick = async () => {
     const id = b.dataset.saveu;
     const role = $(`[data-role="${id}"]`).value, active = $(`[data-active="${id}"]`).checked;
-    try { await updateDoc(doc(db, "users", id), { role, active }); toast("User updated", "ok"); } catch (e) { toast(e.message, "err"); }
+    const jobTitle = $(`[data-jt="${id}"]`).value, department = $(`[data-dp="${id}"]`).value, employeeNumber = $(`[data-en="${id}"]`).value.trim();
+    try { await updateDoc(doc(db, "users", id), { role, active, jobTitle, department, employeeNumber }); toast("User updated", "ok"); } catch (e) { toast(e.message, "err"); }
   });
   // config save
   $("#saveCfg").onclick = async () => {
     const lines = $("#cLines").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const areas = $("#cAreas").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const ppeList = $("#cPpe").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
+    const jobTitlesList = $("#cTitles").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const departments = $("#cDepts").value.split(/\n/).map((s) => s.trim()).filter(Boolean).map((ln) => {
       const [name, subs] = ln.split(":"); return { name: name.trim(), subUnits: (subs || "").split(",").map((x) => x.trim()).filter(Boolean) };
     });
     try {
-      await updateDoc(doc(db, "config", "app"), { lines, areas, ppeList, departments });
-      State.config = { ...State.config, lines, areas, ppeList, departments };
+      await updateDoc(doc(db, "config", "app"), { lines, areas, ppeList, departments, jobTitles: jobTitlesList });
+      State.config = { ...State.config, lines, areas, ppeList, departments, jobTitles: jobTitlesList };
       toast("Configuration saved", "ok");
     } catch (e) { toast(e.message, "err"); }
   };
@@ -1100,13 +1156,13 @@ function printPermit(p, equip) {
         ${row("Status", esc(p.status.toUpperCase()))}
         ${row("Equipment", esc(p.equipmentTag) + (equip ? " · " + esc(equip.line) + " / " + esc(equip.area) : ""))}
         ${p.isoNo ? row("Isolation certificate", esc(p.isoNo)) : ""}
-        ${row("Requester", esc(p.requester?.name))}
+        ${row("Requester", personHTML(p.requester?.name, p.requester))}
         ${row("Department", esc(p.requestingDepartment?.department || "—") + (p.requestingDepartment?.subUnit ? " · " + esc(p.requestingDepartment.subUnit) : ""))}
         ${row("Work", esc(p.workDescription))}
         ${row("Valid from", fmt(p.validity?.start))}
         ${row("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
-        ${p.approval ? row("Approved by", esc(p.approval.issuerName) + " · " + fmt(p.approval.timestamp)) : ""}
-        ${p.closure ? row("Closed by", esc(p.closure.name) + " · " + fmt(p.closure.timestamp)) : ""}
+        ${p.approval ? row("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
+        ${p.closure ? row("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp)) : ""}
       </table>
       <div style="margin-top:14px;font-weight:800;color:#2A6F97;font-size:13px">HAZARD CHECKLIST</div>
       <div>${(p.checklist || []).map((c) => `<div>${c.checked ? "☑" : "☐"} ${esc(c.item)}</div>`).join("")}</div>
@@ -1191,16 +1247,16 @@ async function viewIsolationDetail(m) {
     <div class="page-head"><div><div class="kick">Isolation Certificate</div>
       <h2 style="display:flex;align-items:center;gap:.6rem"><span class="mono" style="font-size:1.1rem">${esc(iso.isoNo || iso.id)}</span> ${badge(iso.status)}</h2></div>
       <div class="actions">${actions}</div></div>
-    ${iso.status === "assigned" ? `<div class="warn-box">Awaiting confirmation by <b>${esc(iso.assignedTo?.name || "—")}</b>. Work must not start until the isolation is confirmed.</div>` : ""}
-    ${iso.status === "removalPending" ? `<div class="warn-box">De-isolation assigned to <b>${esc(iso.removalAssignedTo?.name || "(unassigned — Issuer to action)")}</b>. Locks are still ON.</div>` : ""}
+    ${iso.status === "assigned" ? `<div class="warn-box">Awaiting confirmation by <b>${personHTML(iso.assignedTo?.name, iso.assignedTo)}</b>. Work must not start until the isolation is confirmed.</div>` : ""}
+    ${iso.status === "removalPending" ? `<div class="warn-box">De-isolation assigned to <b>${iso.removalAssignedTo ? personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) : "(unassigned — Issuer to action)"}</b>. Locks are still ON.</div>` : ""}
     <div class="cols cols-2">
       <div class="card"><h3>Certificate</h3>
         ${kv("Equipment", `<span class="mono">${esc(iso.equipmentTag)}</span>${equip ? " · " + esc(equip.line) + " / " + esc(equip.area) : ""}`)}
-        ${kv("Created", esc(iso.createdBy || "—") + " · " + fmt(iso.createdAt))}
-        ${kv("Assigned to", iso.assignedTo ? esc(iso.assignedTo.name) + " · " + fmt(iso.assignedAt) : "—")}
-        ${kv("Isolation confirmed", iso.confirmedBy ? esc(iso.confirmedBy.name) + " · " + fmt(iso.confirmedAt) : "—")}
-        ${iso.removalAssignedTo ? kv("De-isolation assigned", esc(iso.removalAssignedTo.name) + " · " + fmt(iso.removalAssignedAt)) : ""}
-        ${kv("De-isolation confirmed", iso.removalConfirmedBy ? esc(iso.removalConfirmedBy.name) + " · " + fmt(iso.removedAt) : "—")}
+        ${kv("Created", iso.createdBy ? personHTML(iso.createdBy, iso.createdByMeta) + " · " + fmt(iso.createdAt) : "—")}
+        ${kv("Assigned to", iso.assignedTo ? personHTML(iso.assignedTo.name, iso.assignedTo) + " · " + fmt(iso.assignedAt) : "—")}
+        ${kv("Isolation confirmed", iso.confirmedBy ? personHTML(iso.confirmedBy.name, iso.confirmedBy) + " · " + fmt(iso.confirmedAt) : "—")}
+        ${iso.removalAssignedTo ? kv("De-isolation assigned", personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) + " · " + fmt(iso.removalAssignedAt)) : ""}
+        ${kv("De-isolation confirmed", iso.removalConfirmedBy ? personHTML(iso.removalConfirmedBy.name, iso.removalConfirmedBy) + " · " + fmt(iso.removedAt) : "—")}
       </div>
       <div class="card"><h3>Attached permits</h3>
         <div class="attached-list">${attached.map((p) => `<div class="a" data-pl="${p.id}" style="cursor:pointer"><span class="mono">${esc(p.permitNo)}</span> ${esc(p.typeName)} ${badge(p.status)}</div>`).join("") || "<div class='help'>None</div>"}</div>
@@ -1224,7 +1280,7 @@ async function viewIsolationDetail(m) {
     $("[data-ok]").onclick = async () => {
       if (!$("#ckAll").checked) return toast("Tick the confirmation statement", "err");
       const pts = (iso.points || []).map((pt, i) => ({ ...pt, lockTag: $(`[data-lk="${i}"]`)?.value.trim() || pt.lockTag || "" }));
-      await updateDoc(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name }, confirmedAt: nowISO() });
+      await updateDoc(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
       if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
       for (const p of attached) if (p.status === "awaitingIsolation")
         await updateDoc(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
@@ -1235,7 +1291,7 @@ async function viewIsolationDetail(m) {
   if (canRemove) $("#rem").onclick = () => confirmBoxHTML("Confirm de-isolation",
     `<p>All locks and tags have been removed from <b>${esc(iso.equipmentTag)}</b>? The equipment returns to <b>Available</b>.</p>`,
     "Confirm de-isolation", async () => {
-      await updateDoc(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name } });
+      await updateDoc(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
       if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
       closeModal(); toast("De-isolation confirmed — equipment available", "ok"); go("isodetail", { id });
     });
@@ -1253,11 +1309,11 @@ function printIsolation(iso, equip, attached) {
       </div>
       <table style="width:100%;border-collapse:collapse;margin-top:14px">
         ${row("Equipment", esc(iso.equipmentTag) + (equip ? " · " + esc(equip.line) + " / " + esc(equip.area) : ""))}
-        ${row("Created by", esc(iso.createdBy || "—") + " · " + fmt(iso.createdAt))}
-        ${row("Assigned to", iso.assignedTo ? esc(iso.assignedTo.name) + " · " + fmt(iso.assignedAt) : "—")}
-        ${row("Isolation confirmed", iso.confirmedBy ? esc(iso.confirmedBy.name) + " · " + fmt(iso.confirmedAt) : "—")}
-        ${iso.removalAssignedTo ? row("De-isolation assigned", esc(iso.removalAssignedTo.name) + " · " + fmt(iso.removalAssignedAt)) : ""}
-        ${row("De-isolation confirmed", iso.removalConfirmedBy ? esc(iso.removalConfirmedBy.name) + " · " + fmt(iso.removedAt) : "—")}
+        ${row("Created by", iso.createdBy ? personHTML(iso.createdBy, iso.createdByMeta) + " · " + fmt(iso.createdAt) : "—")}
+        ${row("Assigned to", iso.assignedTo ? personHTML(iso.assignedTo.name, iso.assignedTo) + " · " + fmt(iso.assignedAt) : "—")}
+        ${row("Isolation confirmed", iso.confirmedBy ? personHTML(iso.confirmedBy.name, iso.confirmedBy) + " · " + fmt(iso.confirmedAt) : "—")}
+        ${iso.removalAssignedTo ? row("De-isolation assigned", personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) + " · " + fmt(iso.removalAssignedAt)) : ""}
+        ${row("De-isolation confirmed", iso.removalConfirmedBy ? personHTML(iso.removalConfirmedBy.name, iso.removalConfirmedBy) + " · " + fmt(iso.removedAt) : "—")}
       </table>
       <div style="margin-top:14px;font-weight:800;color:#2A6F97;font-size:13px">ISOLATION POINTS</div>
       <table style="width:100%;border-collapse:collapse;border:1px solid #ccc"><tr style="background:#f2f5f8"><th style="text-align:left;padding:5px">Point</th><th style="text-align:left;padding:5px">Method</th><th style="text-align:left;padding:5px">Lock/Tag</th></tr>
