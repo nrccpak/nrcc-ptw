@@ -478,6 +478,19 @@ async function activeUsers() { const u = await fetchAll("users"); return u.filte
 // Only active users holding the Isolator role — used for isolation / de-isolation assignment.
 async function isolatorUsers() { return (await activeUsers()).filter((x) => x.role === "isolator"); }
 
+// A confirmed (active) certificate is ready for de-isolation once every permit
+// attached to it has had its work confirmed complete (or is otherwise closed).
+// This is what makes the Isolator's de-isolation step open automatically after
+// the last crew signs off — without the requester writing to the certificate.
+function isoReadyForDeiso(iso, permits) {
+  if (!iso || iso.status !== "active") return false;
+  const att = permits.filter((p) => p.isolationRef === iso.id);
+  if (!att.length) return false;
+  return att.every((p) =>
+    ["closed", "rejected", "expired"].includes(p.status) ||
+    (["active", "extended"].includes(p.status) && !!p.workCompletion));
+}
+
 async function refreshPendingBadge() {
   if (!["issuer", "admin"].includes(State.profile.role)) return;
   try {
@@ -512,17 +525,19 @@ async function viewDashboard(m) {
 
   const me = State.profile.id;
   // Any Isolator sees all open isolation / de-isolation tasks (not just ones
-  // assigned to them by name) so whoever is on shift can action them.
+  // assigned to them by name) so whoever is on shift can action them. A cert
+  // becomes a de-isolation task automatically once all its crews report done.
   const isIso = State.profile.role === "isolator";
   const tasks = isoAll.filter((i) =>
     (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
-    (i.status === "removalPending" && (isIssuer || isIso || i.removalAssignedTo?.uid === me)));
+    (i.status === "removalPending" && (isIssuer || isIso || i.removalAssignedTo?.uid === me)) ||
+    (isoReadyForDeiso(i, permits) && (isIssuer || isIso)));
   if (tasks.length) {
     html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Isolation tasks</h3></div>
       <table class="tbl"><thead><tr><th>Certificate</th><th>Equipment</th><th>Status</th><th>Assigned to</th></tr></thead><tbody>
-      ${tasks.map((i) => `<tr class="row" data-iid="${i.id}">
+      ${tasks.map((i) => { const deiso = i.status === "removalPending" || isoReadyForDeiso(i, permits); return `<tr class="row" data-iid="${i.id}">
         <td><span class="mono">${esc(i.isoNo || i.id)}</span></td><td>${esc(i.equipmentTag)}</td>
-        <td>${badge(i.status)}</td><td>${esc((i.status === "removalPending" ? i.removalAssignedTo?.name : i.assignedTo?.name) || "—")}</td></tr>`).join("")}
+        <td>${badge(deiso ? "removalPending" : i.status)}</td><td>${esc((deiso ? i.removalAssignedTo?.name : i.assignedTo?.name) || "—")}</td></tr>`; }).join("")}
       </tbody></table></div>`;
   }
 
@@ -773,17 +788,30 @@ async function viewPermitDetail(m) {
   const isoSnap = p.isolationRef ? await getDoc(doc(db, "isolations", p.isolationRef)).catch(() => null) : null;
   const isoDoc = isoSnap && isoSnap.exists() ? { id: isoSnap.id, ...isoSnap.data() } : null;
 
+  // Hand-back order: requester confirms work complete → Isolator de-isolates →
+  // Issuer closes. The equipment is de-isolated when there is no certificate or
+  // its certificate has been removed.
+  const deisolated = !p.isolationRef || (isoDoc && isoDoc.status === "removed");
+  const awaitingDeiso = ["active", "extended"].includes(p.status) && p.workCompletion && !deisolated;
+  // For a shared certificate, de-isolation only opens once every crew has signed
+  // off. Work that out so we can show whether it's ready now or waiting on others.
+  let deisoReady = false;
+  if (awaitingDeiso && isoDoc) {
+    const allPermits = await fetchPermits();
+    deisoReady = isoDoc.status === "removalPending" || isoReadyForDeiso(isoDoc, allPermits);
+  }
   const kv = (k, v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   let actions = "";
   if (p.status === "submitted" && isIssuer) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
   if (["submitted", "awaitingIsolation"].includes(p.status) && isIssuer) actions += `<button class="btn btn-danger" id="reject">Reject</button>`;
   if (["draft"].includes(p.status) && isOwner) actions += `<button class="btn btn-accent" id="submitNow">Submit for approval</button>`;
   // The requester signs off that the work is finished and the equipment is safe
-  // to return to service. The Issuer can only close once this is recorded.
+  // to return to service. The Issuer can only close after de-isolation.
   if (["active", "extended"].includes(p.status) && isOwner && !p.workCompletion) actions += `<button class="btn btn-success" id="workdone">Confirm work complete</button>`;
+  if (awaitingDeiso && deisoReady) actions += `<button class="btn btn-accent" id="godeiso">Go to de-isolation</button>`;
   if (["active", "extended"].includes(p.status) && isIssuer) {
     actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
-    if (p.workCompletion) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
+    if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
   }
   if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
   actions += `<button class="btn btn-ghost no-print" id="pdf">${ICON.pdf} Print / PDF</button>`;
@@ -796,8 +824,9 @@ async function viewPermitDetail(m) {
     ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
     ${equip && equip.isolationStatus === "trialRun" ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — equipment ${esc(equip.tag)} is ENERGISED.</b></div>` : ""}
     ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
-    ${["active", "extended"].includes(p.status) && p.workCompletion ? `<div class="ok-box"><b>Work complete — confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)}</b> · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} The Issuer may now close the permit.</div>` : ""}
     ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed."}</div>` : ""}
+    ${awaitingDeiso ? `<div class="warn-box"><b>Work complete — awaiting de-isolation.</b> Confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)} · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} <b>Locks are still on.</b> ${deisoReady ? `An Isolator must de-isolate <span class="mono">${esc(p.equipmentTag || "")}</span> on certificate <a href="#" data-isolink3 class="mono">${esc(p.isoNo || p.isolationRef)}</a> before this permit can be closed.` : `Other crews on the shared isolation are still working — de-isolation will open once every crew has confirmed work complete.`}</div>` : ""}
+    ${["active", "extended"].includes(p.status) && p.workCompletion && deisolated ? `<div class="ok-box"><b>Work complete${p.isolationRef ? " and equipment de-isolated" : ""} — confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)}</b> · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} The Issuer may now close the permit.</div>` : ""}
 
     <div class="cols cols-2">
       <div class="card"><h3>Details</h3>
@@ -836,7 +865,8 @@ async function viewPermitDetail(m) {
 
   // bind actions
   $("#pdf") && ($("#pdf").onclick = () => printPermit(p, equip));
-  $$("[data-isolink],[data-isolink2]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
+  $$("[data-isolink],[data-isolink2],[data-isolink3]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
+  $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#submitNow") && ($("#submitNow").onclick = async () => { await updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() }); toast("Submitted", "ok"); go("detail", { id }); });
   $("#reject") && ($("#reject").onclick = () => {
     modal({ title: "Reject permit", body: `<label class="field"><span>Reason</span><textarea id="rr" placeholder="Why is this being rejected?"></textarea></label>`,
@@ -950,8 +980,9 @@ async function approvePermit(p, equip) {
 // Requester's written sign-off that the job is finished and the equipment is
 // safe to return to service. The permit cannot be closed until this is on record.
 async function confirmWorkComplete(p, equip) {
+  const isolated = !!p.isolationRef;
   modal({ title: "Confirm work complete", wide: true, body: `
-    <div class="info-box">Confirm the work under permit <b class="mono">${esc(p.permitNo)}</b> on <b>${esc(p.equipmentTag || "")}</b> is finished and the equipment is safe to return to service. The Issuer can close the permit only after this confirmation.</div>
+    <div class="info-box">Confirm the work under permit <b class="mono">${esc(p.permitNo)}</b> on <b>${esc(p.equipmentTag || "")}</b> is finished and the equipment is safe to return to service.${isolated ? " An Isolator will then de-isolate the equipment, after which the Issuer can close the permit." : " The Issuer can then close the permit."}</div>
     <label class="field"><span>Completion remarks <span class="req">*</span></span><textarea id="wcRemarks" placeholder="Work completed, tools and personnel removed, area cleared…"></textarea></label>
     <label class="checkline"><input type="checkbox" id="wcAck"> I confirm the work is complete and <b>${esc(p.equipmentTag || "the equipment")}</b> is safe to return to service.</label>`,
     footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-success" data-ok>Confirm work complete</button>` });
@@ -965,64 +996,32 @@ async function confirmWorkComplete(p, equip) {
         workCompletion: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, safeToReturn: true, timestamp: nowISO() },
         updatedAt: nowISO()
       });
-      closeModal(); toast("Work completion confirmed — Issuer can now close the permit", "ok"); go("detail", { id: p.id });
+      closeModal(); toast(isolated ? "Work complete — equipment can now be de-isolated" : "Work complete — Issuer can now close the permit", "ok"); go("detail", { id: p.id });
     } catch (e) { toast(e.message || "Could not confirm work completion", "err"); }
   };
 }
 
 async function closePermit(p, equip) {
-  if (!p.workCompletion) return toast("The requester must confirm the work is complete before closing.", "err");
+  // Hand-back gates: requester signs off work → Isolator de-isolates → Issuer
+  // closes. The de-isolation now happens on the certificate before this point,
+  // so closing is a clean final step (no inline lock removal here).
+  if (!p.workCompletion) return toast("The requester must confirm the work is complete before this permit can be closed.", "err");
   let iso = null;
   if (p.isolationRef) {
     const s = await getDoc(doc(db, "isolations", p.isolationRef));
     if (s.exists()) iso = { id: s.id, ...s.data() };
   }
   if (iso && iso.status === "trialRun") return toast("Re-isolate after the trial run before closing", "err");
-  const remaining = iso ? (iso.attachedPermitIds || []).filter((x) => x !== p.id) : [];
-  const last = iso && remaining.length === 0;
+  if (iso && iso.status !== "removed") return toast("An Isolator must de-isolate the equipment before this permit can be closed.", "err");
 
-  let body = `<label class="field"><span>Closure remarks</span><textarea id="crem" placeholder="Work complete, area cleared…"></textarea></label>`;
-  let users = [];
-  if (last && iso.status === "active") {
-    users = await isolatorUsers();
-    const deisoBlock = users.length
-      ? `<label class="checkline"><input type="radio" name="deiso" value="assign" checked> Assign de-isolation to:</label>
-      <select id="deisoUser" style="margin:.2rem 0 .6rem">${users.map((u) => `<option value="${u.id}">${esc(u.name)}${(u.jobTitle || u.position) ? " — " + esc(u.jobTitle || u.position) : ""}</option>`).join("")}</select>
-      <label class="checkline"><input type="radio" name="deiso" value="now"> Locks already removed — I confirm de-isolation now</label>`
-      : `<div class="help">No active Isolator users available to assign — ask an Admin to assign the Isolator role to a user, or confirm de-isolation directly below.</div>
-      <label class="checkline"><input type="radio" name="deiso" value="now" checked> Locks already removed — I confirm de-isolation now</label>`;
-    body = `<div class="info-box">This is the <b>last permit</b> on isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b>. Decide how <b>${esc(equip?.tag || "the equipment")}</b> is de-isolated and returned to service.</div>` + body + `
-      <div class="section-title">De-isolation</div>
-      ${deisoBlock}`;
-  } else if (last && iso.status === "assigned") {
-    body = `<div class="info-box">Isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b> was never confirmed; it will be cancelled and ${esc(equip?.tag || "the equipment")} returned to Available.</div>` + body;
-  } else if (iso && !last) {
-    body = `<div class="info-box">${remaining.length} other permit(s) remain on certificate <b class="mono">${esc(iso.isoNo || "")}</b> — the isolation stays in place.</div>` + body;
-  }
-
-  confirmBoxHTML("Close permit", body, "Close permit", async () => {
-    const remarks = $("#crem")?.value.trim() || "";
-    await updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() });
-    if (iso) {
-      if (!last) {
-        await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: remaining });
-      } else if (iso.status === "assigned") {
-        await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled before isolation was applied" });
-        if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-      } else {
-        const mode = document.querySelector('input[name="deiso"]:checked')?.value || "now";
-        if (mode === "now") {
-          await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() } });
-          if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-        } else {
-          const ru = users.find((u) => u.id === $("#deisoUser").value);
-          await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [], status: "removalPending", removalAssignedTo: { uid: ru?.id || null, name: ru?.name || "", ...userMeta(ru) }, removalAssignedAt: nowISO() });
-          // equipment stays Isolated (locks still on) until the assignee confirms removal
-        }
-      }
-    }
-    closeModal(); toast("Permit closed", "ok"); go("detail", { id: p.id });
-  });
+  confirmBoxHTML("Close permit",
+    `<div class="info-box">Work is complete${iso ? " and <b>" + esc(p.equipmentTag || "the equipment") + "</b> has been de-isolated and returned to service" : ""}. Closing finalises permit <b class="mono">${esc(p.permitNo)}</b>.</div>
+     <label class="field"><span>Closure remarks</span><textarea id="crem" placeholder="Work complete, area cleared…"></textarea></label>`,
+    "Close permit", async () => {
+      const remarks = $("#crem")?.value.trim() || "";
+      await updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() });
+      closeModal(); toast("Permit closed", "ok"); go("detail", { id: p.id });
+    });
 }
 
 async function trialRun(p, equip) {
@@ -1319,7 +1318,11 @@ async function viewIsolationDetail(m) {
   // shift, not only the named assignee. The actual signer is stamped below.
   const isIso = State.profile.role === "isolator";
   const canConfirm = iso.status === "assigned" && (canI || isIso || iso.assignedTo?.uid === me);
-  const canRemove = iso.status === "removalPending" && (canI || isIso || iso.removalAssignedTo?.uid === me);
+  // De-isolation opens automatically once all crews on a confirmed certificate
+  // have signed off their work complete (readyForDeiso), as well as for any
+  // certificate explicitly put into removalPending by an older flow.
+  const readyForDeiso = isoReadyForDeiso(iso, permits);
+  const canRemove = (iso.status === "removalPending" || readyForDeiso) && (canI || isIso || iso.removalAssignedTo?.uid === me);
   // An active certificate with no open permits is orphaned — let an
   // Issuer/Admin release it directly to return the equipment to service.
   const openAttached = attached.filter((p) => ["draft", "submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
@@ -1337,7 +1340,8 @@ async function viewIsolationDetail(m) {
       <h2 style="display:flex;align-items:center;gap:.6rem"><span class="mono" style="font-size:1.1rem">${esc(iso.isoNo || iso.id)}</span> ${badge(iso.status)}</h2></div>
       <div class="actions">${actions}</div></div>
     ${iso.status === "assigned" ? `<div class="warn-box">Awaiting confirmation by <b>${personHTML(iso.assignedTo?.name, iso.assignedTo)}</b>. Work must not start until the isolation is confirmed.</div>` : ""}
-    ${iso.status === "removalPending" ? `<div class="warn-box">De-isolation assigned to <b>${iso.removalAssignedTo ? personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) : "(unassigned — Issuer to action)"}</b>. Locks are still ON.</div>` : ""}
+    ${readyForDeiso ? `<div class="warn-box"><b>Ready for de-isolation.</b> All permits on this certificate have been confirmed work-complete, so <b>${esc(iso.equipmentTag)}</b> can now be de-isolated. <b>Locks are still ON</b> — an Isolator must confirm de-isolation before the Issuer can close the permit(s).</div>` : ""}
+    ${iso.status === "removalPending" ? `<div class="warn-box">De-isolation assigned to <b>${iso.removalAssignedTo ? personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) : "(unassigned — any Isolator can action)"}</b>. Locks are still ON.</div>` : ""}
     ${canRelease ? `<div class="warn-box">This certificate is still <b>active</b> but has <b>no open permits</b>. As Issuer/Admin you can release it to return <b>${esc(iso.equipmentTag)}</b> to service.</div>` : ""}
     <div class="cols cols-2">
       <div class="card"><h3>Certificate</h3>
