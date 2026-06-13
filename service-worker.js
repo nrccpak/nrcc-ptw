@@ -3,7 +3,7 @@
    Bump CACHE_VERSION whenever you change app files, so devices
    pick up the new version on next launch.
    ============================================================ */
-const CACHE_VERSION = "ptw-v11";
+const CACHE_VERSION = "ptw-v12";
 const APP_SHELL = [
   "./",
   "./index.html",

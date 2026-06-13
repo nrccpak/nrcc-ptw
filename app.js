@@ -890,50 +890,64 @@ async function viewNewPermit(m) {
     let gasTest = null;
     if (type.requiresGasTest) gasTest = { required: true, o2: $("#g_o2").value, lel: $("#g_lel").value, h2s: $("#g_h2s").value, co: $("#g_co").value, by: $("#g_by").value.trim(), time: nowISO() };
     const open = $("#vopen").checked;
-    // Validation. The date range is checked on any save; the full hazard / gas
-    // checks only when submitting for approval (drafts may be saved incomplete).
+    // Validation. The date range is a hard check on any save. On submit the
+    // gas-test readings stay mandatory (they are safety-critical), but the
+    // hazard checklist is advisory: unticked items raise a confirm rather than
+    // a block, and the recorded checklist shows the Issuer exactly what was
+    // and wasn't confirmed at approval time.
     const startV = $("#vstart").value || "", endV = $("#vend").value || "";
     if (!open && endV && startV && new Date(endV) <= new Date(startV)) return toast("Planned end must be after the valid-from time.", "err");
-    if (status === "submitted") {
-      if (!checklist.every((c) => c.checked)) return toast("Tick every hazard-checklist item before submitting (or use Save as draft).", "err");
-      if (type.requiresGasTest && (!gasTest || !String(gasTest.o2).trim() || !String(gasTest.lel).trim() || !gasTest.by))
-        return toast("Enter the gas-test readings (O₂, LEL) and who tested before submitting.", "err");
-    }
-    const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
-    const validity = { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: editing?.validity?.extendedTo ?? null };
-    try {
-      if (editing) {
-        // Update the existing draft in place. Identity / audit fields (permitNo,
-        // requester, approval, createdAt…) are deliberately left untouched so the
-        // write satisfies the security rules and the audit trail stays intact.
-        await updateDoc(doc(db, "permits", editing.id), {
-          type: type.code, typeName: type.name, status,
+    if (status === "submitted" && type.requiresGasTest &&
+        (!gasTest || !String(gasTest.o2).trim() || !String(gasTest.lel).trim() || !gasTest.by))
+      return toast("Enter the gas-test readings (O₂, LEL) and who tested before submitting.", "err");
+
+    const finalize = async () => {
+      const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
+      const validity = { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: editing?.validity?.extendedTo ?? null };
+      try {
+        if (editing) {
+          // Update the existing draft in place. Identity / audit fields (permitNo,
+          // requester, approval, createdAt…) are deliberately left untouched so the
+          // write satisfies the security rules and the audit trail stays intact.
+          await updateDoc(doc(db, "permits", editing.id), {
+            type: type.code, typeName: type.name, status,
+            equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
+            requestingDepartment, workDescription: desc, location: $("#loc").value.trim(),
+            validity, checklist, ppe, gasTest, isolationPoints, updatedAt: nowISO()
+          });
+          toast(status === "draft" ? "Draft updated" : "Permit submitted for approval", "ok");
+          return go("detail", { id: editing.id });
+        }
+        const permit = {
+          permitNo: makePermitNo(type),
+          type: type.code, typeName: type.name,
+          status,
           equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
-          requestingDepartment, workDescription: desc, location: $("#loc").value.trim(),
-          validity, checklist, ppe, gasTest, isolationPoints, updatedAt: nowISO()
-        });
-        toast(status === "draft" ? "Draft updated" : "Permit submitted for approval", "ok");
-        return go("detail", { id: editing.id });
-      }
-      const permit = {
-        permitNo: makePermitNo(type),
-        type: type.code, typeName: type.name,
-        status,
-        equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
-        isolationRef: null, isoNo: null,
-        requester: { uid: State.profile.id, name: State.profile.name, ...myMeta() },
-        requestingDepartment,
-        workDescription: desc, location: $("#loc").value.trim(),
-        validity,
-        checklist, ppe, gasTest, isolationPoints,
-        approval: null, rejection: null, closure: null, trialRuns: [],
-        sync: { createdOffline: !navigator.onLine },
-        createdAt: nowISO(), updatedAt: nowISO()
-      };
-      const ref = await addDoc(collection(db, "permits"), permit);
-      toast(status === "draft" ? "Draft saved" : "Permit submitted for approval", "ok");
-      go("detail", { id: ref.id });
-    } catch (err) { toast(err.message, "err"); }
+          isolationRef: null, isoNo: null,
+          requester: { uid: State.profile.id, name: State.profile.name, ...myMeta() },
+          requestingDepartment,
+          workDescription: desc, location: $("#loc").value.trim(),
+          validity,
+          checklist, ppe, gasTest, isolationPoints,
+          approval: null, rejection: null, closure: null, trialRuns: [],
+          sync: { createdOffline: !navigator.onLine },
+          createdAt: nowISO(), updatedAt: nowISO()
+        };
+        const ref = await addDoc(collection(db, "permits"), permit);
+        toast(status === "draft" ? "Draft saved" : "Permit submitted for approval", "ok");
+        go("detail", { id: ref.id });
+      } catch (err) { toast(err.message, "err"); }
+    };
+
+    // Advisory hazard-checklist gate — warn on unticked items, then let the
+    // requester proceed. Drafts and fully-ticked submissions save straight away.
+    const unconfirmed = status === "submitted" ? checklist.filter((c) => !c.checked) : [];
+    if (unconfirmed.length) {
+      return confirmBox("Submit with unconfirmed items?",
+        `${unconfirmed.length} hazard-checklist item(s) are not ticked (${unconfirmed.map((c) => c.item).join("; ")}). The Issuer will see these as unconfirmed when reviewing. Submit for approval anyway?`,
+        "Submit anyway", () => { closeModal(); return finalize(); });
+    }
+    return finalize();
   }
   draw();
 }
@@ -1019,6 +1033,8 @@ async function viewPermitDetail(m) {
         ${p.closure ? kv("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
       </div>
       <div class="card"><h3>Hazard checklist</h3>
+        ${(() => { const u = (p.checklist || []).filter((c) => !c.checked).length;
+          return u ? `<div class="warn-box"><b>${u} item(s) not confirmed by the requester.</b> Review before approving.</div>` : ""; })()}
         ${(p.checklist || []).map((c) => `<div class="checkline">${c.checked ? "☑" : "☐"} ${esc(c.item)}</div>`).join("") || "<div class='help'>None</div>"}
         <div class="section-title">PPE</div>
         ${(p.ppe || []).length ? p.ppe.map((x) => `<span class="chip">${esc(x)}</span> `).join("") : "<span class='help'>None specified</span>"}
