@@ -5,7 +5,7 @@ Hosted on **GitHub Pages** (this repository) with **Firebase** providing login a
 database (Firestore, with built-in offline cache and auto-sync).
 
 > **Full step-by-step instructions are in `NRCC_PTW_Setup_and_User_Manual.docx`**
-> (shipped alongside this package). Read that first — it covers Firebase setup,
+> (if provided separately). Read that first — it covers Firebase setup,
 > GitHub Pages deployment, daily use, and how to scale the system later.
 
 ---
@@ -19,7 +19,7 @@ database (Firestore, with built-in offline cache and auto-sync).
 | Database | Firestore with offline persistence (auto-sync when online) |
 | App type | Installable PWA — works on phone and desktop |
 | Permit types (v1) | General/Cold, Hot Work, Electrical Isolation (LOTO), Confined Space |
-| Roles | Requester · Issuer · Admin |
+| Roles | Requester · Issuer · Isolator · Admin |
 | Isolation | Separate NRCC-ISO certificates: Issuer assigns → electrician confirms → permits activate; de-isolation confirmed the same way |
 | Safety logic | Shared isolation (multi-crew), last-permit-closes rule, trial-run sub-workflow |
 
