@@ -89,10 +89,18 @@ service cloud.firestore {
     match /isolations/{id} {
       allow read: if isActive();
       allow create: if canIssue() && isActive();
-      // Issuer/Admin manage certificates; additionally any active Isolator may
-      // confirm the isolation or de-isolation (whoever is on shift), not just
-      // the named assignee.
-      allow update: if isActive() && (canIssue() || isIsolator());
+      // Issuer/Admin manage certificates (create, assign, release); any active
+      // Isolator may confirm isolation or de-isolation (whoever is on shift),
+      // not just the named assignee. The ONE transition reserved for the
+      // Isolator is confirming the physical isolation is applied — the
+      // assigned → active step. An Issuer creates and assigns the certificate
+      // but must never sign that the locks are on; that role separation is
+      // enforced here, not just hidden in the UI. (Admin kept as superuser.)
+      allow update: if isActive() && (
+        (resource.data.status == 'assigned' && request.resource.data.status == 'active')
+          ? (isIsolator() || isAdmin())
+          : (canIssue() || isIsolator())
+      );
       allow delete: if isAdmin();
     }
 

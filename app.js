@@ -1536,7 +1536,11 @@ async function viewIsolationDetail(m) {
   // Any active Isolator may confirm — the lockout is done by whoever is on
   // shift, not only the named assignee. The actual signer is stamped below.
   const isIso = State.profile.role === "isolator";
-  const canConfirm = iso.status === "assigned" && (canI || isIso || iso.assignedTo?.uid === me);
+  // Confirming the physical isolation is the Isolator's safety responsibility.
+  // The Issuer creates and assigns the certificate but must NOT sign that locks
+  // are applied — that separation is the whole point of the role. Admin is kept
+  // only as a system superuser fallback (mirrors the de-isolation rule below).
+  const canConfirm = iso.status === "assigned" && (isIso || isAdmin || iso.assignedTo?.uid === me);
   // De-isolation opens automatically once all crews on a confirmed certificate
   // have signed off their work complete (readyForDeiso), as well as for any
   // certificate explicitly put into removalPending by an older flow.
