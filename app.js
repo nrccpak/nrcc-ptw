@@ -1289,8 +1289,9 @@ function confirmBoxHTML(title, bodyHtml, okLabel, onOk, danger = false) {
 /* -------------------- 5e. Equipment -------------------- */
 async function viewEquipment(m) {
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
+  const isAdmin = State.profile.role === "admin";
   m.innerHTML = `<div class="page-head"><div><div class="kick">Asset register</div><h2>Equipment</h2></div>
-    <div class="actions">${isIssuer ? `<button class="btn btn-ghost" id="imp">Import CSV</button><button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
+    <div class="actions">${isAdmin ? `<button class="btn btn-ghost" id="imp">Import CSV</button>` : ""}${isIssuer ? `<button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
     <div class="filters"><input class="search" id="q" placeholder="Search tag or name…">
       <select id="fLine"><option value="">All lines</option>${State.config.lines.map((l) => `<option>${esc(l)}</option>`).join("")}</select>
       <select id="fArea"><option value="">All areas</option>${State.config.areas.map((a) => `<option>${esc(a)}</option>`).join("")}</select></div>
@@ -1307,6 +1308,8 @@ async function viewEquipment(m) {
   draw();
   if (isIssuer) {
     $("#add").onclick = () => openAddEquipment(equip, (added) => { equip.push(added); draw(); });
+  }
+  if (isAdmin) {
     $("#imp").onclick = () => openImport(equip, (newList) => { equip = newList; draw(); });
   }
 }
