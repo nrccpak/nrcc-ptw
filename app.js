@@ -15,7 +15,8 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, addDoc
+  collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, addDoc,
+  writeBatch, arrayUnion, arrayRemove
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig, appBranding } from "./firebase-config.js";
 
@@ -82,6 +83,22 @@ function isOverdue(p) {
   const d = new Date(end); return !isNaN(d) && d.getTime() < Date.now();
 }
 function overdueChip() { return `<span class="badge-st st-overdue" title="Planned end has passed">Overdue</span>`; }
+// Minimal RFC-4180-ish CSV line parser: handles quoted fields and embedded
+// commas / doubled quotes (naive split() corrupted any description with a comma).
+function parseCsvLine(line) {
+  const out = []; let cur = "", q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { out.push(cur); cur = ""; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out.map((s) => s.trim());
+}
 
 /* -------------------- People & roles -------------------- */
 // Job titles available in the app — config overrides the built-in default.
@@ -143,18 +160,40 @@ function toast(msg, type = "") {
   setTimeout(() => t.remove(), 3200);
 }
 
+let _modalKeydown = null;
 function modal({ title, body, footer = "", wide = false }) {
   const root = $("#modal-root");
-  root.innerHTML = `<div class="modal-bg"><div class="modal ${wide ? "wide" : ""}">
-    <div class="mhead"><h3>${esc(title)}</h3><button class="x" data-close>&times;</button></div>
+  root.innerHTML = `<div class="modal-bg"><div class="modal ${wide ? "wide" : ""}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="mhead"><h3>${esc(title)}</h3><button class="x" data-close aria-label="Close">&times;</button></div>
     <div class="mbody">${body}</div>
     ${footer ? `<div class="mfoot">${footer}</div>` : ""}
   </div></div>`;
   root.querySelector("[data-close]").onclick = closeModal;
   root.querySelector(".modal-bg").onclick = (e) => { if (e.target.classList.contains("modal-bg")) closeModal(); };
+  // Keyboard support: Escape closes; Tab is trapped within the dialog.
+  if (_modalKeydown) document.removeEventListener("keydown", _modalKeydown);
+  _modalKeydown = (e) => {
+    if (e.key === "Escape") return closeModal();
+    if (e.key !== "Tab") return;
+    const f = $$('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])', root)
+      .filter((el) => el.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  document.addEventListener("keydown", _modalKeydown);
+  // Focus the first useful field (not the close button) once painted.
+  setTimeout(() => {
+    const el = root.querySelector(".mbody input,.mbody select,.mbody textarea,.mfoot [data-ok],.mfoot button") || root.querySelector(".modal");
+    el?.focus?.();
+  }, 0);
   return root.querySelector(".modal");
 }
-function closeModal() { $("#modal-root").innerHTML = ""; }
+function closeModal() {
+  $("#modal-root").innerHTML = "";
+  if (_modalKeydown) { document.removeEventListener("keydown", _modalKeydown); _modalKeydown = null; }
+}
 
 function confirmBox(title, message, okLabel, onOk, danger = false) {
   modal({ title, body: `<p style="margin:.2rem 0 0;color:var(--ink-2)">${esc(message)}</p>`,
@@ -194,7 +233,7 @@ onAuthStateChanged(auth, async (user) => {
       // No profile yet → bootstrap or pending self-signup
       const initSnap = await getDoc(doc(db, "meta", "init"));
       if (!initSnap.exists()) return renderBootstrap(user);
-      return renderCompleteProfile(user, false);
+      return renderCompleteProfile(user);
     }
   } catch (e) {
     renderLogin(e.message);
@@ -428,7 +467,7 @@ function renderApp() {
           <div style="text-align:right"><div style="font-weight:700">${esc(p.name)}</div>
             <span class="role-chip">${esc(p.role)}</span></div>
           <div class="avatar">${initials(p.name)}</div>
-          <button class="btn btn-ghost btn-sm" id="logout" title="Sign out">${ICON.out}</button>
+          <button class="btn btn-ghost btn-sm" id="logout" title="Sign out" aria-label="Sign out">${ICON.out}</button>
         </div>
       </header>
       <main class="main" id="main"></main>
@@ -515,7 +554,7 @@ async function refreshPendingBadge() {
 /* -------------------- 5a. Dashboard -------------------- */
 async function viewDashboard(m) {
   m.innerHTML = `<div class="page-head"><div><div class="kick">Overview</div><h2>Welcome, ${esc(State.profile.name.split(" ")[0])}</h2></div>
-    <div class="actions"><button class="btn btn-accent" onclick="">+ New Permit</button></div></div>
+    <div class="actions"><button class="btn btn-accent">+ New Permit</button></div></div>
     <div id="dash">Loading…</div>`;
   m.querySelector(".actions .btn").onclick = () => go("new");
   const permits = await fetchPermits();
@@ -586,8 +625,9 @@ function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = ()
 
 /* -------------------- 5b. Permit Register -------------------- */
 async function viewPermits(m) {
+  let lastRows = [];
   m.innerHTML = `<div class="page-head"><div><div class="kick">Records</div><h2>Permit Register</h2></div>
-    <div class="actions"><button class="btn btn-accent" id="np">+ New Permit</button></div></div>
+    <div class="actions"><button class="btn btn-ghost" id="expCsv">Export CSV</button><button class="btn btn-accent" id="np">+ New Permit</button></div></div>
     ${tabsHtml("p")}
     <div class="filters">
       <input class="search" id="q" placeholder="Search permit no, equipment, work…">
@@ -599,6 +639,7 @@ async function viewPermits(m) {
     </div>
     <div class="card pad0" id="ptable">Loading…</div>`;
   $("#np").onclick = () => go("new");
+  $("#expCsv").onclick = () => exportPermitsCsv(lastRows);
   bindTabs();
   $("#fType").innerHTML += State.config.permitTypes.map((t) => `<option value="${t.code}">${esc(t.name)}</option>`).join("");
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
@@ -611,6 +652,7 @@ async function viewPermits(m) {
       (!fs || (fs === "overdue" ? isOverdue(p) : p.status === fs)) &&
       (!fd || p.requestingDepartment?.department === fd) &&
       (!q || [p.permitNo, p.equipmentTag, p.workDescription, p.requester?.name].join(" ").toLowerCase().includes(q)));
+    lastRows = rows;
     $("#ptable").innerHTML = `<table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Dept</th><th>Status</th><th>Requester</th><th>Created</th></tr></thead><tbody>
       ${rows.map((p) => `<tr class="row" data-pid="${p.id}">
         <td><span class="mono">${esc(p.permitNo)}</span></td>
@@ -622,6 +664,35 @@ async function viewPermits(m) {
   };
   ["q", "fType", "fStatus", "fDept"].forEach((id) => $("#" + id).addEventListener("input", draw));
   draw();
+}
+
+// Download the currently-filtered permit register as a CSV file (client-side).
+function exportPermitsCsv(rows) {
+  if (!rows || !rows.length) return toast("Nothing to export for the current filter", "err");
+  const cols = [
+    ["Permit No", (p) => p.permitNo],
+    ["Type", (p) => p.typeName || p.type],
+    ["Status", (p) => isOverdue(p) ? p.status + " (overdue)" : p.status],
+    ["Equipment", (p) => p.equipmentTag],
+    ["Line", (p) => p.line], ["Area", (p) => p.area],
+    ["Department", (p) => p.requestingDepartment?.department || ""],
+    ["Requester", (p) => p.requester?.name || ""],
+    ["Work", (p) => p.workDescription || ""],
+    ["Valid from", (p) => p.validity?.start || ""],
+    ["Valid to", (p) => p.validity?.openEnded ? "Open" : (p.validity?.extendedTo || p.validity?.plannedEnd || "")],
+    ["Isolation cert", (p) => p.isoNo || ""],
+    ["Created", (p) => p.createdAt || ""]
+  ];
+  const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = [cols.map((c) => cell(c[0])).join(",")]
+    .concat(rows.map((p) => cols.map((c) => cell(c[1](p))).join(",")))
+    .join("\r\n");
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `permits-${nowISO().slice(0, 10)}.csv`;
+  a.click(); URL.revokeObjectURL(url);
+  toast(`Exported ${rows.length} permit(s)`, "ok");
 }
 
 /* -------------------- 5c. New Permit -------------------- */
@@ -715,6 +786,10 @@ async function viewNewPermit(m) {
     // default validity start = now
     const n = new Date(); n.setMinutes(n.getMinutes() - n.getTimezoneOffset());
     $("#vstart").value = n.toISOString().slice(0, 16);
+    // Open-ended permits have no planned end — disable the end field accordingly.
+    const vopenEl = $("#vopen"), vendEl = $("#vend");
+    const syncOpen = () => { vendEl.disabled = vopenEl.checked; if (vopenEl.checked) vendEl.value = ""; };
+    vopenEl.onchange = syncOpen; syncOpen();
     // dept → subunit
     const fillSub = () => { const d = cfg.departments.find((x) => x.name === $("#dept").value);
       $("#subunit").innerHTML = `<option value="">—</option>` + (d?.subUnits || []).map((s) => `<option>${esc(s)}</option>`).join(""); };
@@ -770,7 +845,7 @@ async function viewNewPermit(m) {
       $("#desc").value = editing.workDescription || "";
       $("#loc").value = editing.location || "";
       if (editing.validity?.start) $("#vstart").value = String(editing.validity.start).slice(0, 16);
-      if (editing.validity?.openEnded) $("#vopen").checked = true;
+      if (editing.validity?.openEnded) { $("#vopen").checked = true; syncOpen(); }
       else if (editing.validity?.plannedEnd) $("#vend").value = String(editing.validity.plannedEnd).slice(0, 16);
       (editing.checklist || []).forEach((c, i) => { const el = $(`[data-chk="${i}"]`); if (el) el.checked = !!c.checked; });
       const ppeSet = new Set(editing.ppe || []);
@@ -815,6 +890,15 @@ async function viewNewPermit(m) {
     let gasTest = null;
     if (type.requiresGasTest) gasTest = { required: true, o2: $("#g_o2").value, lel: $("#g_lel").value, h2s: $("#g_h2s").value, co: $("#g_co").value, by: $("#g_by").value.trim(), time: nowISO() };
     const open = $("#vopen").checked;
+    // Validation. The date range is checked on any save; the full hazard / gas
+    // checks only when submitting for approval (drafts may be saved incomplete).
+    const startV = $("#vstart").value || "", endV = $("#vend").value || "";
+    if (!open && endV && startV && new Date(endV) <= new Date(startV)) return toast("Planned end must be after the valid-from time.", "err");
+    if (status === "submitted") {
+      if (!checklist.every((c) => c.checked)) return toast("Tick every hazard-checklist item before submitting (or use Save as draft).", "err");
+      if (type.requiresGasTest && (!gasTest || !String(gasTest.o2).trim() || !String(gasTest.lel).trim() || !gasTest.by))
+        return toast("Enter the gas-test readings (O₂, LEL) and who tested before submitting.", "err");
+    }
     const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
     const validity = { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: editing?.validity?.extendedTo ?? null };
     try {
@@ -966,29 +1050,35 @@ async function viewPermitDetail(m) {
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Reject</button>` });
     $("[data-c]").onclick = closeModal;
     $("[data-ok]").onclick = async () => {
-      await updateDoc(doc(db, "permits", id), { status: "rejected", rejection: { by: State.profile.id, byName: State.profile.name, ...myMeta(), reason: $("#rr").value.trim(), timestamp: nowISO() }, updatedAt: nowISO() });
-      if (p.isolationRef) {
-        const s = await getDoc(doc(db, "isolations", p.isolationRef));
-        if (s.exists()) {
-          const isoX = s.data();
-          const rem = (isoX.attachedPermitIds || []).filter((x) => x !== id);
-          if (rem.length) await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: rem });
-          else if (isoX.status === "assigned") {
-            await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled — permit rejected before isolation" });
-            await updateDoc(doc(db, "equipment", p.equipmentRef), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-          } else await updateDoc(doc(db, "isolations", p.isolationRef), { attachedPermitIds: [], status: "removalPending" });
-        }
+      // Read the certificate (if any) first, then commit every change in one batch.
+      let isoX = null;
+      if (p.isolationRef) { const s = await getDoc(doc(db, "isolations", p.isolationRef)); if (s.exists()) isoX = s.data(); }
+      const batch = writeBatch(db);
+      batch.update(doc(db, "permits", id), { status: "rejected", rejection: { by: State.profile.id, byName: State.profile.name, ...myMeta(), reason: $("#rr").value.trim(), timestamp: nowISO() }, updatedAt: nowISO() });
+      if (isoX) {
+        const isoRef = doc(db, "isolations", p.isolationRef);
+        const remCount = (isoX.attachedPermitIds || []).filter((x) => x !== id).length;
+        if (remCount) batch.update(isoRef, { attachedPermitIds: arrayRemove(id) });
+        else if (isoX.status === "assigned") {
+          batch.update(isoRef, { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled — permit rejected before isolation" });
+          batch.update(doc(db, "equipment", p.equipmentRef), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+        } else batch.update(isoRef, { attachedPermitIds: [], status: "removalPending" });
       }
+      await batch.commit();
       closeModal(); toast("Permit rejected"); go("detail", { id }); refreshPendingBadge();
     };
   });
   $("#approve") && ($("#approve").onclick = () => approvePermit(p, equip));
   $("#extend") && ($("#extend").onclick = () => {
-    modal({ title: "Extend permit", body: `<label class="field"><span>New end date/time</span><input type="datetime-local" id="ne"></label>`,
+    const curEnd = (p.validity?.extendedTo || p.validity?.plannedEnd || "").slice(0, 16);
+    modal({ title: "Extend permit", body: `<label class="field"><span>New end date/time</span><input type="datetime-local" id="ne" value="${curEnd}"></label>`,
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-primary" data-ok>Extend</button>` });
     $("[data-c]").onclick = closeModal;
     $("[data-ok]").onclick = async () => {
-      await updateDoc(doc(db, "permits", id), { status: "extended", "validity.extendedTo": $("#ne").value || null, "validity.openEnded": false, updatedAt: nowISO() });
+      const ne = $("#ne").value;
+      if (!ne) return toast("Pick a new end date/time", "err");
+      if (new Date(ne) <= new Date()) return toast("The new end must be in the future.", "err");
+      await updateDoc(doc(db, "permits", id), { status: "extended", "validity.extendedTo": ne, "validity.openEnded": false, updatedAt: nowISO() });
       closeModal(); toast("Permit extended", "ok"); go("detail", { id });
     };
   });
@@ -1005,7 +1095,15 @@ async function approvePermit(p, equip) {
 
   // --- non-isolation permits: approve straight to Active ---
   if (!type.requiresIsolation) {
-    confirmBoxHTML("Approve permit", `<p>Approve <b>${esc(p.permitNo)}</b> and activate the work?</p>`, "Approve & activate", async () => {
+    // Safety cross-check: warn the Issuer if the equipment is currently isolated
+    // / energised for a trial, or already carries other live permits.
+    let warn = "";
+    const eqStatus = equip?.isolationStatus;
+    if (eqStatus === "isolated" || eqStatus === "pending") warn += `<div class="warn-box">${esc(equip.tag)} is currently under an <b>isolation (LOTO)</b> for other work. Confirm this work is compatible before activating.</div>`;
+    if (eqStatus === "trialRun") warn += `<div class="danger-box"><b>${esc(equip.tag)} is ENERGISED for a trial run.</b> Do not activate work that needs it de-energised.</div>`;
+    const others = (await fetchPermits()).filter((x) => x.id !== p.id && x.equipmentRef === p.equipmentRef && ["active", "extended"].includes(x.status));
+    if (others.length) warn += `<div class="warn-box"><b>${others.length} other active permit(s)</b> already on ${esc(p.equipmentTag)}. Review concurrent work.</div>`;
+    confirmBoxHTML("Approve permit", `${warn}<p>Approve <b>${esc(p.permitNo)}</b> and activate the work?</p>`, "Approve & activate", async () => {
       await updateDoc(doc(db, "permits", p.id), { status: "active", approval: approval(), updatedAt: nowISO() });
       closeModal(); toast("Permit approved & activated", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
     });
@@ -1024,8 +1122,10 @@ async function approvePermit(p, equip) {
     confirmBoxHTML("Approve permit",
       `<div class="info-box">${esc(equip.tag)} is already isolated under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. This permit will <b>attach to the shared isolation</b> and become Active immediately.</div>
        <p>Approve <b>${esc(p.permitNo)}</b>?</p>`, "Approve & attach", async () => {
-      await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [...(iso.attachedPermitIds || []), p.id] });
-      await updateDoc(doc(db, "permits", p.id), { status: "active", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
+      batch.update(doc(db, "permits", p.id), { status: "active", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
+      await batch.commit();
       closeModal(); toast("Permit approved & attached to isolation", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1036,8 +1136,10 @@ async function approvePermit(p, equip) {
     confirmBoxHTML("Approve permit",
       `<div class="warn-box">Isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b> for ${esc(equip.tag)} is assigned to <b>${esc(iso.assignedTo?.name || "")}</b> and awaiting confirmation. This permit will attach to it and activate automatically once the isolation is confirmed.</div>
        <p>Approve <b>${esc(p.permitNo)}</b>?</p>`, "Approve & attach", async () => {
-      await updateDoc(doc(db, "isolations", iso.id), { attachedPermitIds: [...(iso.attachedPermitIds || []), p.id] });
-      await updateDoc(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
+      batch.update(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
+      await batch.commit();
       closeModal(); toast("Approved — awaiting isolation confirmation"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1057,7 +1159,8 @@ async function approvePermit(p, equip) {
   $("[data-ok]").onclick = async () => {
     const au = users.find((u) => u.id === $("#assignTo").value);
     const isoId = uid(); const isoNo = makeIsoNo();
-    await setDoc(doc(db, "isolations", isoId), {
+    const batch = writeBatch(db);
+    batch.set(doc(db, "isolations", isoId), {
       isoNo, equipmentRef: equip.id, equipmentTag: equip.tag,
       points: p.isolationPoints || [], status: "assigned",
       assignedTo: { uid: au?.id || null, name: au?.name || "", ...userMeta(au) }, assignedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, assignedAt: nowISO(),
@@ -1065,8 +1168,9 @@ async function approvePermit(p, equip) {
       removalAssignedTo: null, removalAssignedAt: null, removalConfirmedBy: null, removedAt: null,
       attachedPermitIds: [p.id], createdBy: State.profile.name, createdByMeta: myMeta(), createdAt: nowISO()
     });
-    await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "pending", activeIsolationId: isoId, updatedAt: nowISO() });
-    await updateDoc(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: isoId, isoNo, approval: approval(), updatedAt: nowISO() });
+    batch.update(doc(db, "equipment", equip.id), { isolationStatus: "pending", activeIsolationId: isoId, updatedAt: nowISO() });
+    batch.update(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: isoId, isoNo, approval: approval(), updatedAt: nowISO() });
+    await batch.commit();
     closeModal(); toast(`Certificate ${isoNo} assigned to ${au?.name || ""}`, "ok"); go("detail", { id: p.id }); refreshPendingBadge();
   };
 }
@@ -1133,9 +1237,11 @@ async function trialRun(p, equip) {
   $("[data-ok]").onclick = async () => {
     if (!($("#clr1").checked && $("#clr2").checked && $("#clr3").checked)) return toast("Confirm all three checks", "err");
     const tr = { requestedBy: State.profile.name, requestedAt: nowISO(), authorisedBy: State.profile.name, authorisedByMeta: myMeta(), authorisedAt: nowISO(), reIsolatedAt: null, status: "open" };
-    await updateDoc(doc(db, "permits", p.id), { trialRuns: [...(p.trialRuns || []), tr], updatedAt: nowISO() });
-    if (isoRef) await updateDoc(isoRef, { status: "trialRun" });
-    if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
+    const batch = writeBatch(db);
+    batch.update(doc(db, "permits", p.id), { trialRuns: arrayUnion(tr), updatedAt: nowISO() });
+    if (isoRef) batch.update(isoRef, { status: "trialRun" });
+    if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
+    await batch.commit();
     closeModal(); toast("Trial run started — equipment energised", "");
     // offer re-isolate immediately
     setTimeout(() => offerReisolate(p, equip), 400);
@@ -1148,9 +1254,11 @@ function offerReisolate(p, equip) {
     "Re-isolate now", async () => {
       const snap = await getDoc(doc(db, "permits", p.id)); const pp = snap.data();
       const trs = (pp.trialRuns || []).map((t, i, a) => i === a.length - 1 ? { ...t, reIsolatedAt: nowISO(), status: "closed" } : t);
-      await updateDoc(doc(db, "permits", p.id), { trialRuns: trs, updatedAt: nowISO() });
-      if (p.isolationRef) await updateDoc(doc(db, "isolations", p.isolationRef), { status: "active" });
-      if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "permits", p.id), { trialRuns: trs, updatedAt: nowISO() });
+      if (p.isolationRef) batch.update(doc(db, "isolations", p.isolationRef), { status: "active" });
+      if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
+      await batch.commit();
       closeModal(); toast("Re-isolated — work may resume", "ok"); go("detail", { id: p.id });
     });
 }
@@ -1228,9 +1336,9 @@ function openImport(existing, onDone) {
     const r = new FileReader();
     r.onload = () => {
       const lines = r.result.split(/\r?\n/).filter((x) => x.trim());
-      const head = lines.shift().split(",").map((h) => h.trim().toLowerCase());
+      const head = parseCsvLine(lines.shift()).map((h) => h.toLowerCase());
       const idx = (k) => head.indexOf(k);
-      parsed = lines.map((ln) => { const c = ln.split(","); return {
+      parsed = lines.map((ln) => { const c = parseCsvLine(ln); return {
         tag: (c[idx("tag")] || "").trim(), description: (c[idx("description")] || "").trim(),
         line: (c[idx("line")] || State.config.lines[0]).trim(), area: (c[idx("area")] || State.config.areas[0]).trim() }; })
         .filter((x) => x.tag && !existing.some((e) => e.tag.toLowerCase() === x.tag.toLowerCase()));
@@ -1472,10 +1580,11 @@ async function viewIsolationDetail(m) {
       if (!$("#ckAll").checked) return toast("Tick the confirmation statement", "err");
       const pts = (iso.points || []).map((pt, i) => ({ ...pt, lockTag: $(`[data-lk="${i}"]`)?.value.trim() || pt.lockTag || "" }));
       try {
-        await updateDoc(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
-        if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
-        for (const p of attached) if (p.status === "awaitingIsolation")
-          await updateDoc(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
+        const batch = writeBatch(db);
+        batch.update(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
+        if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
+        for (const p of attached) if (p.status === "awaitingIsolation") batch.update(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
+        await batch.commit();
         closeModal(); toast("Isolation confirmed — waiting permits activated", "ok"); go("isodetail", { id });
       } catch (e) { toast(e.message || "Could not confirm isolation", "err"); }
     };
@@ -1484,16 +1593,20 @@ async function viewIsolationDetail(m) {
   if (canRemove) $("#rem").onclick = () => confirmBoxHTML("Confirm de-isolation",
     `<p>All locks and tags have been removed from <b>${esc(iso.equipmentTag)}</b>? The equipment returns to <b>Available</b>.</p>`,
     "Confirm de-isolation", async () => {
-      await updateDoc(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
-      if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
+      if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      await batch.commit();
       closeModal(); toast("De-isolation confirmed — equipment available", "ok"); go("isodetail", { id });
     });
 
   if (canRelease) $("#release").onclick = () => confirmBoxHTML("Release isolation",
     `<p>This certificate has <b>no open permits</b>. Confirm all locks and tags are removed from <b>${esc(iso.equipmentTag)}</b> and return it to <b>Available</b>?</p>`,
     "Release isolation", async () => {
-      await updateDoc(doc(db, "isolations", id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
-      if (equip) await updateDoc(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      const batch = writeBatch(db);
+      batch.update(doc(db, "isolations", id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
+      if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      await batch.commit();
       closeModal(); toast("Isolation released — equipment available", "ok"); go("isodetail", { id });
     }, true);
 }

@@ -94,7 +94,6 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
   grid-template-areas:"side top" "side main";min-height:100vh}
 .topbar{grid-area:top;background:linear-gradient(90deg,var(--navy),var(--navy-2));
   display:flex;align-items:center;gap:1rem;padding:0 1.3rem;color:#fff;box-shadow:var(--shadow-sm);z-index:20}
-.topbar .hamb{display:none;background:none;border:none;color:#fff;font-size:1.4rem;cursor:pointer}
 .topbar h1{font-size:1.02rem;font-weight:700;color:#fff}
 .topbar .who{display:flex;align-items:center;gap:.6rem;font-size:.85rem}
 .avatar{width:34px;height:34px;border-radius:50%;background:var(--amber);color:var(--navy);
@@ -156,7 +155,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
 .st-rejected{background:var(--red-soft);color:#9b2c2c}
 .st-expired{background:#ECEFF2;color:var(--grey)}
 .st-isolated{background:var(--amber-soft);color:#8a5d00}
-.st-trialrun,.st-energised{background:var(--red-soft);color:#9b2c2c}
+.st-trialrun{background:var(--red-soft);color:#9b2c2c}
 .st-available{background:var(--green-soft);color:#15784f}
 .st-awaitingIsolation{background:var(--amber-soft);color:#8a5d00}
 .st-assigned{background:var(--steel-soft);color:var(--steel)}
@@ -265,7 +264,7 @@ table.tbl tr:last-child td{border-bottom:none}
 /* ---------- Print (per-permit PDF) ---------- */
 @media print{
   body{background:#fff}
-  .app,.sidebar,.topbar,.toast-wrap,.no-print{display:none !important}
+  .app,.sidebar,.topbar,.toast-wrap,#modal-root,.no-print{display:none !important}
   #print-area{display:block !important}
 }
 #print-area{display:none}
