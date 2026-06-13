@@ -71,6 +71,17 @@ function fmt(iso) {
 }
 function fmtDate(iso) { if (!iso) return "—"; const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleDateString([], { year: "numeric", month: "short", day: "2-digit" }); }
 function initials(name) { return (name || "?").split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase(); }
+// Planned end of a permit (an explicit extension wins; open-ended never expires).
+function permitEnd(p) { return p?.validity?.openEnded ? null : (p?.validity?.extendedTo || p?.validity?.plannedEnd || null); }
+// A still-live permit whose planned end has passed is "overdue". We never change
+// the stored status automatically (that would need a server write); instead the
+// UI flags it so an Issuer extends or closes it.
+function isOverdue(p) {
+  if (!p || !["active", "extended", "awaitingIsolation"].includes(p.status)) return false;
+  const end = permitEnd(p); if (!end) return false;
+  const d = new Date(end); return !isNaN(d) && d.getTime() < Date.now();
+}
+function overdueChip() { return `<span class="badge-st st-overdue" title="Planned end has passed">Overdue</span>`; }
 
 /* -------------------- People & roles -------------------- */
 // Job titles available in the app — config overrides the built-in default.
@@ -515,6 +526,7 @@ async function viewDashboard(m) {
   const pending = permits.filter((p) => p.status === "submitted");
   const isolated = equip.filter((e) => e.isolationStatus === "isolated" || e.isolationStatus === "trialRun");
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
+  const overdue = (isIssuer ? permits : mine).filter(isOverdue);
 
   const stat = (num, lab, ic) => `<div class="stat"><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
   let html = `<div class="cols cols-4" style="margin-bottom:1.2rem">
@@ -522,6 +534,7 @@ async function viewDashboard(m) {
     ${stat(pending.length, isIssuer ? "Awaiting your approval" : "Submitted", ICON.newdoc)}
     ${stat(isolated.length, "Equipment isolated", ICON.lock)}
     ${stat(mine.length, "My permits", ICON.cube)}</div>`;
+  if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
 
   const me = State.profile.id;
   const isAdmin = State.profile.role === "admin";
@@ -555,6 +568,7 @@ async function viewDashboard(m) {
     </tbody></table></div>`;
   $("#dash").innerHTML = html;
   bindPermitRows();
+  const ob = $("#overdueBanner"); if (ob) ob.onclick = () => go("permits", { status: "overdue" });
   $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
 }
 
@@ -563,7 +577,7 @@ function permitRow(p, showStatus = false) {
     <td><span class="mono">${esc(p.permitNo)}</span></td>
     <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName || p.type)}</span></td>
     <td>${esc(p.equipmentTag || "—")}</td>
-    ${showStatus ? `<td>${badge(p.status)}</td>` : ""}
+    ${showStatus ? `<td>${badge(p.status)}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
     <td>${esc(p.requester?.name || "—")}</td>
     ${!showStatus ? `<td></td>` : ""}
   </tr>`;
@@ -579,7 +593,8 @@ async function viewPermits(m) {
       <input class="search" id="q" placeholder="Search permit no, equipment, work…">
       <select id="fType"><option value="">All types</option></select>
       <select id="fStatus"><option value="">All statuses</option>
-        ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected", "expired"].map((s) => `<option>${s}</option>`).join("")}</select>
+        ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected"].map((s) => `<option>${s}</option>`).join("")}
+        <option value="overdue">overdue</option></select>
       <select id="fDept"><option value="">All departments</option></select>
     </div>
     <div class="card pad0" id="ptable">Loading…</div>`;
@@ -587,18 +602,21 @@ async function viewPermits(m) {
   bindTabs();
   $("#fType").innerHTML += State.config.permitTypes.map((t) => `<option value="${t.code}">${esc(t.name)}</option>`).join("");
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
+  if (State.params.status) $("#fStatus").value = State.params.status;
   const all = await fetchPermits();
   const draw = () => {
     const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value;
     const rows = all.filter((p) =>
-      (!ft || p.type === ft) && (!fs || p.status === fs) && (!fd || p.requestingDepartment?.department === fd) &&
+      (!ft || p.type === ft) &&
+      (!fs || (fs === "overdue" ? isOverdue(p) : p.status === fs)) &&
+      (!fd || p.requestingDepartment?.department === fd) &&
       (!q || [p.permitNo, p.equipmentTag, p.workDescription, p.requester?.name].join(" ").toLowerCase().includes(q)));
     $("#ptable").innerHTML = `<table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Dept</th><th>Status</th><th>Requester</th><th>Created</th></tr></thead><tbody>
       ${rows.map((p) => `<tr class="row" data-pid="${p.id}">
         <td><span class="mono">${esc(p.permitNo)}</span></td>
         <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName)}</span></td>
         <td>${esc(p.equipmentTag)}</td><td>${esc(p.requestingDepartment?.department || "—")}</td>
-        <td>${badge(p.status)}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
+        <td>${badge(p.status)}${isOverdue(p) ? " " + overdueChip() : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
       || `<tr><td colspan="7" class="empty">No permits match.</td></tr>`}</tbody></table>`;
     bindPermitRows();
   };
@@ -611,10 +629,21 @@ async function viewNewPermit(m) {
   if (!State.profile.active) { m.innerHTML = `<div class="danger-box">Your account is not active yet.</div>`; return; }
   const cfg = State.config;
   const equip = await fetchEquipment();
-  let type = cfg.permitTypes[0];
+  // Editing an existing draft? Load it (owner-only, drafts only) and prefill the
+  // form below. Anything else falls through to a blank "new permit".
+  const editId = State.params.editId || null;
+  let editing = null;
+  if (editId) {
+    const s = await getDoc(doc(db, "permits", editId)).catch(() => null);
+    if (!s || !s.exists()) return go("permits");
+    editing = { id: editId, ...s.data() };
+    if (editing.status !== "draft" || editing.requester?.uid !== State.profile.id) return go("detail", { id: editId });
+  }
+  let type = editing ? (cfg.permitTypes.find((t) => t.code === editing.type) || cfg.permitTypes[0]) : cfg.permitTypes[0];
+  let prefilled = false;
   const draw = () => {
     const deptOpts = cfg.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
-    m.innerHTML = `<div class="page-head"><div><div class="kick">Create</div><h2>New Work Permit</h2></div></div>
+    m.innerHTML = `<div class="page-head"><div><div class="kick">${editing ? "Edit" : "Create"}</div><h2>${editing ? "Edit Draft Permit" : "New Work Permit"}</h2></div></div>
     <div class="card ${TYPE_CLASS[type.code]}">
       <h3>Permit type</h3><div class="csub">Choose the kind of work — the form adapts to it.</div>
       <div class="cols cols-4">${cfg.permitTypes.map((t) => `
@@ -730,6 +759,44 @@ async function viewNewPermit(m) {
     }
     $("#saveDraft").onclick = () => savePermit("draft");
     $("#submit").onclick = () => savePermit("submitted");
+
+    // Prefill from the draft being edited — only on the first render. A manual
+    // permit-type change after that intentionally resets the type-specific fields.
+    if (editing && !prefilled) {
+      prefilled = true;
+      if (editing.requestingDepartment?.department) $("#dept").value = editing.requestingDepartment.department;
+      fillSub();
+      if (editing.requestingDepartment?.subUnit) $("#subunit").value = editing.requestingDepartment.subUnit;
+      $("#desc").value = editing.workDescription || "";
+      $("#loc").value = editing.location || "";
+      if (editing.validity?.start) $("#vstart").value = String(editing.validity.start).slice(0, 16);
+      if (editing.validity?.openEnded) $("#vopen").checked = true;
+      else if (editing.validity?.plannedEnd) $("#vend").value = String(editing.validity.plannedEnd).slice(0, 16);
+      (editing.checklist || []).forEach((c, i) => { const el = $(`[data-chk="${i}"]`); if (el) el.checked = !!c.checked; });
+      const ppeSet = new Set(editing.ppe || []);
+      $$("[data-ppe]").forEach((el) => { el.checked = ppeSet.has(el.value); });
+      if (type.requiresIsolation && (editing.isolationPoints || []).length) {
+        $("#isoRows").innerHTML = "";
+        editing.isolationPoints.forEach((pt) => {
+          const d = document.createElement("div"); d.className = "iso-row";
+          d.innerHTML = `<input placeholder="Isolation point (e.g. MCC-3 breaker)"><input placeholder="Method (rack-out / valve)"><input placeholder="Lock / tag no."><button class="btn btn-ghost btn-sm">✕</button>`;
+          const ins = d.querySelectorAll("input");
+          ins[0].value = pt.point || ""; ins[1].value = pt.method || ""; ins[2].value = pt.lockTag || "";
+          d.querySelector("button").onclick = () => d.remove();
+          $("#isoRows").appendChild(d);
+        });
+      }
+      if (type.requiresGasTest && editing.gasTest) {
+        const g = editing.gasTest;
+        if ($("#g_o2")) $("#g_o2").value = g.o2 || "";
+        if ($("#g_lel")) $("#g_lel").value = g.lel || "";
+        if ($("#g_h2s")) $("#g_h2s").value = g.h2s || "";
+        if ($("#g_co")) $("#g_co").value = g.co || "";
+        if ($("#g_by")) $("#g_by").value = g.by || "";
+      }
+      const eqExisting = equip.find((x) => x.id === editing.equipmentRef);
+      if (eqExisting) chooseEq(eqExisting);
+    }
   };
 
   async function savePermit(status) {
@@ -748,22 +815,37 @@ async function viewNewPermit(m) {
     let gasTest = null;
     if (type.requiresGasTest) gasTest = { required: true, o2: $("#g_o2").value, lel: $("#g_lel").value, h2s: $("#g_h2s").value, co: $("#g_co").value, by: $("#g_by").value.trim(), time: nowISO() };
     const open = $("#vopen").checked;
-    const permit = {
-      permitNo: makePermitNo(type),
-      type: type.code, typeName: type.name,
-      status,
-      equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
-      isolationRef: null, isoNo: null,
-      requester: { uid: State.profile.id, name: State.profile.name, ...myMeta() },
-      requestingDepartment: { department: $("#dept").value, subUnit: $("#subunit").value || null },
-      workDescription: desc, location: $("#loc").value.trim(),
-      validity: { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: null },
-      checklist, ppe, gasTest, isolationPoints,
-      approval: null, rejection: null, closure: null, trialRuns: [],
-      sync: { createdOffline: !navigator.onLine },
-      createdAt: nowISO(), updatedAt: nowISO()
-    };
+    const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
+    const validity = { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: editing?.validity?.extendedTo ?? null };
     try {
+      if (editing) {
+        // Update the existing draft in place. Identity / audit fields (permitNo,
+        // requester, approval, createdAt…) are deliberately left untouched so the
+        // write satisfies the security rules and the audit trail stays intact.
+        await updateDoc(doc(db, "permits", editing.id), {
+          type: type.code, typeName: type.name, status,
+          equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
+          requestingDepartment, workDescription: desc, location: $("#loc").value.trim(),
+          validity, checklist, ppe, gasTest, isolationPoints, updatedAt: nowISO()
+        });
+        toast(status === "draft" ? "Draft updated" : "Permit submitted for approval", "ok");
+        return go("detail", { id: editing.id });
+      }
+      const permit = {
+        permitNo: makePermitNo(type),
+        type: type.code, typeName: type.name,
+        status,
+        equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
+        isolationRef: null, isoNo: null,
+        requester: { uid: State.profile.id, name: State.profile.name, ...myMeta() },
+        requestingDepartment,
+        workDescription: desc, location: $("#loc").value.trim(),
+        validity,
+        checklist, ppe, gasTest, isolationPoints,
+        approval: null, rejection: null, closure: null, trialRuns: [],
+        sync: { createdOffline: !navigator.onLine },
+        createdAt: nowISO(), updatedAt: nowISO()
+      };
       const ref = await addDoc(collection(db, "permits"), permit);
       toast(status === "draft" ? "Draft saved" : "Permit submitted for approval", "ok");
       go("detail", { id: ref.id });
@@ -792,6 +874,9 @@ async function viewPermitDetail(m) {
   const equip = eqSnap && eqSnap.exists() ? { id: eqSnap.id, ...eqSnap.data() } : null;
   const isoSnap = p.isolationRef ? await getDoc(doc(db, "isolations", p.isolationRef)).catch(() => null) : null;
   const isoDoc = isoSnap && isoSnap.exists() ? { id: isoSnap.id, ...isoSnap.data() } : null;
+  // Equipment temporarily energised for a trial run — surface a persistent
+  // "Re-isolate now" action (the post-trial prompt is easy to dismiss or miss).
+  const inTrial = (equip && equip.isolationStatus === "trialRun") || (isoDoc && isoDoc.status === "trialRun");
 
   // Hand-back order: requester confirms work complete → Isolator de-isolates →
   // Issuer closes. The equipment is de-isolated when there is no certificate or
@@ -809,7 +894,7 @@ async function viewPermitDetail(m) {
   let actions = "";
   if (p.status === "submitted" && isIssuer) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
   if (["submitted", "awaitingIsolation"].includes(p.status) && isIssuer) actions += `<button class="btn btn-danger" id="reject">Reject</button>`;
-  if (["draft"].includes(p.status) && isOwner) actions += `<button class="btn btn-accent" id="submitNow">Submit for approval</button>`;
+  if (["draft"].includes(p.status) && isOwner) actions += `<button class="btn btn-ghost" id="editDraft">Edit</button><button class="btn btn-accent" id="submitNow">Submit for approval</button>`;
   // The requester signs off that the work is finished and the equipment is safe
   // to return to service. The Issuer can only close after de-isolation.
   if (["active", "extended"].includes(p.status) && isOwner && !p.workCompletion) actions += `<button class="btn btn-success" id="workdone">Confirm work complete</button>`;
@@ -818,7 +903,8 @@ async function viewPermitDetail(m) {
     actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
     if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
   }
-  if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
+  if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef && !inTrial) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
+  if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef && inTrial) actions += `<button class="btn btn-success" id="reiso">Re-isolate now</button>`;
   actions += `<button class="btn btn-ghost no-print" id="pdf">${ICON.pdf} Print / PDF</button>`;
 
   $("#pd").innerHTML = `
@@ -827,6 +913,7 @@ async function viewPermitDetail(m) {
       <div class="actions">${actions}</div></div>
 
     ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
+    ${isOverdue(p) ? `<div class="danger-box"><b>Permit overdue.</b> The planned end (${fmt(permitEnd(p))}) has passed. ${isIssuer ? "Extend the validity or close the permit." : "Ask the Issuer to extend or close this permit."}</div>` : ""}
     ${equip && equip.isolationStatus === "trialRun" ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — equipment ${esc(equip.tag)} is ENERGISED.</b></div>` : ""}
     ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
     ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed."}</div>` : ""}
@@ -872,6 +959,7 @@ async function viewPermitDetail(m) {
   $("#pdf") && ($("#pdf").onclick = () => printPermit(p, equip));
   $$("[data-isolink],[data-isolink2],[data-isolink3]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
+  $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
   $("#submitNow") && ($("#submitNow").onclick = async () => { await updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() }); toast("Submitted", "ok"); go("detail", { id }); });
   $("#reject") && ($("#reject").onclick = () => {
     modal({ title: "Reject permit", body: `<label class="field"><span>Reason</span><textarea id="rr" placeholder="Why is this being rejected?"></textarea></label>`,
@@ -907,6 +995,7 @@ async function viewPermitDetail(m) {
   $("#workdone") && ($("#workdone").onclick = () => confirmWorkComplete(p, equip));
   $("#close") && ($("#close").onclick = () => closePermit(p, equip));
   $("#trial") && ($("#trial").onclick = () => trialRun(p, equip));
+  $("#reiso") && ($("#reiso").onclick = () => offerReisolate(p, equip));
 }
 
 /* -------------------- 6. Permit + isolation logic -------------------- */
