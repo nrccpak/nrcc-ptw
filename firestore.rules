@@ -24,9 +24,25 @@ service cloud.firestore {
     function noUsersYet() {
       return !exists(/databases/$(database)/documents/meta/init);
     }
+    // On a permit update the approval / rejection / closure / requester fields
+    // are the audit trail. On every NON-Issuer update path they must stay byte
+    // -for-byte unchanged. This is what stops a requester (or isolator) from
+    // forging an approval to self-activate a permit, or rewriting who raised it.
+    function permitAuditLocked() {
+      return request.resource.data.approval == resource.data.approval
+        && request.resource.data.rejection == resource.data.rejection
+        && request.resource.data.closure == resource.data.closure
+        && request.resource.data.requester == resource.data.requester;
+    }
+
     // ---- users ----
     match /users/{uid} {
-      allow read: if signedIn();
+      // A person can always read their OWN profile (needed at sign-in to learn
+      // their role / active state before any UI renders). Reading other people's
+      // profiles — names, emails, employee numbers — is limited to active users
+      // (Issuers/Admins assigning work, the Admin console). A pending or
+      // anonymous account cannot enumerate staff.
+      allow read: if signedIn() && (request.auth.uid == uid || isActive());
       // A person may create their own profile. They may set role 'admin'
       // ONLY during first-run bootstrap; otherwise self-signups are 'requester'.
       allow create: if signedIn() && request.auth.uid == uid && (
@@ -38,12 +54,16 @@ service cloud.firestore {
     }
 
     // ---- meta (bootstrap marker, written once) ----
+    // Readable by any signed-in account so the app can detect first-run before a
+    // profile exists; only an Admin (or the very first user) may write it.
     match /meta/{doc} {
       allow read: if signedIn();
       allow write: if isAdmin() || (signedIn() && doc == 'init' && noUsersYet());
     }
 
     // ---- config (permit types, lines, areas, departments) ----
+    // Low-sensitivity reference data; readable by any signed-in account so the
+    // sign-up form can populate the configured departments / job titles.
     match /config/{doc} {
       allow read: if signedIn();
       allow write: if isAdmin() || (signedIn() && noUsersYet()); // seed at bootstrap
@@ -51,7 +71,7 @@ service cloud.firestore {
 
     // ---- equipment ----
     match /equipment/{id} {
-      allow read: if signedIn();
+      allow read: if isActive();
       // Issuer/Admin create & maintain equipment.
       allow create: if canIssue() && isActive();
       // Issuer/Admin may update freely; any active Isolator may update an item
@@ -67,7 +87,7 @@ service cloud.firestore {
 
     // ---- isolations (certificates) ----
     match /isolations/{id} {
-      allow read: if signedIn();
+      allow read: if isActive();
       allow create: if canIssue() && isActive();
       // Issuer/Admin manage certificates; additionally any active Isolator may
       // confirm the isolation or de-isolation (whoever is on shift), not just
@@ -78,24 +98,36 @@ service cloud.firestore {
 
     // ---- permits ----
     match /permits/{id} {
-      allow read: if signedIn();
-      // Any active user may raise a permit (they are the requester).
-      allow create: if signedIn() && isActive()
-                    && request.resource.data.requester.uid == request.auth.uid;
-      // Requester may edit their own DRAFT/SUBMITTED permit; Issuer/Admin may edit any;
-      // the requester may also record their work-completion sign-off on their own
-      // ACTIVE/EXTENDED permit (without changing its status); and any active
-      // Isolator may activate a permit waiting on isolation when they confirm the
-      // certificate it is attached to.
+      allow read: if isActive();
+      // Any active user may raise a permit (as the requester). A new permit may
+      // only start as a draft or submitted — never pre-approved / active.
+      allow create: if isActive()
+                    && request.resource.data.requester.uid == request.auth.uid
+                    && request.resource.data.status in ['draft', 'submitted'];
+      // Update paths (audit fields stay locked on every non-Issuer path):
+      //  • Issuer/Admin — full authority (records approval/closure/rejection…).
+      //  • Requester editing their own draft/submitted permit — the new status
+      //    must stay within draft/submitted (so they can never self-approve to
+      //    active), and the audit fields are locked.
+      //  • Requester recording work-completion on their own active/extended
+      //    permit — the status must not change.
+      //  • Isolator activating a permit (awaitingIsolation → active) when they
+      //    confirm the certificate it is attached to.
       allow update: if isActive() && (
         canIssue() ||
         (resource.data.requester.uid == request.auth.uid &&
-         resource.data.status in ['draft','submitted']) ||
+         resource.data.status in ['draft', 'submitted'] &&
+         request.resource.data.status in ['draft', 'submitted'] &&
+         permitAuditLocked()) ||
         (resource.data.requester.uid == request.auth.uid &&
-         resource.data.status in ['active','extended'] &&
-         request.resource.data.status == resource.data.status) ||
-        (isIsolator() && resource.data.status == 'awaitingIsolation' &&
-         resource.data.isolationRef != null)
+         resource.data.status in ['active', 'extended'] &&
+         request.resource.data.status == resource.data.status &&
+         permitAuditLocked()) ||
+        (isIsolator() &&
+         resource.data.status == 'awaitingIsolation' &&
+         resource.data.isolationRef != null &&
+         request.resource.data.status == 'active' &&
+         permitAuditLocked())
       );
       allow delete: if isAdmin();
     }

@@ -3,7 +3,7 @@
    Bump CACHE_VERSION whenever you change app files, so devices
    pick up the new version on next launch.
    ============================================================ */
-const CACHE_VERSION = "ptw-v9";
+const CACHE_VERSION = "ptw-v10";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -12,11 +12,20 @@ const APP_SHELL = [
   "./firebase-config.js",
   "./manifest.webmanifest",
   "./icons/icon-192.png",
-  "./icons/icon-512.png"
+  "./icons/icon-512.png",
+  "./icons/icon-maskable-512.png"
 ];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE_VERSION).then((c) => c.addAll(APP_SHELL)).then(() => self.skipWaiting()));
+  // Cache each shell file independently. addAll() rejects the whole batch if any
+  // single file 404s — a missing icon would then silently disable offline mode.
+  // add().catch() per-file keeps the install (and offline support) resilient.
+  e.waitUntil((async () => {
+    const cache = await caches.open(CACHE_VERSION);
+    await Promise.all(APP_SHELL.map((url) =>
+      cache.add(url).catch((err) => console.warn("SW: could not cache", url, err))));
+    await self.skipWaiting();
+  })());
 });
 
 self.addEventListener("activate", (e) => {
