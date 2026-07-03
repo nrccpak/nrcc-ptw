@@ -99,6 +99,15 @@ function parseCsvLine(line) {
   out.push(cur);
   return out.map((s) => s.trim());
 }
+// Firestore write promises resolve only on SERVER acknowledgement. When the
+// device is offline the write is queued locally (and syncs later) but the
+// promise never settles — so every `await updateDoc(...); toast(...)` flow
+// would silently freeze, despite the app being "offline-first". When offline,
+// give the local cache a moment to apply, then continue optimistically.
+function fsWrite(p) {
+  if (navigator.onLine) return p;
+  return Promise.race([p, new Promise((res) => setTimeout(res, 600))]);
+}
 
 /* -------------------- People & roles -------------------- */
 // Job titles available in the app — config overrides the built-in default.
@@ -570,7 +579,7 @@ async function viewDashboard(m) {
   const stat = (num, lab, ic) => `<div class="stat"><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
   let html = `<div class="cols cols-4" style="margin-bottom:1.2rem">
     ${stat(active.length, "Active permits", ICON.list)}
-    ${stat(pending.length, isIssuer ? "Awaiting your approval" : "Submitted", ICON.newdoc)}
+    ${stat(isIssuer ? pending.length : mine.filter((p) => p.status === "submitted").length, isIssuer ? "Awaiting your approval" : "My submitted", ICON.newdoc)}
     ${stat(isolated.length, "Equipment isolated", ICON.lock)}
     ${stat(mine.length, "My permits", ICON.cube)}</div>`;
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
@@ -897,9 +906,26 @@ async function viewNewPermit(m) {
     // and wasn't confirmed at approval time.
     const startV = $("#vstart").value || "", endV = $("#vend").value || "";
     if (!open && endV && startV && new Date(endV) <= new Date(startV)) return toast("Planned end must be after the valid-from time.", "err");
+    // A submitted permit must have a planned end OR be explicitly open-ended.
+    // (Previously it could silently have neither — such a permit never showed
+    // as overdue and effectively never expired without being marked open.)
+    if (status === "submitted" && !open && !endV)
+      return toast("Set a planned end date/time, or tick Open-ended.", "err");
     if (status === "submitted" && type.requiresGasTest &&
         (!gasTest || !String(gasTest.o2).trim() || !String(gasTest.lel).trim() || !gasTest.by))
       return toast("Enter the gas-test readings (O₂, LEL) and who tested before submitting.", "err");
+    // Gas-reading sanity check (advisory, like the hazard checklist): flag
+    // readings outside accepted entry/hot-work limits so an unsafe atmosphere
+    // is never submitted by accident. The requester can still consciously
+    // proceed — the recorded values remain visible to the Issuer.
+    const gasWarnings = [];
+    if (status === "submitted" && gasTest) {
+      const o2 = parseFloat(gasTest.o2), lel = parseFloat(gasTest.lel), h2s = parseFloat(gasTest.h2s), co = parseFloat(gasTest.co);
+      if (!isNaN(o2) && (o2 < 19.5 || o2 > 23.5)) gasWarnings.push(`O₂ ${o2}% is outside the safe range (19.5–23.5%)`);
+      if (!isNaN(lel) && lel >= 5) gasWarnings.push(`LEL ${lel}% is at or above the 5% action limit`);
+      if (!isNaN(h2s) && h2s > 10) gasWarnings.push(`H₂S ${h2s} ppm exceeds 10 ppm`);
+      if (!isNaN(co) && co > 25) gasWarnings.push(`CO ${co} ppm exceeds 25 ppm`);
+    }
 
     const finalize = async () => {
       const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
@@ -909,12 +935,12 @@ async function viewNewPermit(m) {
           // Update the existing draft in place. Identity / audit fields (permitNo,
           // requester, approval, createdAt…) are deliberately left untouched so the
           // write satisfies the security rules and the audit trail stays intact.
-          await updateDoc(doc(db, "permits", editing.id), {
+          await fsWrite(updateDoc(doc(db, "permits", editing.id), {
             type: type.code, typeName: type.name, status,
             equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
             requestingDepartment, workDescription: desc, location: $("#loc").value.trim(),
             validity, checklist, ppe, gasTest, isolationPoints, updatedAt: nowISO()
-          });
+          }));
           toast(status === "draft" ? "Draft updated" : "Permit submitted for approval", "ok");
           return go("detail", { id: editing.id });
         }
@@ -933,18 +959,22 @@ async function viewNewPermit(m) {
           sync: { createdOffline: !navigator.onLine },
           createdAt: nowISO(), updatedAt: nowISO()
         };
-        const ref = await addDoc(collection(db, "permits"), permit);
+        const ref = await fsWrite(addDoc(collection(db, "permits"), permit));
         toast(status === "draft" ? "Draft saved" : "Permit submitted for approval", "ok");
         go("detail", { id: ref.id });
       } catch (err) { toast(err.message, "err"); }
     };
 
-    // Advisory hazard-checklist gate — warn on unticked items, then let the
-    // requester proceed. Drafts and fully-ticked submissions save straight away.
+    // Advisory gate — warn on unticked checklist items and/or out-of-range gas
+    // readings, then let the requester consciously proceed. Drafts and clean
+    // submissions save straight away.
     const unconfirmed = status === "submitted" ? checklist.filter((c) => !c.checked) : [];
-    if (unconfirmed.length) {
+    const advisories = [];
+    if (unconfirmed.length) advisories.push(`${unconfirmed.length} hazard-checklist item(s) are not ticked (${unconfirmed.map((c) => c.item).join("; ")}).`);
+    if (gasWarnings.length) advisories.push(`GAS READINGS OUT OF RANGE: ${gasWarnings.join("; ")}.`);
+    if (advisories.length) {
       return confirmBox("Submit with unconfirmed items?",
-        `${unconfirmed.length} hazard-checklist item(s) are not ticked (${unconfirmed.map((c) => c.item).join("; ")}). The Issuer will see these as unconfirmed when reviewing. Submit for approval anyway?`,
+        `${advisories.join(" ")} The Issuer will see these when reviewing. Submit for approval anyway?`,
         "Submit anyway", () => { closeModal(); return finalize(); });
     }
     return finalize();
@@ -1060,7 +1090,7 @@ async function viewPermitDetail(m) {
   $$("[data-isolink],[data-isolink2],[data-isolink3]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
-  $("#submitNow") && ($("#submitNow").onclick = async () => { await updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() }); toast("Submitted", "ok"); go("detail", { id }); });
+  $("#submitNow") && ($("#submitNow").onclick = async () => { await fsWrite(updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() })); toast("Submitted", "ok"); go("detail", { id }); });
   $("#reject") && ($("#reject").onclick = () => {
     modal({ title: "Reject permit", body: `<label class="field"><span>Reason</span><textarea id="rr" placeholder="Why is this being rejected?"></textarea></label>`,
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Reject</button>` });
@@ -1080,7 +1110,7 @@ async function viewPermitDetail(m) {
           batch.update(doc(db, "equipment", p.equipmentRef), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
         } else batch.update(isoRef, { attachedPermitIds: [], status: "removalPending" });
       }
-      await batch.commit();
+      await fsWrite(batch.commit());
       closeModal(); toast("Permit rejected"); go("detail", { id }); refreshPendingBadge();
     };
   });
@@ -1094,7 +1124,7 @@ async function viewPermitDetail(m) {
       const ne = $("#ne").value;
       if (!ne) return toast("Pick a new end date/time", "err");
       if (new Date(ne) <= new Date()) return toast("The new end must be in the future.", "err");
-      await updateDoc(doc(db, "permits", id), { status: "extended", "validity.extendedTo": ne, "validity.openEnded": false, updatedAt: nowISO() });
+      await fsWrite(updateDoc(doc(db, "permits", id), { status: "extended", "validity.extendedTo": ne, "validity.openEnded": false, updatedAt: nowISO() }));
       closeModal(); toast("Permit extended", "ok"); go("detail", { id });
     };
   });
@@ -1120,7 +1150,7 @@ async function approvePermit(p, equip) {
     const others = (await fetchPermits()).filter((x) => x.id !== p.id && x.equipmentRef === p.equipmentRef && ["active", "extended"].includes(x.status));
     if (others.length) warn += `<div class="warn-box"><b>${others.length} other active permit(s)</b> already on ${esc(p.equipmentTag)}. Review concurrent work.</div>`;
     confirmBoxHTML("Approve permit", `${warn}<p>Approve <b>${esc(p.permitNo)}</b> and activate the work?</p>`, "Approve & activate", async () => {
-      await updateDoc(doc(db, "permits", p.id), { status: "active", approval: approval(), updatedAt: nowISO() });
+      await fsWrite(updateDoc(doc(db, "permits", p.id), { status: "active", approval: approval(), updatedAt: nowISO() }));
       closeModal(); toast("Permit approved & activated", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1133,7 +1163,16 @@ async function approvePermit(p, equip) {
     if (s.exists()) iso = { id: s.id, ...s.data() };
   }
 
-  if (iso && ["active", "trialRun"].includes(iso.status)) {
+  // SAFETY GATE: never attach a new crew's permit to an isolation while the
+  // equipment is ENERGISED for a trial run. Approving it "Active" would send
+  // a crew onto live equipment. Re-isolate first, then approve.
+  if (iso && iso.status === "trialRun") {
+    return confirmBoxHTML("Cannot approve — trial run in progress",
+      `<div class="danger-box"><b>${esc(equip.tag)} is ENERGISED for a trial run</b> under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. This permit cannot be attached or activated until the equipment is re-isolated.</div>`,
+      "OK", async () => closeModal());
+  }
+
+  if (iso && iso.status === "active") {
     // shared isolation already confirmed → attach, permit goes Active
     confirmBoxHTML("Approve permit",
       `<div class="info-box">${esc(equip.tag)} is already isolated under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. This permit will <b>attach to the shared isolation</b> and become Active immediately.</div>
@@ -1141,7 +1180,7 @@ async function approvePermit(p, equip) {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
       batch.update(doc(db, "permits", p.id), { status: "active", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
-      await batch.commit();
+      await fsWrite(batch.commit());
       closeModal(); toast("Permit approved & attached to isolation", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1155,7 +1194,7 @@ async function approvePermit(p, equip) {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
       batch.update(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
-      await batch.commit();
+      await fsWrite(batch.commit());
       closeModal(); toast("Approved — awaiting isolation confirmation"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1186,7 +1225,7 @@ async function approvePermit(p, equip) {
     });
     batch.update(doc(db, "equipment", equip.id), { isolationStatus: "pending", activeIsolationId: isoId, updatedAt: nowISO() });
     batch.update(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: isoId, isoNo, approval: approval(), updatedAt: nowISO() });
-    await batch.commit();
+    await fsWrite(batch.commit());
     closeModal(); toast(`Certificate ${isoNo} assigned to ${au?.name || ""}`, "ok"); go("detail", { id: p.id }); refreshPendingBadge();
   };
 }
@@ -1206,10 +1245,10 @@ async function confirmWorkComplete(p, equip) {
     if (!remarks) return toast("Enter completion remarks", "err");
     if (!$("#wcAck").checked) return toast("Tick the confirmation statement", "err");
     try {
-      await updateDoc(doc(db, "permits", p.id), {
+      await fsWrite(updateDoc(doc(db, "permits", p.id), {
         workCompletion: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, safeToReturn: true, timestamp: nowISO() },
         updatedAt: nowISO()
-      });
+      }));
       closeModal(); toast(isolated ? "Work complete — equipment can now be de-isolated" : "Work complete — Issuer can now close the permit", "ok"); go("detail", { id: p.id });
     } catch (e) { toast(e.message || "Could not confirm work completion", "err"); }
   };
@@ -1233,7 +1272,7 @@ async function closePermit(p, equip) {
      <label class="field"><span>Closure remarks</span><textarea id="crem" placeholder="Work complete, area cleared…"></textarea></label>`,
     "Close permit", async () => {
       const remarks = $("#crem")?.value.trim() || "";
-      await updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() });
+      await fsWrite(updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() }));
       closeModal(); toast("Permit closed", "ok"); go("detail", { id: p.id });
     });
 }
@@ -1257,7 +1296,7 @@ async function trialRun(p, equip) {
     batch.update(doc(db, "permits", p.id), { trialRuns: arrayUnion(tr), updatedAt: nowISO() });
     if (isoRef) batch.update(isoRef, { status: "trialRun" });
     if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
-    await batch.commit();
+    await fsWrite(batch.commit());
     closeModal(); toast("Trial run started — equipment energised", "");
     // offer re-isolate immediately
     setTimeout(() => offerReisolate(p, equip), 400);
@@ -1274,7 +1313,7 @@ function offerReisolate(p, equip) {
       batch.update(doc(db, "permits", p.id), { trialRuns: trs, updatedAt: nowISO() });
       if (p.isolationRef) batch.update(doc(db, "isolations", p.isolationRef), { status: "active" });
       if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
-      await batch.commit();
+      await fsWrite(batch.commit());
       closeModal(); toast("Re-isolated — work may resume", "ok"); go("detail", { id: p.id });
     });
 }
@@ -1369,7 +1408,14 @@ function openImport(existing, onDone) {
   $("[data-ok]").onclick = async () => {
     $("[data-ok]").disabled = true;
     try {
-      for (const x of parsed) await addDoc(collection(db, "equipment"), { ...x, isolationStatus: "available", activeIsolationId: null, createdBy: State.profile.name, createdAt: nowISO() });
+      // Batched import (chunks of 400 — Firestore batch limit is 500). One
+      // round trip per chunk instead of one per row, and each chunk is atomic.
+      for (let i = 0; i < parsed.length; i += 400) {
+        const batch = writeBatch(db);
+        parsed.slice(i, i + 400).forEach((x) => batch.set(doc(collection(db, "equipment")),
+          { ...x, isolationStatus: "available", activeIsolationId: null, createdBy: State.profile.name, createdAt: nowISO() }));
+        await fsWrite(batch.commit());
+      }
       closeModal(); toast(`Imported ${parsed.length} equipment`, "ok");
       onDone(await fetchEquipment());
     } catch (e) { toast(e.message, "err"); }
@@ -1607,7 +1653,7 @@ async function viewIsolationDetail(m) {
         batch.update(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
         if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
         for (const p of attached) if (p.status === "awaitingIsolation") batch.update(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
-        await batch.commit();
+        await fsWrite(batch.commit());
         closeModal(); toast("Isolation confirmed — waiting permits activated", "ok"); go("isodetail", { id });
       } catch (e) { toast(e.message || "Could not confirm isolation", "err"); }
     };
@@ -1619,7 +1665,7 @@ async function viewIsolationDetail(m) {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
       if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-      await batch.commit();
+      await fsWrite(batch.commit());
       closeModal(); toast("De-isolation confirmed — equipment available", "ok"); go("isodetail", { id });
     });
 
@@ -1629,7 +1675,7 @@ async function viewIsolationDetail(m) {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
       if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-      await batch.commit();
+      await fsWrite(batch.commit());
       closeModal(); toast("Isolation released — equipment available", "ok"); go("isodetail", { id });
     }, true);
 }

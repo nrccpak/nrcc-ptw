@@ -108,10 +108,19 @@ service cloud.firestore {
     match /permits/{id} {
       allow read: if isActive();
       // Any active user may raise a permit (as the requester). A new permit may
-      // only start as a draft or submitted — never pre-approved / active.
+      // only start as a draft or submitted — never pre-approved / active — and
+      // must not arrive with a forged approval / completion / closure / isolation
+      // already stamped on it (those fields are only ever written by the roles
+      // that own them, later in the lifecycle).
       allow create: if isActive()
                     && request.resource.data.requester.uid == request.auth.uid
-                    && request.resource.data.status in ['draft', 'submitted'];
+                    && request.resource.data.status in ['draft', 'submitted']
+                    && request.resource.data.get('approval', null) == null
+                    && request.resource.data.get('rejection', null) == null
+                    && request.resource.data.get('closure', null) == null
+                    && request.resource.data.get('workCompletion', null) == null
+                    && request.resource.data.get('isolationRef', null) == null
+                    && request.resource.data.get('trialRuns', []).size() == 0;
       // Update paths (audit fields stay locked on every non-Issuer path):
       //  • Issuer/Admin — full authority (records approval/closure/rejection…).
       //  • Requester editing their own draft/submitted permit — the new status
@@ -126,16 +135,27 @@ service cloud.firestore {
         (resource.data.requester.uid == request.auth.uid &&
          resource.data.status in ['draft', 'submitted'] &&
          request.resource.data.status in ['draft', 'submitted'] &&
-         permitAuditLocked()) ||
+         permitAuditLocked() &&
+         // Identity / audit anchors a requester may never rewrite on edit:
+         request.resource.data.permitNo == resource.data.permitNo &&
+         request.resource.data.createdAt == resource.data.createdAt &&
+         request.resource.data.get('workCompletion', null) == resource.data.get('workCompletion', null) &&
+         request.resource.data.get('isolationRef', null) == resource.data.get('isolationRef', null)) ||
+        // Requester on their own live permit may ONLY record work completion.
+        // (Previously this path allowed rewriting validity — i.e. a requester
+        // could silently self-extend their own permit — plus gas test,
+        // checklist and equipment fields. Now field-locked.)
         (resource.data.requester.uid == request.auth.uid &&
          resource.data.status in ['active', 'extended'] &&
-         request.resource.data.status == resource.data.status &&
-         permitAuditLocked()) ||
+         request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(['workCompletion', 'updatedAt'])) ||
+        // Isolator activating an approved permit: status flip only.
         (isIsolator() &&
          resource.data.status == 'awaitingIsolation' &&
          resource.data.isolationRef != null &&
          request.resource.data.status == 'active' &&
-         permitAuditLocked())
+         request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(['status', 'updatedAt']))
       );
       allow delete: if isAdmin();
     }
