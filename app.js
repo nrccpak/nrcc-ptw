@@ -1028,7 +1028,9 @@ async function viewPermitDetail(m) {
   if (["active", "extended"].includes(p.status) && isOwner && !p.workCompletion) actions += `<button class="btn btn-success" id="workdone">Confirm work complete</button>`;
   if (awaitingDeiso && deisoReady && isIsoOrAdmin) actions += `<button class="btn btn-accent" id="godeiso">Go to de-isolation</button>`;
   if (["active", "extended"].includes(p.status) && isIssuer) {
-    actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
+    // Once work is complete AND the equipment is de-isolated the permit is
+    // ready to close — extending it is meaningless, so only offer Close.
+    if (!(p.workCompletion && deisolated)) actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
     if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
   }
   // Trial-run actions (Start trial run / Re-isolate now) are Admin-only;
