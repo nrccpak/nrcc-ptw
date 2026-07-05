@@ -1339,9 +1339,14 @@ async function viewEquipment(m) {
   const draw = () => {
     const q = $("#q").value.toLowerCase(), fl = $("#fLine").value, fa = $("#fArea").value;
     const rows = equip.filter((e) => (!fl || e.line === fl) && (!fa || e.area === fa) && (!q || (e.tag + " " + e.description).toLowerCase().includes(q)));
-    $("#etable").innerHTML = `<table class="tbl"><thead><tr><th>Tag</th><th>Description</th><th>Line</th><th>Area</th><th>Status</th></tr></thead><tbody>
-      ${rows.map((e) => `<tr><td><span class="mono">${esc(e.tag)}</span></td><td>${esc(e.description || "—")}</td><td>${esc(e.line)}</td><td>${esc(e.area)}</td><td>${badge(e.isolationStatus || "available")}</td></tr>`).join("")
-      || `<tr><td colspan="5" class="empty">No equipment yet. ${isIssuer ? "Add one or import a CSV." : ""}</td></tr>`}</tbody></table>`;
+    const nCols = isIssuer ? 6 : 5;
+    $("#etable").innerHTML = `<table class="tbl"><thead><tr><th>Tag</th><th>Description</th><th>Line</th><th>Area</th><th>Status</th>${isIssuer ? "<th></th>" : ""}</tr></thead><tbody>
+      ${rows.map((e) => `<tr><td><span class="mono">${esc(e.tag)}</span></td><td>${esc(e.description || "—")}</td><td>${esc(e.line)}</td><td>${esc(e.area)}</td><td>${badge(e.isolationStatus || "available")}</td>${isIssuer ? `<td style="text-align:right"><button class="btn btn-ghost btn-sm" data-edit="${e.id}">Edit</button></td>` : ""}</tr>`).join("")
+      || `<tr><td colspan="${nCols}" class="empty">No equipment yet. ${isIssuer ? "Add one or import a CSV." : ""}</td></tr>`}</tbody></table>`;
+    if (isIssuer) $$("[data-edit]").forEach((b) => b.onclick = () => {
+      const it = equip.find((e) => e.id === b.dataset.edit);
+      if (it) openEditEquipment(it, equip, (upd) => { Object.assign(it, upd); draw(); });
+    });
   };
   ["q", "fLine", "fArea"].forEach((id) => $("#" + id).addEventListener("input", draw));
   draw();
@@ -1377,6 +1382,36 @@ function openAddEquipment(existing, onAdded) {
     if (existing.some((e) => e.tag.toLowerCase() === tag.toLowerCase())) return toast("That tag already exists", "err");
     const rec = { tag, description: $("#aDesc").value.trim(), line: $("#aLine").value, area: $("#aArea").value, isolationStatus: "available", activeIsolationId: null, createdBy: State.profile.name, createdAt: nowISO() };
     try { const ref = await addDoc(collection(db, "equipment"), rec); closeModal(); toast("Equipment added", "ok"); onAdded({ id: ref.id, ...rec }); }
+    catch (e) { toast(e.message, "err"); }
+  };
+}
+
+// Edit an existing equipment record (tag / description / line / area). Issuers
+// and Admins only — wired in from the equipment table's per-row Edit button.
+function openEditEquipment(item, existing, onSaved) {
+  const cfg = State.config;
+  modal({ title: "Edit equipment", body: `
+    <label class="field"><span>Tag <span class="req">*</span></span><input type="text" id="eTag" value="${esc(item.tag)}"></label>
+    <div id="dupWarn"></div>
+    <label class="field"><span>Description</span><input type="text" id="eDesc" value="${esc(item.description || "")}" placeholder="e.g. Raw Mill Circulation Fan"></label>
+    <div class="grid-2">
+      <label class="field"><span>Line</span><select id="eLine">${cfg.lines.map((l) => `<option${l === item.line ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+      <label class="field"><span>Area</span><select id="eArea">${cfg.areas.map((a) => `<option${a === item.area ? " selected" : ""}>${esc(a)}</option>`).join("")}</select></label>
+    </div>`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-accent" data-ok>Save</button>` });
+  $("[data-c]").onclick = closeModal;
+  const tagInput = $("#eTag");
+  tagInput.addEventListener("input", () => {
+    const t = tagInput.value.trim().toLowerCase();
+    const dup = existing.find((e) => e.id !== item.id && e.tag.toLowerCase() === t);
+    $("#dupWarn").innerHTML = dup ? `<div class="warn-box">Another item already uses tag <b class="mono">${esc(dup.tag)}</b>.</div>` : "";
+  });
+  $("[data-ok]").onclick = async () => {
+    const tag = tagInput.value.trim();
+    if (!tag) return toast("Enter a tag", "err");
+    if (existing.some((e) => e.id !== item.id && e.tag.toLowerCase() === tag.toLowerCase())) return toast("That tag already exists", "err");
+    const upd = { tag, description: $("#eDesc").value.trim(), line: $("#eLine").value, area: $("#eArea").value };
+    try { await updateDoc(doc(db, "equipment", item.id), upd); closeModal(); toast("Equipment updated", "ok"); onSaved(upd); }
     catch (e) { toast(e.message, "err"); }
   };
 }
