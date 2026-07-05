@@ -1031,8 +1031,10 @@ async function viewPermitDetail(m) {
     actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
     if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
   }
-  if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef && !inTrial) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
-  if (["active", "extended"].includes(p.status) && isIssuer && p.isolationRef && inTrial) actions += `<button class="btn btn-success" id="reiso">Re-isolate now</button>`;
+  // Trial-run actions (Start trial run / Re-isolate now) are Admin-only;
+  // Issuers no longer see either action.
+  if (["active", "extended"].includes(p.status) && State.profile.role === "admin" && p.isolationRef && !inTrial) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
+  if (["active", "extended"].includes(p.status) && State.profile.role === "admin" && p.isolationRef && inTrial) actions += `<button class="btn btn-success" id="reiso">Re-isolate now</button>`;
   actions += `<button class="btn btn-ghost no-print" id="pdf">${ICON.pdf} Print / PDF</button>`;
 
   $("#pd").innerHTML = `
