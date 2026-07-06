@@ -531,7 +531,10 @@ async function fetchAll(coll) {
   return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 }
 async function fetchPermits() { const a = await fetchAll("permits"); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
-async function fetchEquipment() { const a = await fetchAll("equipment"); a.sort((x, y) => (x.tag || "").localeCompare(y.tag || "")); return a; }
+// Active equipment only. Archived items (superseded by a data refresh) stay in
+// the collection so historical permits/certificates still resolve by
+// equipmentRef via getDoc, but are hidden from the active register and pickers.
+async function fetchEquipment() { const a = (await fetchAll("equipment")).filter((e) => !e.archived); a.sort((x, y) => (x.tag || "").localeCompare(y.tag || "")); return a; }
 async function fetchIsolations() { const a = await fetchAll("isolations"); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
 async function activeUsers() { const u = await fetchAll("users"); return u.filter((x) => x.active).sort((a, b) => (a.name || "").localeCompare(b.name || "")); }
 // Only active users holding the Isolator role — used for isolation / de-isolation assignment.
@@ -1422,12 +1425,24 @@ function openEditEquipment(item, existing, onSaved) {
 
 function openImport(existing, onDone) {
   modal({ title: "Import equipment (CSV)", wide: true, body: `
-    <div class="info-box">CSV columns: <b>tag, description, line, area</b> (first row = header). Existing tags are skipped (no duplicates).</div>
+    <div class="info-box">CSV columns: <b>tag, description, line, area</b> (first row = header). In normal mode, tags that already exist are skipped (no duplicates).</div>
+    <label class="checkline" style="margin:.2rem 0 .6rem"><input type="checkbox" id="repl"> <b>Full replace</b> — archive all ${existing.length} current equipment, then import the CSV as a fresh list. Archived items are hidden but kept, so historical permits &amp; certificates stay intact. (Reversible.)</label>
     <input type="file" id="csv" accept=".csv,text/csv">
     <div id="prev" style="margin-top:1rem"></div>`,
     footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-accent" data-ok disabled>Import</button>` });
   $("[data-c]").onclick = closeModal;
-  let parsed = [];
+  let raw = [];      // every parsed CSV row (before dedup)
+  let parsed = [];   // rows that will actually be imported
+  const recompute = () => {
+    const replace = $("#repl").checked;
+    parsed = replace ? raw.slice() : raw.filter((x) => !existing.some((e) => e.tag.toLowerCase() === x.tag.toLowerCase()));
+    if (!raw.length) { $("#prev").innerHTML = ""; $("[data-ok]").disabled = true; return; }
+    $("#prev").innerHTML = replace
+      ? `<div class="warn-box"><b>${existing.length}</b> current equipment will be <b>archived</b> and <b>${parsed.length}</b> new rows imported.</div>`
+      : `<b>${parsed.length}</b> new rows ready (duplicates skipped).`;
+    $("[data-ok]").disabled = parsed.length === 0;
+  };
+  $("#repl").onchange = recompute;
   $("#csv").onchange = (ev) => {
     const file = ev.target.files[0]; if (!file) return;
     const r = new FileReader();
@@ -1435,27 +1450,43 @@ function openImport(existing, onDone) {
       const lines = r.result.split(/\r?\n/).filter((x) => x.trim());
       const head = parseCsvLine(lines.shift()).map((h) => h.toLowerCase());
       const idx = (k) => head.indexOf(k);
-      parsed = lines.map((ln) => { const c = parseCsvLine(ln); return {
+      raw = lines.map((ln) => { const c = parseCsvLine(ln); return {
         tag: (c[idx("tag")] || "").trim(), description: (c[idx("description")] || "").trim(),
         line: (c[idx("line")] || State.config.lines[0]).trim(), area: (c[idx("area")] || State.config.areas[0]).trim() }; })
-        .filter((x) => x.tag && !existing.some((e) => e.tag.toLowerCase() === x.tag.toLowerCase()));
-      $("#prev").innerHTML = `<b>${parsed.length}</b> new rows ready (duplicates skipped).`;
-      $("[data-ok]").disabled = parsed.length === 0;
+        .filter((x) => x.tag);
+      recompute();
     };
     r.readAsText(file);
   };
   $("[data-ok]").onclick = async () => {
+    const replace = $("#repl").checked;
+    // Safety pre-check for a full replace: never archive equipment that is still
+    // under any isolation (isolated / pending / trial run). Doing so would strand
+    // a live LOTO while a same-tag new record appears "Available".
+    if (replace) {
+      const live = existing.filter((e) => e.isolationStatus && e.isolationStatus !== "available");
+      if (live.length) return toast(`Cannot replace: ${live.length} item(s) are still under isolation (${live.slice(0, 3).map((e) => e.tag).join(", ")}${live.length > 3 ? "…" : ""}). De-isolate first.`, "err");
+    }
     $("[data-ok]").disabled = true;
     try {
-      // Batched import (chunks of 400 — Firestore batch limit is 500). One
-      // round trip per chunk instead of one per row, and each chunk is atomic.
+      // Batched writes (chunks of 400 — Firestore batch limit is 500), each chunk
+      // atomic. Archive first, then import the fresh set.
+      if (replace) {
+        for (let i = 0; i < existing.length; i += 400) {
+          const batch = writeBatch(db);
+          existing.slice(i, i + 400).forEach((e) => batch.update(doc(db, "equipment", e.id),
+            { archived: true, archivedAt: nowISO(), archivedBy: State.profile.name, updatedAt: nowISO() }));
+          await fsWrite(batch.commit());
+        }
+      }
       for (let i = 0; i < parsed.length; i += 400) {
         const batch = writeBatch(db);
         parsed.slice(i, i + 400).forEach((x) => batch.set(doc(collection(db, "equipment")),
-          { ...x, isolationStatus: "available", activeIsolationId: null, createdBy: State.profile.name, createdAt: nowISO() }));
+          { ...x, isolationStatus: "available", activeIsolationId: null, archived: false, createdBy: State.profile.name, createdAt: nowISO() }));
         await fsWrite(batch.commit());
       }
-      closeModal(); toast(`Imported ${parsed.length} equipment`, "ok");
+      closeModal();
+      toast(replace ? `Archived ${existing.length}, imported ${parsed.length} equipment` : `Imported ${parsed.length} equipment`, "ok");
       onDone(await fetchEquipment());
     } catch (e) { toast(e.message, "err"); }
   };
