@@ -1447,7 +1447,10 @@ function openImport(existing, onDone) {
     const file = ev.target.files[0]; if (!file) return;
     const r = new FileReader();
     r.onload = () => {
-      const lines = r.result.split(/\r?\n/).filter((x) => x.trim());
+      // Strip a leading UTF-8 BOM (Excel "CSV" often adds one) — otherwise the
+      // first header cell becomes "﻿tag" and the tag column is never found,
+      // silently importing zero rows.
+      const lines = r.result.replace(/^﻿/, "").split(/\r?\n/).filter((x) => x.trim());
       const head = parseCsvLine(lines.shift()).map((h) => h.toLowerCase());
       const idx = (k) => head.indexOf(k);
       raw = lines.map((ln) => { const c = parseCsvLine(ln); return {
@@ -1469,6 +1472,18 @@ function openImport(existing, onDone) {
     }
     $("[data-ok]").disabled = true;
     try {
+      // Auto-sync config: add any line/area values found in the CSV that aren't
+      // already configured, so the register filters and the Add/Edit dropdowns
+      // include them (otherwise imported values can't be filtered and get reset
+      // to the first option if the item is edited).
+      const cfgLines = State.config.lines || [], cfgAreas = State.config.areas || [];
+      const newLines = [...new Set(parsed.map((x) => x.line).filter(Boolean))].filter((l) => !cfgLines.includes(l));
+      const newAreas = [...new Set(parsed.map((x) => x.area).filter(Boolean))].filter((a) => !cfgAreas.includes(a));
+      if (newLines.length || newAreas.length) {
+        const lines = [...cfgLines, ...newLines], areas = [...cfgAreas, ...newAreas];
+        await fsWrite(updateDoc(doc(db, "config", "app"), { lines, areas }));
+        State.config = { ...State.config, lines, areas };
+      }
       // Batched writes (chunks of 400 — Firestore batch limit is 500), each chunk
       // atomic. Archive first, then import the fresh set.
       if (replace) {
