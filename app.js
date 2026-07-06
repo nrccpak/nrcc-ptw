@@ -1348,11 +1348,15 @@ async function viewEquipment(m) {
     const rows = equip.filter((e) => (!fl || e.line === fl) && (!fa || e.area === fa) && (!q || (e.tag + " " + e.description).toLowerCase().includes(q)));
     const nCols = isIssuer ? 6 : 5;
     $("#etable").innerHTML = `<table class="tbl"><thead><tr><th>Tag</th><th>Description</th><th>Line</th><th>Area</th><th>Status</th>${isIssuer ? "<th></th>" : ""}</tr></thead><tbody>
-      ${rows.map((e) => `<tr><td><span class="mono">${esc(e.tag)}</span></td><td>${esc(e.description || "—")}</td><td>${esc(e.line)}</td><td>${esc(e.area)}</td><td>${badge(e.isolationStatus || "available")}</td>${isIssuer ? `<td style="text-align:right"><button class="btn btn-ghost btn-sm" data-edit="${e.id}">Edit</button></td>` : ""}</tr>`).join("")
+      ${rows.map((e) => `<tr><td><span class="mono">${esc(e.tag)}</span></td><td>${esc(e.description || "—")}</td><td>${esc(e.line)}</td><td>${esc(e.area)}</td><td>${badge(e.isolationStatus || "available")}</td>${isIssuer ? `<td style="text-align:right"><button class="btn btn-ghost btn-sm" data-edit="${e.id}">Edit</button>${isAdmin ? ` <button class="btn btn-ghost btn-sm" data-del="${e.id}">Delete</button>` : ""}</td>` : ""}</tr>`).join("")
       || `<tr><td colspan="${nCols}" class="empty">No equipment yet. ${isIssuer ? "Add one or import a CSV." : ""}</td></tr>`}</tbody></table>`;
     if (isIssuer) $$("[data-edit]").forEach((b) => b.onclick = () => {
       const it = equip.find((e) => e.id === b.dataset.edit);
       if (it) openEditEquipment(it, equip, (upd) => { Object.assign(it, upd); draw(); });
+    });
+    if (isAdmin) $$("[data-del]").forEach((b) => b.onclick = () => {
+      const it = equip.find((e) => e.id === b.dataset.del);
+      if (it) openDeleteEquipment(it, () => { equip = equip.filter((e) => e.id !== it.id); draw(); });
     });
   };
   ["q", "fLine", "fArea"].forEach((id) => $("#" + id).addEventListener("input", draw));
@@ -1421,6 +1425,34 @@ function openEditEquipment(item, existing, onSaved) {
     try { await updateDoc(doc(db, "equipment", item.id), upd); closeModal(); toast("Equipment updated", "ok"); onSaved(upd); }
     catch (e) { toast(e.message, "err"); }
   };
+}
+
+// Admin-only equipment delete. A hard delete is allowed only for equipment that
+// nothing references; anything referenced by a permit or certificate is offered
+// Archive instead (preserving history). Equipment under a live isolation is
+// blocked outright.
+async function openDeleteEquipment(item, onChanged) {
+  if (item.isolationStatus && item.isolationStatus !== "available")
+    return toast(`${item.tag} is under isolation and cannot be deleted. De-isolate it first.`, "err");
+  const [permits, isos] = await Promise.all([fetchPermits(), fetchIsolations()]);
+  const refCount = permits.filter((p) => p.equipmentRef === item.id).length
+                 + isos.filter((i) => i.equipmentRef === item.id).length;
+  if (refCount > 0) {
+    return confirmBoxHTML("Cannot delete — records reference this equipment",
+      `<div class="warn-box"><b>${esc(item.tag)}</b> is referenced by <b>${refCount}</b> permit(s) / certificate(s). Hard-deleting it would leave those records without a live equipment link.</div>
+       <p>Archive it instead? Archiving hides it from the active list but keeps it so historical records stay intact. (Reversible.)</p>`,
+      "Archive instead", async () => {
+        await fsWrite(updateDoc(doc(db, "equipment", item.id), { archived: true, archivedAt: nowISO(), archivedBy: State.profile.name, updatedAt: nowISO() }));
+        closeModal(); toast(`${item.tag} archived`, "ok"); onChanged();
+      });
+  }
+  confirmBoxHTML("Delete equipment",
+    `<div class="danger-box">Permanently delete <b>${esc(item.tag)}</b>? This cannot be undone.</div>
+     <p>No permits or certificates reference this equipment, so it is safe to remove.</p>`,
+    "Delete permanently", async () => {
+      await fsWrite(deleteDoc(doc(db, "equipment", item.id)));
+      closeModal(); toast(`${item.tag} deleted`, "ok"); onChanged();
+    }, true);
 }
 
 function openImport(existing, onDone) {
