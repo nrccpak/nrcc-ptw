@@ -227,6 +227,12 @@ table.tbl tr:last-child td{border-bottom:none}
 /* ---------- Offline banner ---------- */
 .offline-bar{background:var(--amber);color:var(--navy);text-align:center;font-size:.8rem;
   font-weight:700;padding:.35rem;letter-spacing:.02em}
+.update-bar{position:fixed;top:0;left:0;right:0;z-index:9999;background:var(--navy);color:#fff;
+  font-size:.85rem;font-weight:600;padding:.55rem .8rem;display:flex;gap:.6rem;align-items:center;
+  justify-content:center;box-shadow:0 2px 10px rgba(0,0,0,.28);padding-top:calc(.55rem + env(safe-area-inset-top))}
+.update-bar button{background:#fff;color:var(--navy);border:none;border-radius:6px;
+  padding:.28rem .7rem;font-weight:700;cursor:pointer;font-size:.82rem}
+.update-bar button.updx{background:transparent;color:#fff;font-weight:400;padding:.28rem .45rem}
 
 /* ---------- Type-specific color borders for permit cards ---------- */
 .permit-type-general{--tc:var(--steel)}
