@@ -216,6 +216,39 @@ function confirmBox(title, message, okLabel, onOk, danger = false) {
 window.addEventListener("online", () => updateOfflineBar());
 window.addEventListener("offline", () => updateOfflineBar());
 
+// Auto-update: the service worker serves the app stale-while-revalidate, so a
+// new deploy is applied on the next launch on its own. When the main code
+// changes it also messages us here, and we surface a non-intrusive banner so
+// the user can reload right away — never automatically, so an in-progress
+// permit is never lost.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (ev.data && ev.data.type === "UPDATE_READY") showUpdateBar();
+  });
+}
+// Periodically nudge the service worker to revalidate the app code (and so
+// detect a new deploy) during long-running sessions. Throttled to ~30 min and
+// also fired when the tab/app is brought back to the foreground.
+let lastUpdateCheck = Date.now();
+function checkForUpdate() {
+  if (Date.now() - lastUpdateCheck < 30 * 60 * 1000) return;
+  lastUpdateCheck = Date.now();
+  if (navigator.serviceWorker && navigator.serviceWorker.controller)
+    fetch("app.js", { cache: "reload" }).catch(() => {});
+}
+setInterval(checkForUpdate, 30 * 60 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkForUpdate(); });
+
+function showUpdateBar() {
+  if (document.getElementById("updbar")) return;
+  const bar = document.createElement("div");
+  bar.id = "updbar"; bar.className = "update-bar";
+  bar.innerHTML = `A new version is available. <button type="button" id="updReload">Reload</button><button type="button" class="updx" id="updDismiss" aria-label="Dismiss">✕</button>`;
+  document.body.appendChild(bar);
+  bar.querySelector("#updReload").onclick = () => location.reload();
+  bar.querySelector("#updDismiss").onclick = () => bar.remove();
+}
+
 onAuthStateChanged(auth, async (user) => {
   State.user = user;
   // Clear any previous session's profile/role immediately. Until the new

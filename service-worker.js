@@ -1,9 +1,16 @@
 /* ============================================================
    Service Worker — caches the app shell so the PWA loads offline.
-   Bump CACHE_VERSION whenever you change app files, so devices
-   pick up the new version on next launch.
+   The app shell is served stale-while-revalidate: the cached copy
+   loads instantly (and works offline) while a fresh copy is fetched
+   in the background, so a new deploy is picked up automatically on
+   the next launch — no manual CACHE_VERSION bump required. When the
+   main code (app.js) changes, clients are messaged so they can offer
+   an immediate reload. (CACHE_VERSION is still bumped occasionally to
+   purge the cache namespace.)
    ============================================================ */
-const CACHE_VERSION = "ptw-v22";
+const CACHE_VERSION = "ptw-v23";
+// Full URL of the main app code — a change here triggers the update prompt.
+const CORE_URL = new URL("./app.js", self.location).href;
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -49,14 +56,25 @@ self.addEventListener("fetch", (e) => {
     return; // let the network/SDK handle it
   }
 
-  // App shell + same-origin: cache-first.
+  // App shell + same-origin: stale-while-revalidate. Serve the cached copy
+  // immediately (fast + offline), refresh it from the network in the background,
+  // and — when the main code changes — tell open clients so they can reload.
   if (url.origin === self.location.origin) {
     e.respondWith(
-      caches.match(req).then((hit) => hit || fetch(req).then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE_VERSION).then((c) => c.put(req, copy));
-        return res;
-      }).catch(() => caches.match("./index.html")))
+      caches.match(req).then((hit) => {
+        const network = fetch(req).then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE_VERSION).then((c) => c.put(req, copy));
+          if (req.url === CORE_URL && hit) {
+            const oldTag = hit.headers.get("etag"), newTag = res.headers.get("etag");
+            if (oldTag && newTag && oldTag !== newTag) {
+              self.clients.matchAll().then((cs) => cs.forEach((c) => c.postMessage({ type: "UPDATE_READY" })));
+            }
+          }
+          return res;
+        }).catch(() => hit || caches.match("./index.html"));
+        return hit || network;
+      })
     );
     return;
   }
