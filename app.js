@@ -811,9 +811,23 @@ async function viewNewPermit(m) {
     eqSearch.addEventListener("input", () => {
       const q = eqSearch.value.toLowerCase().trim();
       if (!q) { eqResults.innerHTML = ""; return; }
-      const hits = equip.filter((e) => (e.tag + " " + e.description).toLowerCase().includes(q)).slice(0, 6);
+      // Tag-first ranking: exact tag > tag starts-with > tag contains >
+      // description contains. Every match is shown (no cap) in a scrollable
+      // list, so the wanted tag is at the top and nothing is hidden below a cut.
+      const rank = (e) => {
+        const t = (e.tag || "").toLowerCase(), d = (e.description || "").toLowerCase();
+        if (t === q) return 4;
+        if (t.startsWith(q)) return 3;
+        if (t.includes(q)) return 2;
+        if (d.includes(q)) return 1;
+        return 0;
+      };
+      const hits = equip.map((e) => ({ e, r: rank(e) })).filter((x) => x.r > 0)
+        .sort((a, b) => b.r - a.r || (a.e.tag || "").localeCompare(b.e.tag || ""))
+        .map((x) => x.e);
       eqResults.innerHTML = hits.length
-        ? `<div class="card pad0" style="margin:.4rem 0 0">${hits.map((e) => `<div class="navitem" data-eq="${e.id}"><span class="mono">${esc(e.tag)}</span>&nbsp;<span style="color:var(--muted)">${esc(e.description || "")}</span>${e.isolationStatus !== "available" ? badge(e.isolationStatus) : ""}</div>`).join("")}</div>`
+        ? `<div class="help" style="margin:.4rem 0 .2rem">${hits.length} match${hits.length > 1 ? "es" : ""}</div>
+           <div class="card pad0" style="margin:0;max-height:320px;overflow-y:auto">${hits.map((e) => `<div class="navitem" data-eq="${e.id}"><span class="mono">${esc(e.tag)}</span>&nbsp;<span style="color:var(--muted)">${esc(e.description || "")}</span>${e.isolationStatus !== "available" ? badge(e.isolationStatus) : ""}</div>`).join("")}</div>`
         : `<div class="help">No match. ${["issuer", "admin"].includes(State.profile.role) ? '<a href="#" id="quickAdd">Add new equipment</a>' : "Ask an Issuer/Admin to add this equipment."}</div>`;
       $$("[data-eq]").forEach((d) => d.onclick = () => chooseEq(equip.find((e) => e.id === d.dataset.eq)));
       const qa = $("#quickAdd"); if (qa) qa.onclick = (e) => { e.preventDefault(); openAddEquipment(equip, (added) => { equip.push(added); chooseEq(added); }); };
