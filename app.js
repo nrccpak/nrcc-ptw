@@ -1385,14 +1385,14 @@ async function viewEquipment(m) {
   const isAdmin = State.profile.role === "admin";
   const selected = new Set();
   m.innerHTML = `<div class="page-head"><div><div class="kick">Asset register</div><h2>Equipment</h2></div>
-    <div class="actions">${isIssuer ? `<button class="btn btn-ghost" id="bulkArea" disabled>Bulk edit area</button>` : ""}${isAdmin ? `<button class="btn btn-ghost" id="imp">Import CSV</button>` : ""}${isIssuer ? `<button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
+    <div class="actions">${isAdmin ? `<button class="btn btn-ghost" id="bulkArea" disabled>Bulk edit area</button>` : ""}${isAdmin ? `<button class="btn btn-ghost" id="imp">Import CSV</button>` : ""}${isIssuer ? `<button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
     <div class="filters"><input class="search" id="q" placeholder="Search tag or name…">
       <select id="fLine"><option value="">All lines</option>${State.config.lines.map((l) => `<option>${esc(l)}</option>`).join("")}</select>
       <select id="fArea"><option value="">All areas</option>${State.config.areas.map((a) => `<option>${esc(a)}</option>`).join("")}</select></div>
     <div class="card pad0" id="etable">Loading…</div>`;
   let equip = await fetchEquipment();
   const updateBulkBtn = () => {
-    if (!isIssuer) return;
+    if (!isAdmin) return;
     const btn = $("#bulkArea");
     btn.textContent = selected.size ? `Bulk edit area (${selected.size})` : "Bulk edit area";
     btn.disabled = selected.size === 0;
@@ -1403,11 +1403,11 @@ async function viewEquipment(m) {
     // Drop selections that have scrolled out of the current filter's result set
     // so the bulk button's count always matches what's actually selectable.
     for (const id of selected) if (!rows.some((e) => e.id === id)) selected.delete(id);
-    const nCols = isIssuer ? 7 : 5;
-    $("#etable").innerHTML = `<table class="tbl"><thead><tr>${isIssuer ? `<th style="width:2rem"><input type="checkbox" id="selAll"></th>` : ""}<th>Tag</th><th>Description</th><th>Line</th><th>Area</th><th>Status</th>${isIssuer ? "<th></th>" : ""}</tr></thead><tbody>
-      ${rows.map((e) => `<tr>${isIssuer ? `<td><input type="checkbox" data-sel="${e.id}"${selected.has(e.id) ? " checked" : ""}></td>` : ""}<td><span class="mono">${esc(e.tag)}</span></td><td>${esc(e.description || "—")}</td><td>${esc(e.line)}</td><td>${esc(e.area)}</td><td>${badge(e.isolationStatus || "available")}</td>${isIssuer ? `<td style="text-align:right"><button class="btn btn-ghost btn-sm" data-edit="${e.id}">Edit</button>${isAdmin ? ` <button class="btn btn-ghost btn-sm" data-del="${e.id}">Delete</button>` : ""}</td>` : ""}</tr>`).join("")
+    const nCols = 5 + (isAdmin ? 1 : 0) + (isIssuer ? 1 : 0);
+    $("#etable").innerHTML = `<table class="tbl"><thead><tr>${isAdmin ? `<th style="width:2rem"><input type="checkbox" id="selAll"></th>` : ""}<th>Tag</th><th>Description</th><th>Line</th><th>Area</th><th>Status</th>${isIssuer ? "<th></th>" : ""}</tr></thead><tbody>
+      ${rows.map((e) => `<tr>${isAdmin ? `<td><input type="checkbox" data-sel="${e.id}"${selected.has(e.id) ? " checked" : ""}></td>` : ""}<td><span class="mono">${esc(e.tag)}</span></td><td>${esc(e.description || "—")}</td><td>${esc(e.line)}</td><td>${esc(e.area)}</td><td>${badge(e.isolationStatus || "available")}</td>${isIssuer ? `<td style="text-align:right"><button class="btn btn-ghost btn-sm" data-edit="${e.id}">Edit</button>${isAdmin ? ` <button class="btn btn-ghost btn-sm" data-del="${e.id}">Delete</button>` : ""}</td>` : ""}</tr>`).join("")
       || `<tr><td colspan="${nCols}" class="empty">No equipment yet. ${isIssuer ? "Add one or import a CSV." : ""}</td></tr>`}</tbody></table>`;
-    if (isIssuer) {
+    if (isAdmin) {
       $$("[data-sel]").forEach((cb) => cb.onchange = () => {
         if (cb.checked) selected.add(cb.dataset.sel); else selected.delete(cb.dataset.sel);
         const selAll = $("#selAll");
@@ -1422,20 +1422,23 @@ async function viewEquipment(m) {
         updateBulkBtn();
       };
       updateBulkBtn();
-      $$("[data-edit]").forEach((b) => b.onclick = () => {
-        const it = equip.find((e) => e.id === b.dataset.edit);
-        if (it) openEditEquipment(it, equip, (upd) => { Object.assign(it, upd); draw(); });
+      $$("[data-del]").forEach((b) => b.onclick = () => {
+        const it = equip.find((e) => e.id === b.dataset.del);
+        if (it) openDeleteEquipment(it, () => { equip = equip.filter((e) => e.id !== it.id); selected.delete(it.id); draw(); });
       });
     }
-    if (isAdmin) $$("[data-del]").forEach((b) => b.onclick = () => {
-      const it = equip.find((e) => e.id === b.dataset.del);
-      if (it) openDeleteEquipment(it, () => { equip = equip.filter((e) => e.id !== it.id); selected.delete(it.id); draw(); });
+    if (isIssuer) $$("[data-edit]").forEach((b) => b.onclick = () => {
+      const it = equip.find((e) => e.id === b.dataset.edit);
+      if (it) openEditEquipment(it, equip, (upd) => { Object.assign(it, upd); draw(); });
     });
   };
   ["q", "fLine", "fArea"].forEach((id) => $("#" + id).addEventListener("input", draw));
   draw();
   if (isIssuer) {
     $("#add").onclick = () => openAddEquipment(equip, (added) => { equip.push(added); draw(); });
+  }
+  if (isAdmin) {
+    $("#imp").onclick = () => openImport(equip, (newList) => { equip = newList; draw(); });
     $("#bulkArea").onclick = () => {
       const items = equip.filter((e) => selected.has(e.id));
       if (!items.length) return;
@@ -1445,9 +1448,6 @@ async function viewEquipment(m) {
         draw();
       });
     };
-  }
-  if (isAdmin) {
-    $("#imp").onclick = () => openImport(equip, (newList) => { equip = newList; draw(); });
   }
 }
 
@@ -1511,7 +1511,7 @@ function openEditEquipment(item, existing, onSaved) {
 
 // Bulk-edit the Area field across a set of already-selected equipment records.
 // Wired in from the equipment table's checkbox column + "Bulk edit area" button,
-// issuer/admin only. Writes are chunked in groups of 400 (Firestore batch limit
+// admin only. Writes are chunked in groups of 400 (Firestore batch limit
 // is 500), mirroring the pattern used by openImport's full-replace mode.
 function openBulkEditEquipmentArea(items, onDone) {
   const cfg = State.config;
