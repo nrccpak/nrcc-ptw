@@ -16,7 +16,7 @@ import {
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, addDoc,
-  writeBatch, arrayUnion, arrayRemove
+  writeBatch, arrayUnion, arrayRemove, onSnapshot
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig, appBranding } from "./firebase-config.js";
 
@@ -159,8 +159,18 @@ const ICON = {
   out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>',
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>',
-  pdf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>'
+  pdf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>'
 };
+
+// Relative "time ago" for the notifications panel.
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60); if (m < 60) return m + " min ago";
+  const h = Math.floor(m / 60); if (h < 24) return h + " h ago";
+  return Math.floor(h / 24) + " d ago";
+}
 
 function toast(msg, type = "") {
   const t = document.createElement("div");
@@ -258,6 +268,7 @@ onAuthStateChanged(auth, async (user) => {
   State.profile = null;
   State.config = null;
   State.view = "dashboard";
+  Notify.stop();               // tear down any previous session's listeners
   if (!user) return renderLogin();
   // Neutral loading screen while the role is fetched — nothing role-gated
   // is shown until the profile is fully loaded below.
@@ -271,6 +282,7 @@ onAuthStateChanged(auth, async (user) => {
       // Commit the profile and render only after the role is fully loaded.
       State.profile = profile;
       renderApp();
+      Notify.start();          // live in-app assignment alerts
     } else {
       // No profile yet → bootstrap or pending self-signup
       const initSnap = await getDoc(doc(db, "meta", "init"));
@@ -505,6 +517,12 @@ function renderApp() {
       <header class="topbar">
         <h1 id="topTitle">Dashboard</h1>
         <div class="spacer"></div>
+        <div class="bell-wrap">
+          <button class="btn btn-ghost btn-sm bell-btn" id="bell" title="Notifications" aria-label="Notifications">
+            ${ICON.bell}<span class="bell-badge hidden" id="bellBadge"></span>
+          </button>
+          <div class="notif-panel hidden" id="notifPanel"></div>
+        </div>
         <div class="who">
           <div style="text-align:right"><div style="font-weight:700">${esc(p.name)}</div>
             <span class="role-chip">${esc(p.role)}</span></div>
@@ -531,6 +549,7 @@ function renderApp() {
   });
   $("#logout").onclick = () => signOut(auth);
   updateOfflineBar();
+  Notify.mountUI();
   go(State.view || "dashboard");
   refreshPendingBadge();
 }
@@ -557,6 +576,227 @@ function updateOfflineBar() {
       main.prepend(bar); }
   } else { bar?.remove(); }
 }
+
+/* -------------------- In-app assignment alerts --------------------
+   Free, in-app only: two live Firestore listeners (permits + isolations)
+   detect every point in the lifecycle where work is handed to a person,
+   then play ONE short sound + raise a bell badge + toast. No backend, no
+   Cloud Functions, no Firebase plan change. Per-user "seen" signatures
+   (localStorage) stop repeats across reloads; the very first sync on a
+   brand-new device is primed silently so history does not ding.
+   Limitation (by design): fires only while the app is open. */
+const Notify = {
+  subs: [], seen: new Set(), items: [], primed: {}, wasEmpty: true,
+  audioCtx: null, unlocked: false, panelOpen: false,
+
+  _key() { return `ptw_seen_alerts_${State.profile?.id || "anon"}`; },
+  _load() {
+    try { this.seen = new Set(JSON.parse(localStorage.getItem(this._key()) || "[]")); }
+    catch { this.seen = new Set(); }
+    this.wasEmpty = this.seen.size === 0;
+  },
+  _save() {
+    // Cap the stored set so it cannot grow without bound.
+    try { localStorage.setItem(this._key(), JSON.stringify([...this.seen].slice(-800))); } catch {}
+  },
+
+  start() {
+    this.stop();
+    this._load();
+    this.items = []; this.primed = {}; this.panelOpen = false;
+    this._unlockAudio();
+    this._watch("permits", (d) => this.permitEvents(d));
+    this._watch("isolations", (d) => this.isoEvents(d));
+    // Overdue is time-based (no doc change), so re-check on a light timer.
+    this._timer = setInterval(() => this._recheckOverdue(), 5 * 60 * 1000);
+    this.badge();
+  },
+  stop() {
+    this.subs.forEach((u) => { try { u(); } catch {} });
+    this.subs = [];
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+  },
+
+  _watch(coll, extract) {
+    const unsub = onSnapshot(collection(db, coll), (snap) => {
+      const first = !this.primed[coll];
+      const silent = this.wasEmpty && first;   // brand-new device → seed quietly
+      const fired = [];
+      snap.forEach((docSnap) => {
+        const d = { id: docSnap.id, ...docSnap.data() };
+        for (const ev of extract(d)) {
+          if (this.seen.has(ev.sig)) continue;
+          this.seen.add(ev.sig);
+          if (!silent) fired.push(ev);
+        }
+      });
+      this.primed[coll] = true;
+      this._save();
+      if (fired.length) this._fire(fired);
+    }, (err) => console.warn("Notify: " + coll + " listener error", err));
+    this.subs.push(unsub);
+  },
+
+  _recheckOverdue() {
+    // Re-evaluate loaded permits for the overdue event only.
+    fetchAll("permits").then((permits) => {
+      const fired = [];
+      permits.forEach((p) => {
+        for (const ev of this.permitEvents(p)) {
+          if (ev.kind !== "overdue" || this.seen.has(ev.sig)) continue;
+          this.seen.add(ev.sig); fired.push(ev);
+        }
+      });
+      this._save();
+      if (fired.length) this._fire(fired);
+    }).catch(() => {});
+  },
+
+  /* ---- which events apply to THIS user for a given doc ---- */
+  permitEvents(p) {
+    const me = State.profile?.id, role = State.profile?.role;
+    const isIssuer = role === "issuer" || role === "admin";
+    const isIsolator = role === "isolator" || role === "admin";
+    const owner = p.requester?.uid === me;
+    const no = p.permitNo || p.id, tag = p.equipmentTag || "the equipment";
+    const to = { view: "detail", params: { id: p.id } };
+    const out = [];
+    // E1 — submitted → Issuer(s)
+    if (p.status === "submitted" && isIssuer && p.requester?.uid !== me)
+      out.push({ sig: `p:${p.id}:submitted`, text: `New permit ${no} submitted by ${p.requester?.name || "a requester"} — review & approve.`, ...to });
+    // E3 — activated → Requester
+    if ((p.status === "active" || p.status === "extended") && owner && p.approval?.issuerUid !== me)
+      out.push({ sig: `p:${p.id}:active`, text: `Permit ${no} is now ACTIVE — work may start on ${tag}.`, ...to });
+    // E4 — rejected → Requester
+    if (p.status === "rejected" && owner && p.rejection?.by !== me)
+      out.push({ sig: `p:${p.id}:rejected`, text: `Permit ${no} was returned by ${p.rejection?.byName || "the Issuer"}.${p.rejection?.reason ? " Reason: " + p.rejection.reason : ""}`, ...to });
+    // E5 — work complete → Issuer(s) (ready to close) + Isolator(s) if isolated
+    if (p.workCompletion && p.workCompletion.by !== me) {
+      const sig = `p:${p.id}:wc:${p.workCompletion.timestamp || ""}`;
+      if (isIssuer) out.push({ sig, text: `Work complete under ${no} on ${tag} — ready to close.`, ...to });
+      else if (isIsolator && p.isolationRef) out.push({ sig, text: `Work complete under ${no} — de-isolate ${tag}.`, ...to });
+    }
+    // E7 — closed → Requester
+    if (p.status === "closed" && owner && p.closure?.by !== me)
+      out.push({ sig: `p:${p.id}:closed`, text: `Permit ${no} closed — ${tag} returned to service.`, ...to });
+    // E8 — overdue → Issuer(s) + Requester
+    if (isOverdue(p) && (isIssuer || owner)) {
+      const end = permitEnd(p);
+      out.push({ sig: `p:${p.id}:overdue:${end || ""}`, kind: "overdue", text: `Permit ${no} is overdue — extend or close.`, ...to });
+    }
+    return out;
+  },
+
+  isoEvents(i) {
+    const me = State.profile?.id, role = State.profile?.role;
+    const isIsolator = role === "isolator" || role === "admin";
+    const no = i.isoNo || i.id, tag = i.equipmentTag || "the equipment";
+    const to = { view: "isodetail", params: { id: i.id } };
+    const out = [];
+    // E2 — isolation assigned → the named Isolator
+    if (i.status === "assigned" && i.assignedTo?.uid === me && i.assignedBy?.uid !== me)
+      out.push({ sig: `i:${i.id}:assigned:${i.assignedAt || ""}`, text: `Isolation ${no} assigned to you — confirm isolation on ${tag}.`, ...to });
+    // E6 — de-isolation → named Isolator, or any Isolator if unassigned
+    if (i.status === "removalPending") {
+      const named = i.removalAssignedTo?.uid;
+      if (named ? named === me : isIsolator)
+        out.push({ sig: `i:${i.id}:removalPending:${i.removalAssignedAt || ""}`, text: `De-isolation of ${no} assigned to you — remove locks on ${tag}.`, ...to });
+    }
+    return out;
+  },
+
+  /* ---- output: sound + badge + toast + panel ---- */
+  _fire(events) {
+    events.forEach((ev) => this.items.unshift({ text: ev.text, view: ev.view, params: ev.params, ts: Date.now(), read: false }));
+    this.items = this.items.slice(0, 50);
+    this.badge();
+    this.ding();                                   // one sound per batch
+    if (events.length === 1) toast("🔔 " + events[0].text);
+    else toast(`🔔 ${events.length} new alerts — tap the bell to view.`);
+    if (this.panelOpen) this.renderPanel();
+  },
+
+  ding() {
+    // Web Audio two-tone chime — no asset needed. Silent-safe if blocked.
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!this.audioCtx) this.audioCtx = new Ctx();
+      const ctx = this.audioCtx;
+      if (ctx.state === "suspended") ctx.resume();
+      const t0 = ctx.currentTime;
+      [880, 1174.66].forEach((f, i) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = f;
+        const t = t0 + i * 0.13;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.2, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        o.connect(g).connect(ctx.destination);
+        o.start(t); o.stop(t + 0.24);
+      });
+    } catch { /* sound unavailable — badge still updates */ }
+  },
+  _unlockAudio() {
+    // Browsers require a user gesture before audio can play; resume on the
+    // first interaction so the next alert can sound.
+    if (this.unlocked) return;
+    const resume = () => {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx && !this.audioCtx) this.audioCtx = new Ctx();
+        if (this.audioCtx && this.audioCtx.state === "suspended") this.audioCtx.resume();
+      } catch {}
+      this.unlocked = true;
+      ["click", "touchstart", "keydown"].forEach((e) => window.removeEventListener(e, resume));
+    };
+    ["click", "touchstart", "keydown"].forEach((e) => window.addEventListener(e, resume, { passive: true }));
+  },
+
+  /* ---- bell UI ---- */
+  mountUI() {
+    const bell = $("#bell");
+    if (!bell) return;
+    bell.onclick = (e) => { e.stopPropagation(); this.togglePanel(); };
+    document.addEventListener("click", (e) => {
+      if (this.panelOpen && !e.target.closest("#notifPanel") && !e.target.closest("#bell")) this.closePanel();
+    });
+    this.badge();
+  },
+  badge() {
+    const b = $("#bellBadge"); if (!b) return;
+    const n = this.items.filter((i) => !i.read).length;
+    b.textContent = n > 9 ? "9+" : String(n);
+    b.classList.toggle("hidden", n === 0);
+  },
+  togglePanel() { this.panelOpen ? this.closePanel() : this.openPanel(); },
+  openPanel() {
+    this.panelOpen = true;
+    this.items.forEach((i) => i.read = true);   // opening clears the badge
+    this.badge();
+    this.renderPanel();
+    const p = $("#notifPanel"); if (p) p.classList.remove("hidden");
+  },
+  closePanel() {
+    this.panelOpen = false;
+    const p = $("#notifPanel"); if (p) p.classList.add("hidden");
+  },
+  renderPanel() {
+    const panel = $("#notifPanel"); if (!panel) return;
+    if (!this.items.length) { panel.innerHTML = `<div class="notif-empty">No notifications yet.</div>`; return; }
+    panel.innerHTML =
+      `<div class="notif-head"><span>Notifications</span><button type="button" id="notifClear" class="notif-clear">Clear all</button></div>` +
+      this.items.map((it, ix) => `<button type="button" class="notif-item" data-nix="${ix}">
+        <span class="notif-dot"></span>
+        <span class="notif-body"><span class="notif-text">${esc(it.text)}</span><span class="notif-time">${timeAgo(it.ts)}</span></span>
+      </button>`).join("");
+    panel.querySelector("#notifClear").onclick = (e) => { e.stopPropagation(); this.items = []; this.badge(); this.renderPanel(); };
+    panel.querySelectorAll(".notif-item").forEach((b) => b.onclick = () => {
+      const it = this.items[+b.dataset.nix]; if (!it) return;
+      this.closePanel(); go(it.view, it.params);
+    });
+  }
+};
 
 /* data fetch helpers */
 async function fetchAll(coll) {

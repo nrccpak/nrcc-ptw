@@ -267,6 +267,41 @@ table.tbl tr:last-child td{border-bottom:none}
   .filters .search{min-width:100%}
 }
 
+/* ---------- Notifications (in-app assignment alerts) ---------- */
+.bell-wrap{position:relative;display:flex;align-items:center}
+.bell-btn{position:relative;padding:.4rem .5rem}
+.bell-btn svg{width:20px;height:20px;display:block}
+.bell-badge{position:absolute;top:-4px;right:-4px;min-width:17px;height:17px;padding:0 4px;
+  border-radius:20px;background:var(--red);color:#fff;font-size:.66rem;font-weight:800;
+  line-height:17px;text-align:center;box-shadow:0 0 0 2px var(--navy)}
+.bell-badge.hidden{display:none}
+
+.notif-panel{position:absolute;top:calc(100% + 10px);right:0;width:340px;max-width:calc(100vw - 24px);
+  max-height:70vh;overflow-y:auto;background:var(--card);border:1px solid var(--line);
+  border-radius:var(--radius-sm);box-shadow:var(--shadow-lg);z-index:120;
+  -webkit-overflow-scrolling:touch}
+.notif-panel.hidden{display:none}
+.notif-head{display:flex;align-items:center;justify-content:space-between;
+  padding:.7rem .9rem;border-bottom:1px solid var(--line);position:sticky;top:0;
+  background:var(--bg-2);font-weight:800;font-size:.82rem;color:var(--ink);
+  text-transform:uppercase;letter-spacing:.05em}
+.notif-clear{border:none;background:none;color:var(--steel);font-weight:700;
+  font-size:.74rem;cursor:pointer;padding:.2rem .3rem;letter-spacing:0;text-transform:none}
+.notif-clear:hover{text-decoration:underline}
+.notif-empty{padding:1.6rem 1rem;text-align:center;color:var(--muted);font-size:.86rem}
+.notif-item{display:flex;gap:.6rem;align-items:flex-start;width:100%;text-align:left;
+  padding:.7rem .9rem;border:none;border-bottom:1px solid var(--line-2);background:none;
+  cursor:pointer;transition:background .12s}
+.notif-item:last-child{border-bottom:none}
+.notif-item:hover{background:var(--bg-2)}
+.notif-dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--amber);margin-top:.4rem}
+.notif-body{display:flex;flex-direction:column;gap:.2rem;min-width:0}
+.notif-text{font-size:.85rem;color:var(--ink);line-height:1.4}
+.notif-time{font-size:.72rem;color:var(--muted);font-weight:600}
+@media (max-width:640px){
+  .notif-panel{position:fixed;top:56px;right:8px;left:8px;width:auto}
+}
+
 /* ---------- Print (per-permit PDF) ---------- */
 @media print{
   body{background:#fff}
