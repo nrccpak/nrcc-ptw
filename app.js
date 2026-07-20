@@ -670,11 +670,14 @@ const Notify = {
     // E4 — rejected → Requester
     if (p.status === "rejected" && owner && p.rejection?.by !== me)
       out.push({ sig: `p:${p.id}:rejected`, text: `Permit ${no} was returned by ${p.rejection?.byName || "the Issuer"}.${p.rejection?.reason ? " Reason: " + p.rejection.reason : ""}`, ...to });
-    // E5 — work complete → Issuer(s) (ready to close) + Isolator(s) if isolated
+    // E5 — work complete. A NON-isolated permit can be closed by the Issuer
+    // right away. An ISOLATED permit must be de-isolated first (closing is
+    // blocked until then), so here we only prompt the Isolator; the Issuer is
+    // alerted to close later — by E9, when de-isolation is confirmed.
     if (p.workCompletion && p.workCompletion.by !== me) {
       const sig = `p:${p.id}:wc:${p.workCompletion.timestamp || ""}`;
-      if (isIssuer) out.push({ sig, text: `Work complete under ${no} on ${tag} — ready to close.`, ...to });
-      else if (isIsolator && p.isolationRef) out.push({ sig, text: `Work complete under ${no} — de-isolate ${tag}.`, ...to });
+      if (!p.isolationRef && isIssuer) out.push({ sig, text: `Work complete under ${no} on ${tag} — ready to close.`, ...to });
+      else if (p.isolationRef && isIsolator) out.push({ sig: sig + ":deiso", text: `Work complete under ${no} — de-isolation needed on ${tag}.`, ...to });
     }
     // E7 — closed → Requester
     if (p.status === "closed" && owner && p.closure?.by !== me)
@@ -701,6 +704,13 @@ const Notify = {
       const named = i.removalAssignedTo?.uid;
       if (named ? named === me : isIsolator)
         out.push({ sig: `i:${i.id}:removalPending:${i.removalAssignedAt || ""}`, text: `De-isolation of ${no} assigned to you — remove locks on ${tag}.`, ...to });
+    }
+    // E9 — de-isolation confirmed (locks removed) → Issuer(s) can now close the
+    // permit(s). This is the moment closing stops being blocked.
+    const ids = i.attachedPermitIds || [];
+    if (i.status === "removed" && ids.length && (role === "issuer" || role === "admin") && i.removalConfirmedBy?.uid !== me) {
+      const dest = ids.length === 1 ? { view: "detail", params: { id: ids[0] } } : { view: "isodetail", params: { id: i.id } };
+      out.push({ sig: `i:${i.id}:removed:${i.removedAt || ""}`, text: `De-isolation complete on ${tag} (${no}) — permit${ids.length > 1 ? "s" : ""} can now be closed.`, ...dest });
     }
     return out;
   },
