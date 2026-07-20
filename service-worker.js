@@ -8,7 +8,7 @@
    an immediate reload. (CACHE_VERSION is still bumped occasionally to
    purge the cache namespace.)
    ============================================================ */
-const CACHE_VERSION = "ptw-v23";
+const CACHE_VERSION = "ptw-v24";
 // Full URL of the main app code — a change here triggers the update prompt.
 const CORE_URL = new URL("./app.js", self.location).href;
 const APP_SHELL = [
