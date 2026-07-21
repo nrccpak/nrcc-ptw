@@ -143,6 +143,11 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
 .stat .ic{position:absolute;top:1rem;right:1rem;width:34px;height:34px;border-radius:9px;
   display:grid;place-items:center;background:var(--steel-soft)}
 .stat .ic svg{width:18px;height:18px;color:var(--steel)}
+/* Clickable KPI tiles: hint interactivity on hover/focus and lift slightly. */
+.stat-link{cursor:pointer;transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease}
+.stat-link:hover,.stat-link:focus-visible{transform:translateY(-2px);box-shadow:var(--shadow-md,0 6px 18px rgba(15,23,42,.12));border-color:var(--steel);outline:none}
+.stat-link:focus-visible{box-shadow:0 0 0 3px var(--steel-soft)}
+.stat-link:active{transform:translateY(0)}
 
 /* ---------- Badges / chips ---------- */
 .badge-st{display:inline-flex;align-items:center;gap:.35rem;font-size:.72rem;font-weight:800;
@@ -182,6 +187,9 @@ table.tbl tr:last-child td{border-bottom:none}
 .filters{display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center}
 .filters input,.filters select{width:auto;min-width:140px;padding:.5rem .7rem;font-size:.85rem}
 .filters .search{min-width:230px}
+.filters .mine-toggle{display:inline-flex;align-items:center;gap:.4rem;font-size:.85rem;
+  font-weight:600;color:var(--muted);cursor:pointer;white-space:nowrap}
+.filters .mine-toggle input{width:auto;min-width:0;flex:none;margin:0;cursor:pointer}
 
 /* ---------- Modal ---------- */
 .modal-bg{position:fixed;inset:0;background:rgba(10,33,56,.55);backdrop-filter:blur(2px);

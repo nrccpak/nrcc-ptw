@@ -862,12 +862,14 @@ async function viewDashboard(m) {
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
   const overdue = (isIssuer ? permits : mine).filter(isOverdue);
 
-  const stat = (num, lab, ic) => `<div class="stat"><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
+  // Each tile is a shortcut into a pre-filtered list. `nav` = {view, params};
+  // omit it (as the empty banner does) to render a plain, non-clickable tile.
+  const stat = (num, lab, ic, nav) => `<div class="stat${nav ? " stat-link" : ""}"${nav ? ` role="button" tabindex="0" data-nav='${esc(JSON.stringify(nav))}' aria-label="${esc(lab)}: ${num}. View list"` : ""}><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
   let html = `<div class="cols cols-4" style="margin-bottom:1.2rem">
-    ${stat(active.length, "Active permits", ICON.list)}
-    ${stat(isIssuer ? pending.length : mine.filter((p) => p.status === "submitted").length, isIssuer ? "Awaiting your approval" : "My submitted", ICON.newdoc)}
-    ${stat(isolated.length, "Equipment isolated", ICON.lock)}
-    ${stat(mine.length, "My permits", ICON.cube)}</div>`;
+    ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
+    ${stat(isIssuer ? pending.length : mine.filter((p) => p.status === "submitted").length, isIssuer ? "Awaiting your approval" : "My submitted", ICON.newdoc, isIssuer ? { view: "permits", params: { status: "submitted" } } : { view: "permits", params: { status: "submitted", mine: true } })}
+    ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
+    ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
 
   const me = State.profile.id;
@@ -902,6 +904,12 @@ async function viewDashboard(m) {
     </tbody></table></div>`;
   $("#dash").innerHTML = html;
   bindPermitRows();
+  // KPI tiles drill through to their pre-filtered list; keyboard-activatable too.
+  $$(".stat-link[data-nav]").forEach((t) => {
+    const nav = () => { const n = JSON.parse(t.dataset.nav); go(n.view, n.params); };
+    t.onclick = nav;
+    t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nav(); } };
+  });
   const ob = $("#overdueBanner"); if (ob) ob.onclick = () => go("permits", { status: "overdue" });
   $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
 }
@@ -928,9 +936,11 @@ async function viewPermits(m) {
       <input class="search" id="q" placeholder="Search permit no, equipment, work…">
       <select id="fType"><option value="">All types</option></select>
       <select id="fStatus"><option value="">All statuses</option>
+        <option value="activeAll">active / extended</option>
         ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected"].map((s) => `<option>${s}</option>`).join("")}
         <option value="overdue">overdue</option></select>
       <select id="fDept"><option value="">All departments</option></select>
+      <label class="mine-toggle"><input type="checkbox" id="fMine"> My permits</label>
     </div>
     <div class="card pad0" id="ptable">Loading…</div>`;
   $("#np").onclick = () => go("new");
@@ -939,13 +949,15 @@ async function viewPermits(m) {
   $("#fType").innerHTML += State.config.permitTypes.map((t) => `<option value="${t.code}">${esc(t.name)}</option>`).join("");
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
   if (State.params.status) $("#fStatus").value = State.params.status;
+  if (State.params.mine) $("#fMine").checked = true;
   const all = await fetchPermits();
   const draw = () => {
-    const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value;
+    const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value, fm = $("#fMine").checked;
     const rows = all.filter((p) =>
       (!ft || p.type === ft) &&
-      (!fs || (fs === "overdue" ? isOverdue(p) : p.status === fs)) &&
+      (!fs || (fs === "overdue" ? isOverdue(p) : fs === "activeAll" ? ["active", "extended"].includes(p.status) : p.status === fs)) &&
       (!fd || p.requestingDepartment?.department === fd) &&
+      (!fm || p.requester?.uid === State.profile.id) &&
       (!q || [p.permitNo, p.equipmentTag, p.workDescription, p.requester?.name].join(" ").toLowerCase().includes(q)));
     lastRows = rows;
     $("#ptable").innerHTML = `<table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Dept</th><th>Status</th><th>Requester</th><th>Created</th></tr></thead><tbody>
@@ -958,6 +970,7 @@ async function viewPermits(m) {
     bindPermitRows();
   };
   ["q", "fType", "fStatus", "fDept"].forEach((id) => $("#" + id).addEventListener("input", draw));
+  $("#fMine").addEventListener("change", draw);
   draw();
 }
 
@@ -1638,7 +1651,10 @@ async function viewEquipment(m) {
     <div class="actions">${isAdmin ? `<button class="btn btn-ghost" id="bulkArea" disabled>Bulk edit area</button>` : ""}${isAdmin ? `<button class="btn btn-ghost" id="imp">Import CSV</button>` : ""}${isIssuer ? `<button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
     <div class="filters"><input class="search" id="q" placeholder="Search tag or name…">
       <select id="fLine"><option value="">All lines</option>${State.config.lines.map((l) => `<option>${esc(l)}</option>`).join("")}</select>
-      <select id="fArea"><option value="">All areas</option>${State.config.areas.map((a) => `<option>${esc(a)}</option>`).join("")}</select></div>
+      <select id="fArea"><option value="">All areas</option>${State.config.areas.map((a) => `<option>${esc(a)}</option>`).join("")}</select>
+      <select id="fStatus"><option value="">All statuses</option>
+        <option value="isolatedAny">isolated / trial run</option>
+        ${["available", "pending", "isolated", "trialRun"].map((s) => `<option>${s}</option>`).join("")}</select></div>
     <div class="card pad0" id="etable">Loading…</div>`;
   let equip = await fetchEquipment();
   const updateBulkBtn = () => {
@@ -1648,8 +1664,10 @@ async function viewEquipment(m) {
     btn.disabled = selected.size === 0;
   };
   const draw = () => {
-    const q = $("#q").value.toLowerCase(), fl = $("#fLine").value, fa = $("#fArea").value;
-    const rows = equip.filter((e) => (!fl || e.line === fl) && (!fa || e.area === fa) && (!q || (e.tag + " " + e.description).toLowerCase().includes(q)));
+    const q = $("#q").value.toLowerCase(), fl = $("#fLine").value, fa = $("#fArea").value, fs = $("#fStatus").value;
+    const rows = equip.filter((e) => (!fl || e.line === fl) && (!fa || e.area === fa) &&
+      (!fs || (fs === "isolatedAny" ? (e.isolationStatus === "isolated" || e.isolationStatus === "trialRun") : (e.isolationStatus || "available") === fs)) &&
+      (!q || (e.tag + " " + e.description).toLowerCase().includes(q)));
     // Drop selections that have scrolled out of the current filter's result set
     // so the bulk button's count always matches what's actually selectable.
     for (const id of selected) if (!rows.some((e) => e.id === id)) selected.delete(id);
@@ -1682,7 +1700,8 @@ async function viewEquipment(m) {
       if (it) openEditEquipment(it, equip, (upd) => { Object.assign(it, upd); draw(); });
     });
   };
-  ["q", "fLine", "fArea"].forEach((id) => $("#" + id).addEventListener("input", draw));
+  if (State.params.status) $("#fStatus").value = State.params.status;
+  ["q", "fLine", "fArea", "fStatus"].forEach((id) => $("#" + id).addEventListener("input", draw));
   draw();
   if (isIssuer) {
     $("#add").onclick = () => openAddEquipment(equip, (added) => { equip.push(added); draw(); });
