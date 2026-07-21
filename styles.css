@@ -170,6 +170,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
 .st-overdue{background:var(--red-soft);color:#9b2c2c}
 .chip{display:inline-flex;align-items:center;gap:.35rem;background:var(--bg-2);border:1px solid var(--line);
   border-radius:20px;padding:.25rem .65rem;font-size:.78rem;font-weight:600;color:var(--ink-2)}
+.chip-ok{background:var(--green-soft);border-color:#BFE3C9;color:#15784f}
+.chip-prog{background:var(--amber-soft);border-color:#F2D89A;color:#8a5d00}
 .type-pill{display:inline-flex;align-items:center;gap:.4rem;font-weight:700;font-size:.82rem}
 .dot{width:9px;height:9px;border-radius:50%;flex:none}
 
