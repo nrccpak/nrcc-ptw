@@ -1327,10 +1327,29 @@ async function viewPermitDetail(m) {
   // For a shared certificate, de-isolation only opens once every crew has signed
   // off. Work that out so we can show whether it's ready now or waiting on others.
   let deisoReady = false;
-  if (awaitingDeiso && isoDoc) {
+  // Load every permit sharing this isolation certificate. A single lockout often
+  // covers several crews (several permits), and each crew only sees their own
+  // permit. When their work is done but the equipment stays isolated — because
+  // OTHER crews are still working — it can look like a system fault. Showing the
+  // sibling permits here gives the whole picture in one place, and lets us fetch
+  // once for both that list and the shared-cert de-isolation readiness check.
+  let siblings = [];
+  if (p.isolationRef) {
     const allPermits = await fetchPermits();
-    deisoReady = isoDoc.status === "removalPending" || isoReadyForDeiso(isoDoc, allPermits);
+    siblings = allPermits.filter((x) => x.isolationRef === p.isolationRef && x.id !== id);
+    if (awaitingDeiso && isoDoc) deisoReady = isoDoc.status === "removalPending" || isoReadyForDeiso(isoDoc, allPermits);
   }
+  const shared = siblings.length > 0;
+  const siblingsWorking = siblings.filter((x) => ["active", "extended"].includes(x.status) && !x.workCompletion).length;
+  // A compact "is this crew finished?" indicator for the sibling-permit table.
+  const workChip = (x) => {
+    if (x.status === "closed") return `<span class="chip">Closed</span>`;
+    if (["rejected", "expired"].includes(x.status)) return `<span class="chip">—</span>`;
+    if (["active", "extended"].includes(x.status)) return x.workCompletion
+      ? `<span class="chip chip-ok">✔ Work complete</span>`
+      : `<span class="chip chip-prog">● In progress</span>`;
+    return `<span class="chip">Not started</span>`;
+  };
   const kv = (k, v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   let actions = "";
   if (p.status === "submitted" && isIssuer) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
@@ -1362,7 +1381,7 @@ async function viewPermitDetail(m) {
     ${equip && equip.isolationStatus === "trialRun" ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — equipment ${esc(equip.tag)} is ENERGISED.</b></div>` : ""}
     ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
     ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed."}</div>` : ""}
-    ${awaitingDeiso ? `<div class="warn-box"><b>Work complete — awaiting de-isolation.</b> Confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)} · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} <b>Locks are still on.</b> ${deisoReady ? `An Isolator must de-isolate <span class="mono">${esc(p.equipmentTag || "")}</span> on certificate <a href="#" data-isolink3 class="mono">${esc(p.isoNo || p.isolationRef)}</a> before this permit can be closed.` : `Other crews on the shared isolation are still working — de-isolation will open once every crew has confirmed work complete.`}</div>` : ""}
+    ${awaitingDeiso ? `<div class="warn-box"><b>Work complete — awaiting de-isolation.</b> Confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)} · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} <b>Locks are still on.</b> ${deisoReady ? `An Isolator must de-isolate <span class="mono">${esc(p.equipmentTag || "")}</span> on certificate <a href="#" data-isolink3 class="mono">${esc(p.isoNo || p.isolationRef)}</a> before this permit can be closed.` : `<b>This is expected, not a fault.</b> ${esc(p.equipmentTag || "")} is on a <b>shared isolation</b> with ${siblings.length} other permit(s)${siblingsWorking ? ` — <b>${siblingsWorking} still in progress</b>` : ""}. The locks stay ON until every crew confirms work complete. See <b>Other permits on this isolation</b> below.`}</div>` : ""}
     ${["active", "extended"].includes(p.status) && p.workCompletion && deisolated ? `<div class="ok-box"><b>Work complete${p.isolationRef ? " and equipment de-isolated" : ""} — confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)}</b> · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} The Issuer may now close the permit.</div>` : ""}
 
     <div class="cols cols-2">
@@ -1397,6 +1416,17 @@ async function viewPermitDetail(m) {
         ${(p.isolationPoints || []).map((i) => `<tr><td>${esc(i.point)}</td><td>${esc(i.method || "—")}</td><td>${esc(i.lockTag || "—")}</td></tr>`).join("") || `<tr><td colspan="3" class="empty">No points listed</td></tr>`}
       </tbody></table></div>` : ""}
 
+    ${shared ? `<div class="card"><h3>Other permits on this isolation (${siblings.length})</h3>
+      <div class="info-box">These crews share isolation certificate <a href="#" data-isolink4 class="mono">${esc(p.isoNo || p.isolationRef)}</a> on <span class="mono">${esc(p.equipmentTag)}</span>. The equipment stays isolated (locks ON) until <b>every</b> permit listed here is confirmed work-complete — so your own permit alone does not release it.</div>
+      <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Requester</th><th>Status</th><th>Work</th></tr></thead><tbody>
+        ${siblings.map((s) => `<tr class="row" data-sib="${s.id}">
+          <td><span class="mono">${esc(s.permitNo)}</span></td>
+          <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[s.type]}"></span>${esc(s.typeName || s.type)}</span></td>
+          <td>${esc(s.requester?.name || "—")}</td>
+          <td>${badge(s.status)}${isOverdue(s) ? " " + overdueChip() : ""}</td>
+          <td>${workChip(s)}</td></tr>`).join("")}
+      </tbody></table></div>` : ""}
+
     ${p.trialRuns?.length ? `<div class="card"><h3>Trial run log</h3>
       ${p.trialRuns.map((t) => `<div class="kv"><div class="k">${fmt(t.authorisedAt || t.requestedAt)}</div>
         <div class="v">Authorised by ${personHTML(t.authorisedBy, t.authorisedByMeta)} · ${t.reIsolatedAt ? "Re-isolated " + fmt(t.reIsolatedAt) : "OPEN"}</div></div>`).join("")}</div>` : ""}
@@ -1404,7 +1434,8 @@ async function viewPermitDetail(m) {
 
   // bind actions
   $("#pdf") && ($("#pdf").onclick = () => printPermit(p, equip));
-  $$("[data-isolink],[data-isolink2],[data-isolink3]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
+  $$("[data-isolink],[data-isolink2],[data-isolink3],[data-isolink4]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
+  $$("tr.row[data-sib]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.sib }));
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
   $("#submitNow") && ($("#submitNow").onclick = async () => { await fsWrite(updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() })); toast("Submitted", "ok"); go("detail", { id }); });
