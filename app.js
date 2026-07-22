@@ -98,6 +98,32 @@ function permitStage(p, isolations) {
 function stageChip(stage) {
   return stage ? ` <span class="badge-st stage-${stage}">${STAGE_LABEL[stage]}</span>` : "";
 }
+// Cycle-based equipment availability. Joining a still-working shared isolation
+// is allowed (several crews under one lockout), but once the hand-back has
+// begun the equipment is blocked for NEW permits until the Issuer closes every
+// permit — i.e. when any live permit is awaiting closure, or the lockout's
+// de-isolation is pending / all its crews have signed off. Overdue alone does
+// not block (the Issuer extends or closes at their discretion — warned only).
+function equipmentBlock(eqId, permits, isolations, excludeId) {
+  const live = permits.filter((p) => p.equipmentRef === eqId && p.id !== excludeId &&
+    ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
+  const closing = live.filter((p) => permitStage(p, isolations) === "awaitingClosure");
+  if (closing.length) return { kind: "awaitingClosure", permits: closing };
+  for (const iid of new Set(live.map((p) => p.isolationRef).filter(Boolean))) {
+    const iso = isolations.find((i) => i.id === iid);
+    if (iso && (iso.status === "removalPending" || (iso.status === "active" && isoReadyForDeiso(iso, permits))))
+      return { kind: "awaitingDeisolation", permits: live.filter((p) => p.isolationRef === iid) };
+  }
+  return null;
+}
+const BLOCK_TEXT = {
+  awaitingClosure: "an earlier permit is awaiting closure by the Issuer",
+  awaitingDeisolation: "its lockout is in hand-back (de-isolation pending)",
+};
+function blockBox(equipTag, block, isolations) {
+  return `<div class="danger-box"><b>${esc(equipTag)} is not available for a new permit</b> — ${BLOCK_TEXT[block.kind]}. Every permit must be closed before new work can start on this equipment.
+    <div class="attached-list" style="margin-top:.5rem">${block.permits.map((p) => `<div class="a"><span class="mono">${esc(p.permitNo)}</span> ${esc(p.typeName)} · ${esc(p.requester?.name || "")} ${badge(p.status)}${stageChip(permitStage(p, isolations))}</div>`).join("")}</div></div>`;
+}
 // Minimal RFC-4180-ish CSV line parser: handles quoted fields and embedded
 // commas / doubled quotes (naive split() corrupted any description with a comma).
 function parseCsvLine(line) {
@@ -1155,22 +1181,31 @@ async function viewNewPermit(m) {
       $$("[data-eq]").forEach((d) => d.onclick = () => chooseEq(equip.find((e) => e.id === d.dataset.eq)));
       const qa = $("#quickAdd"); if (qa) qa.onclick = (e) => { e.preventDefault(); openAddEquipment(equip, (added) => { equip.push(added); chooseEq(added); }); };
     });
-    function chooseEq(e) {
+    async function chooseEq(e) {
+      // Cycle-based availability gate: equipment whose current work cycle is in
+      // hand-back (or with earlier permits left unclosed) cannot be selected.
+      // The approval gate re-checks authoritatively — this is early feedback.
+      const [permits, isos] = [await fetchPermits(), await fetchIsolations().catch(() => [])];
+      const block = equipmentBlock(e.id, permits, isos, editing?.id);
+      if (block) {
+        $("#eqId").value = ""; $("#eqChosen").innerHTML = ""; eqSearch.value = ""; eqResults.innerHTML = "";
+        $("#simops").innerHTML = blockBox(e.tag, block, isos);
+        return;
+      }
       $("#eqId").value = e.id; eqSearch.value = ""; eqResults.innerHTML = "";
       $("#eqChosen").innerHTML = `<div class="attached-list" style="margin-top:.5rem"><div class="a">
         ${ICON.cube}<b class="mono">${esc(e.tag)}</b> ${esc(e.description || "")} · ${esc(e.line)} / ${esc(e.area)}
         ${e.isolationStatus !== "available" ? badge(e.isolationStatus) : ""}
         <button class="btn btn-ghost btn-sm" id="clearEq" style="margin-left:auto">Change</button></div></div>`;
       $("#clearEq").onclick = () => { $("#eqId").value = ""; $("#eqChosen").innerHTML = ""; $("#simops").innerHTML = ""; };
-      showSimops(e);
+      showSimops(e, permits, isos);
     }
-    async function showSimops(e) {
-      const permits = await fetchPermits();
-      const activeOnEq = permits.filter((p) => p.equipmentRef === e.id && ["submitted", "active", "extended"].includes(p.status));
+    function showSimops(e, permits, isos) {
+      const activeOnEq = permits.filter((p) => p.equipmentRef === e.id && p.id !== editing?.id && ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
       if (activeOnEq.length) {
-        $("#simops").innerHTML = `<div class="warn-box"><b>${activeOnEq.length} active permit(s) already on ${esc(e.tag)}.</b>
+        $("#simops").innerHTML = `<div class="warn-box"><b>${activeOnEq.length} live permit(s) already on ${esc(e.tag)}.</b>
           The Issuer will review concurrent work. ${e.isolationStatus === "isolated" ? "This equipment is already isolated; an isolation permit will attach to the existing isolation." : ""}
-          <div class="attached-list" style="margin-top:.5rem">${activeOnEq.map((p) => `<div class="a"><span class="mono">${esc(p.permitNo)}</span> ${esc(p.typeName)} · ${esc(p.requester?.name)} ${badge(p.status)}</div>`).join("")}</div></div>`;
+          <div class="attached-list" style="margin-top:.5rem">${activeOnEq.map((p) => `<div class="a"><span class="mono">${esc(p.permitNo)}</span> ${esc(p.typeName)} · ${esc(p.requester?.name)} ${badge(p.status)}${stageChip(permitStage(p, isos))}${isOverdue(p) ? " " + overdueChip() : ""}</div>`).join("")}</div></div>`;
       } else $("#simops").innerHTML = "";
     }
     // isolation rows
@@ -1254,6 +1289,12 @@ async function viewNewPermit(m) {
     if (status === "submitted" && type.requiresGasTest &&
         (!gasTest || !String(gasTest.o2).trim() || !String(gasTest.lel).trim() || !gasTest.by))
       return toast("Enter the gas-test readings (O₂, LEL) and who tested before submitting.", "err");
+    // Cycle-based availability: equipment mid hand-back (or with unclosed
+    // earlier permits) cannot receive a new submission. Re-checked at approval.
+    if (status === "submitted") {
+      const block = equipmentBlock(eqId, await fetchPermits(), await fetchIsolations().catch(() => []), editing?.id);
+      if (block) return toast(`${e.tag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
+    }
     // Gas-reading sanity check (advisory, like the hazard checklist): flag
     // readings outside accepted entry/hot-work limits so an unsafe atmosphere
     // is never submitted by accident. The requester can still consciously
@@ -1465,7 +1506,11 @@ async function viewPermitDetail(m) {
   $$("tr.row[data-sib]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.sib }));
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
-  $("#submitNow") && ($("#submitNow").onclick = async () => { await fsWrite(updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() })); toast("Submitted", "ok"); go("detail", { id }); });
+  $("#submitNow") && ($("#submitNow").onclick = async () => {
+    const block = equipmentBlock(p.equipmentRef, await fetchPermits(), await fetchIsolations().catch(() => []), p.id);
+    if (block) return toast(`${p.equipmentTag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
+    await fsWrite(updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() })); toast("Submitted", "ok"); go("detail", { id });
+  });
   $("#reject") && ($("#reject").onclick = () => {
     modal({ title: "Reject permit", body: `<label class="field"><span>Reason</span><textarea id="rr" placeholder="Why is this being rejected?"></textarea></label>`,
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Reject</button>` });
@@ -1514,16 +1559,32 @@ async function approvePermit(p, equip) {
   const type = State.config.permitTypes.find((t) => t.code === p.type);
   const approval = () => ({ issuerUid: State.profile.id, issuerName: State.profile.name, ...myMeta(), timestamp: nowISO() });
 
+  // AVAILABILITY GATE (authoritative — the picker/submission checks are only
+  // early feedback): equipment whose work cycle is in hand-back, or carrying
+  // permits awaiting closure, cannot receive new work until all are closed.
+  const allPermits = await fetchPermits();
+  const allIsos = await fetchIsolations().catch(() => []);
+  const block = equipmentBlock(p.equipmentRef, allPermits, allIsos, p.id);
+  if (block) {
+    return confirmBoxHTML("Cannot approve — equipment not available",
+      blockBox(p.equipmentTag, block, allIsos) + `<p>Close the earlier permit(s) before approving new work on this equipment.</p>`,
+      "OK", async () => closeModal());
+  }
+  // Concurrent-work cross-check, shown to the Issuer in every approval dialog
+  // (previously only non-isolation permits got it): each live permit with its
+  // hand-back stage, overdue flagged. Warning only — the Issuer decides.
+  const others = allPermits.filter((x) => x.id !== p.id && x.equipmentRef === p.equipmentRef && ["submitted", "awaitingIsolation", "active", "extended"].includes(x.status));
+  const concurrentWarn = others.length ? `<div class="warn-box"><b>${others.length} other live permit(s)</b> already on ${esc(p.equipmentTag)}. Review concurrent work.
+    <div class="attached-list" style="margin-top:.5rem">${others.map((x) => `<div class="a"><span class="mono">${esc(x.permitNo)}</span> ${esc(x.typeName)} · ${esc(x.requester?.name || "")} ${badge(x.status)}${stageChip(permitStage(x, allIsos))}${isOverdue(x) ? " " + overdueChip() : ""}</div>`).join("")}</div></div>` : "";
+
   // --- non-isolation permits: approve straight to Active ---
   if (!type.requiresIsolation) {
     // Safety cross-check: warn the Issuer if the equipment is currently isolated
     // / energised for a trial, or already carries other live permits.
-    let warn = "";
+    let warn = concurrentWarn;
     const eqStatus = equip?.isolationStatus;
     if (eqStatus === "isolated" || eqStatus === "pending") warn += `<div class="warn-box">${esc(equip.tag)} is currently under an <b>isolation (LOTO)</b> for other work. Confirm this work is compatible before activating.</div>`;
     if (eqStatus === "trialRun") warn += `<div class="danger-box"><b>${esc(equip.tag)} is ENERGISED for a trial run.</b> Do not activate work that needs it de-energised.</div>`;
-    const others = (await fetchPermits()).filter((x) => x.id !== p.id && x.equipmentRef === p.equipmentRef && ["active", "extended"].includes(x.status));
-    if (others.length) warn += `<div class="warn-box"><b>${others.length} other active permit(s)</b> already on ${esc(p.equipmentTag)}. Review concurrent work.</div>`;
     confirmBoxHTML("Approve permit", `${warn}<p>Approve <b>${esc(p.permitNo)}</b> and activate the work?</p>`, "Approve & activate", async () => {
       await fsWrite(updateDoc(doc(db, "permits", p.id), { status: "active", approval: approval(), updatedAt: nowISO() }));
       closeModal(); toast("Permit approved & activated", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
@@ -1547,10 +1608,26 @@ async function approvePermit(p, equip) {
       "OK", async () => closeModal());
   }
 
+  // SAFETY GATE: the certificate is mid de-isolation — locks are coming OFF.
+  // Attaching new work now, or spawning a second certificate that would
+  // overwrite the equipment's pointer to this one, could put a crew on live
+  // equipment. (The availability gate above catches this too, but only while
+  // permits still reference the certificate — this covers it via the equipment.)
+  if (iso && iso.status === "removalPending") {
+    return confirmBoxHTML("Cannot approve — de-isolation in progress",
+      `<div class="danger-box"><b>${esc(equip.tag)} is being de-isolated</b> under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. Wait until de-isolation is complete and the earlier permits are closed — a fresh certificate will then be created on approval.</div>`,
+      "OK", async () => closeModal());
+  }
+
   if (iso && iso.status === "active") {
-    // shared isolation already confirmed → attach, permit goes Active
+    // shared isolation already confirmed → attach, permit goes Active. If some
+    // crews on the lockout have already signed off, tell the Issuer plainly
+    // that approving keeps the isolation in place for the new work.
+    const signedOff = allPermits.filter((x) => x.isolationRef === iso.id && ["active", "extended"].includes(x.status) && x.workCompletion).length;
     confirmBoxHTML("Approve permit",
-      `<div class="info-box">${esc(equip.tag)} is already isolated under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. This permit will <b>attach to the shared isolation</b> and become Active immediately.</div>
+      `${concurrentWarn}
+       ${signedOff ? `<div class="warn-box"><b>${signedOff} crew(s) on this lockout have already signed off work-complete.</b> Approving attaches new work to the certificate and keeps the isolation in place — de-isolation will now also wait for this permit.</div>` : ""}
+       <div class="info-box">${esc(equip.tag)} is already isolated under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. This permit will <b>attach to the shared isolation</b> and become Active immediately.</div>
        <p>Approve <b>${esc(p.permitNo)}</b>?</p>`, "Approve & attach", async () => {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
@@ -1564,7 +1641,8 @@ async function approvePermit(p, equip) {
   if (iso && iso.status === "assigned") {
     // isolation assigned but not yet confirmed → attach, permit waits
     confirmBoxHTML("Approve permit",
-      `<div class="warn-box">Isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b> for ${esc(equip.tag)} is assigned to <b>${esc(iso.assignedTo?.name || "")}</b> and awaiting confirmation. This permit will attach to it and activate automatically once the isolation is confirmed.</div>
+      `${concurrentWarn}
+       <div class="warn-box">Isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b> for ${esc(equip.tag)} is assigned to <b>${esc(iso.assignedTo?.name || "")}</b> and awaiting confirmation. This permit will attach to it and activate automatically once the isolation is confirmed.</div>
        <p>Approve <b>${esc(p.permitNo)}</b>?</p>`, "Approve & attach", async () => {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
@@ -1579,6 +1657,7 @@ async function approvePermit(p, equip) {
   const users = await isolatorUsers();
   if (!users.length) return toast("No active Isolator users found. Ask an Admin to assign the Isolator role to a user first.", "err");
   modal({ title: "Approve & create isolation certificate", wide: true, body: `
+    ${concurrentWarn}
     <div class="info-box">A new <b>isolation certificate</b> with its own reference number will be created for <b>${esc(equip?.tag || "")}</b>. The permit stays <b>Awaiting Isolation</b> until the assigned person confirms in the app that the isolation is physically applied.</div>
     <div class="section-title">Isolation points (from the permit)</div>
     ${(p.isolationPoints || []).map((i) => `<div class="checkline">• ${esc(i.point)}${i.method ? " — " + esc(i.method) : ""}${i.lockTag ? " · " + esc(i.lockTag) : ""}</div>`).join("") || "<div class='help'>No points listed — they can be completed at confirmation.</div>"}
@@ -2218,7 +2297,9 @@ async function viewIsolationDetail(m) {
     "Confirm de-isolation", async () => {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
-      if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      // Only reset the equipment if THIS certificate is still its current one —
+      // never mark it Available out from under a newer certificate.
+      if (equip && equip.activeIsolationId === id) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
       await fsWrite(batch.commit());
       closeModal(); toast("De-isolation confirmed — equipment available", "ok"); go("isodetail", { id });
     });
@@ -2228,7 +2309,7 @@ async function viewIsolationDetail(m) {
     "Release isolation", async () => {
       const batch = writeBatch(db);
       batch.update(doc(db, "isolations", id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
-      if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      if (equip && equip.activeIsolationId === id) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
       await fsWrite(batch.commit());
       closeModal(); toast("Isolation released — equipment available", "ok"); go("isodetail", { id });
     }, true);
