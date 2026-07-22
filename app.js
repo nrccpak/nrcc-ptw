@@ -83,6 +83,21 @@ function isOverdue(p) {
   const d = new Date(end); return !isNaN(d) && d.getTime() < Date.now();
 }
 function overdueChip() { return `<span class="badge-st st-overdue" title="Planned end has passed">Overdue</span>`; }
+// A live permit's stored status stays "active"/"extended" from approval until
+// the Issuer closes it, which hides how far the hand-back has progressed.
+// Like isOverdue, the stage is derived in the UI (never stored) from the
+// workCompletion sign-off plus the isolation certificate's status.
+const STAGE_LABEL = { inProgress: "Work in progress", awaitingDeisolation: "Awaiting de-isolation", awaitingClosure: "Awaiting closure" };
+function permitStage(p, isolations) {
+  if (!p || !["active", "extended"].includes(p.status)) return null;
+  if (!p.workCompletion) return "inProgress";
+  const iso = p.isolationRef ? (isolations || []).find((i) => i.id === p.isolationRef) : null;
+  const deisolated = !p.isolationRef || (iso && iso.status === "removed");
+  return deisolated ? "awaitingClosure" : "awaitingDeisolation";
+}
+function stageChip(stage) {
+  return stage ? ` <span class="badge-st stage-${stage}">${STAGE_LABEL[stage]}</span>` : "";
+}
 // Minimal RFC-4180-ish CSV line parser: handles quoted fields and embedded
 // commas / doubled quotes (naive split() corrupted any description with a comma).
 function parseCsvLine(line) {
@@ -900,7 +915,7 @@ async function viewDashboard(m) {
   }
   html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My recent permits"}</h3></div>
     <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th></tr></thead><tbody>
-    ${(isIssuer ? active : mine).slice(0, 8).map((p) => permitRow(p, true)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+    ${(isIssuer ? active : mine).slice(0, 8).map((p) => permitRow(p, true, isoAll)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
     </tbody></table></div>`;
   $("#dash").innerHTML = html;
   bindPermitRows();
@@ -914,12 +929,12 @@ async function viewDashboard(m) {
   $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
 }
 
-function permitRow(p, showStatus = false) {
+function permitRow(p, showStatus = false, isolations = []) {
   return `<tr class="row" data-pid="${p.id}">
     <td><span class="mono">${esc(p.permitNo)}</span></td>
     <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName || p.type)}</span></td>
     <td>${esc(p.equipmentTag || "—")}</td>
-    ${showStatus ? `<td>${badge(p.status)}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
+    ${showStatus ? `<td>${badge(p.status)}${stageChip(permitStage(p, isolations))}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
     <td>${esc(p.requester?.name || "—")}</td>
     ${!showStatus ? `<td></td>` : ""}
   </tr>`;
@@ -928,7 +943,7 @@ function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = ()
 
 /* -------------------- 5b. Permit Register -------------------- */
 async function viewPermits(m) {
-  let lastRows = [];
+  let lastRows = [], isos = [];
   m.innerHTML = `<div class="page-head"><div><div class="kick">Records</div><h2>Permit Register</h2></div>
     <div class="actions"><button class="btn btn-ghost" id="expCsv">Export CSV</button><button class="btn btn-accent" id="np">+ New Permit</button></div></div>
     ${tabsHtml("p")}
@@ -937,6 +952,9 @@ async function viewPermits(m) {
       <select id="fType"><option value="">All types</option></select>
       <select id="fStatus"><option value="">All statuses</option>
         <option value="activeAll">active / extended</option>
+        <option value="stage:inProgress">work in progress</option>
+        <option value="stage:awaitingDeisolation">awaiting de-isolation</option>
+        <option value="stage:awaitingClosure">awaiting closure</option>
         ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected"].map((s) => `<option>${s}</option>`).join("")}
         <option value="overdue">overdue</option></select>
       <select id="fDept"><option value="">All departments</option></select>
@@ -944,18 +962,23 @@ async function viewPermits(m) {
     </div>
     <div class="card pad0" id="ptable">Loading…</div>`;
   $("#np").onclick = () => go("new");
-  $("#expCsv").onclick = () => exportPermitsCsv(lastRows);
+  $("#expCsv").onclick = () => exportPermitsCsv(lastRows, isos);
   bindTabs();
   $("#fType").innerHTML += State.config.permitTypes.map((t) => `<option value="${t.code}">${esc(t.name)}</option>`).join("");
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
   if (State.params.status) $("#fStatus").value = State.params.status;
   if (State.params.mine) $("#fMine").checked = true;
   const all = await fetchPermits();
+  // Certificates are needed to derive each live permit's hand-back stage
+  // (work in progress → awaiting de-isolation → awaiting closure).
+  isos = await fetchIsolations().catch(() => []);
   const draw = () => {
     const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value, fm = $("#fMine").checked;
     const rows = all.filter((p) =>
       (!ft || p.type === ft) &&
-      (!fs || (fs === "overdue" ? isOverdue(p) : fs === "activeAll" ? ["active", "extended"].includes(p.status) : p.status === fs)) &&
+      (!fs || (fs === "overdue" ? isOverdue(p)
+        : fs.startsWith("stage:") ? permitStage(p, isos) === fs.slice(6)
+        : fs === "activeAll" ? ["active", "extended"].includes(p.status) : p.status === fs)) &&
       (!fd || p.requestingDepartment?.department === fd) &&
       (!fm || p.requester?.uid === State.profile.id) &&
       (!q || [p.permitNo, p.equipmentTag, p.workDescription, p.requester?.name].join(" ").toLowerCase().includes(q)));
@@ -965,7 +988,7 @@ async function viewPermits(m) {
         <td><span class="mono">${esc(p.permitNo)}</span></td>
         <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName)}</span></td>
         <td>${esc(p.equipmentTag)}</td><td>${esc(p.requestingDepartment?.department || "—")}</td>
-        <td>${badge(p.status)}${isOverdue(p) ? " " + overdueChip() : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
+        <td>${badge(p.status)}${stageChip(permitStage(p, isos))}${isOverdue(p) ? " " + overdueChip() : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
       || `<tr><td colspan="7" class="empty">No permits match.</td></tr>`}</tbody></table>`;
     bindPermitRows();
   };
@@ -975,12 +998,16 @@ async function viewPermits(m) {
 }
 
 // Download the currently-filtered permit register as a CSV file (client-side).
-function exportPermitsCsv(rows) {
+function exportPermitsCsv(rows, isolations = []) {
   if (!rows || !rows.length) return toast("Nothing to export for the current filter", "err");
   const cols = [
     ["Permit No", (p) => p.permitNo],
     ["Type", (p) => p.typeName || p.type],
-    ["Status", (p) => isOverdue(p) ? p.status + " (overdue)" : p.status],
+    ["Status", (p) => {
+      const stage = permitStage(p, isolations);
+      let s = p.status + (stage ? ` (${STAGE_LABEL[stage].toLowerCase()})` : "");
+      return isOverdue(p) ? s + " (overdue)" : s;
+    }],
     ["Equipment", (p) => p.equipmentTag],
     ["Line", (p) => p.line], ["Area", (p) => p.area],
     ["Department", (p) => p.requestingDepartment?.department || ""],
