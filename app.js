@@ -183,12 +183,13 @@ function optionList(items, selected) {
 const TYPE_CLASS = { general: "permit-type-general", hot: "permit-type-hot", loto: "permit-type-loto", confined: "permit-type-confined" };
 const TYPE_DOT = { general: "var(--steel)", hot: "var(--red)", loto: "var(--amber)", confined: "var(--green)" };
 
+const STATUS_LABEL = { draft: "Draft", submitted: "Submitted", awaitingIsolation: "Awaiting Isolation",
+  active: "Active", extended: "Extended", closed: "Closed", rejected: "Rejected", expired: "Expired",
+  isolated: "Isolated", pending: "Isolation Pending", trialRun: "Trial Run", available: "Available",
+  assigned: "Assigned", removalPending: "De-isolation Pending", removed: "Removed" };
+
 function badge(status) {
-  const map = { draft: "Draft", submitted: "Submitted", awaitingIsolation: "Awaiting Isolation",
-    active: "Active", extended: "Extended", closed: "Closed", rejected: "Rejected", expired: "Expired",
-    isolated: "Isolated", pending: "Isolation Pending", trialRun: "Trial Run", available: "Available",
-    assigned: "Assigned", removalPending: "De-isolation Pending", removed: "Removed" };
-  return `<span class="badge-st st-${status}">${esc(map[status] || status)}</span>`;
+  return `<span class="badge-st st-${status}">${esc(STATUS_LABEL[status] || status)}</span>`;
 }
 
 const ICON = {
@@ -1044,16 +1045,22 @@ function exportPermitsCsv(rows, isolations = []) {
     ["Isolation cert", (p) => p.isoNo || ""],
     ["Created", (p) => p.createdAt || ""]
   ];
+  downloadCsv(cols, rows, `permits-${nowISO().slice(0, 10)}.csv`);
+  toast(`Exported ${rows.length} permit(s)`, "ok");
+}
+
+// Build a CSV from [header, valueFn] column pairs and save it client-side. The
+// leading BOM keeps Excel from mangling non-ASCII tags/descriptions.
+function downloadCsv(cols, rows, filename) {
   const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const csv = [cols.map((c) => cell(c[0])).join(",")]
-    .concat(rows.map((p) => cols.map((c) => cell(c[1](p))).join(",")))
+    .concat(rows.map((r) => cols.map((c) => cell(c[1](r))).join(",")))
     .join("\r\n");
   const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = `permits-${nowISO().slice(0, 10)}.csv`;
+  a.href = url; a.download = filename;
   a.click(); URL.revokeObjectURL(url);
-  toast(`Exported ${rows.length} permit(s)`, "ok");
 }
 
 /* -------------------- 5c. New Permit -------------------- */
@@ -1785,7 +1792,7 @@ async function viewEquipment(m) {
   const isAdmin = State.profile.role === "admin";
   const selected = new Set();
   m.innerHTML = `<div class="page-head"><div><div class="kick">Asset register</div><h2>Equipment</h2></div>
-    <div class="actions">${isAdmin ? `<button class="btn btn-ghost" id="bulkArea" disabled>Bulk edit area</button>` : ""}${isAdmin ? `<button class="btn btn-ghost" id="imp">Import CSV</button>` : ""}${isIssuer ? `<button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
+    <div class="actions">${isAdmin ? `<button class="btn btn-ghost" id="bulkArea" disabled>Bulk edit area</button>` : ""}${isAdmin ? `<button class="btn btn-ghost" id="imp">Import CSV</button>` : ""}${isAdmin ? `<button class="btn btn-ghost" id="expCsv">Export CSV</button>` : ""}${isIssuer ? `<button class="btn btn-accent" id="add">+ Add equipment</button>` : ""}</div></div>
     <div class="filters"><input class="search" id="q" placeholder="Search tag or name…">
       <select id="fLine"><option value="">All lines</option>${State.config.lines.map((l) => `<option>${esc(l)}</option>`).join("")}</select>
       <select id="fArea"><option value="">All areas</option>${State.config.areas.map((a) => `<option>${esc(a)}</option>`).join("")}</select>
@@ -1794,6 +1801,7 @@ async function viewEquipment(m) {
         ${["available", "pending", "isolated", "trialRun"].map((s) => `<option>${s}</option>`).join("")}</select></div>
     <div class="card pad0" id="etable">Loading…</div>`;
   let equip = await fetchEquipment();
+  let lastRows = [];
   const updateBulkBtn = () => {
     if (!isAdmin) return;
     const btn = $("#bulkArea");
@@ -1805,6 +1813,7 @@ async function viewEquipment(m) {
     const rows = equip.filter((e) => (!fl || e.line === fl) && (!fa || e.area === fa) &&
       (!fs || (fs === "isolatedAny" ? (e.isolationStatus === "isolated" || e.isolationStatus === "trialRun") : (e.isolationStatus || "available") === fs)) &&
       (!q || (e.tag + " " + e.description).toLowerCase().includes(q)));
+    lastRows = rows;
     // Drop selections that have scrolled out of the current filter's result set
     // so the bulk button's count always matches what's actually selectable.
     for (const id of selected) if (!rows.some((e) => e.id === id)) selected.delete(id);
@@ -1845,6 +1854,7 @@ async function viewEquipment(m) {
   }
   if (isAdmin) {
     $("#imp").onclick = () => openImport(equip, (newList) => { equip = newList; draw(); });
+    $("#expCsv").onclick = () => exportEquipmentCsv(lastRows);
     $("#bulkArea").onclick = () => {
       const items = equip.filter((e) => selected.has(e.id));
       if (!items.length) return;
@@ -1855,6 +1865,21 @@ async function viewEquipment(m) {
       });
     };
   }
+}
+
+// Download the currently-filtered equipment register. The first four columns
+// match the Import CSV header, so an export can be re-imported as-is.
+function exportEquipmentCsv(rows) {
+  if (!rows || !rows.length) return toast("Nothing to export for the current filter", "err");
+  const cols = [
+    ["tag", (e) => e.tag],
+    ["description", (e) => e.description || ""],
+    ["line", (e) => e.line || ""],
+    ["area", (e) => e.area || ""],
+    ["status", (e) => STATUS_LABEL[e.isolationStatus || "available"] || e.isolationStatus]
+  ];
+  downloadCsv(cols, rows, `equipment-${nowISO().slice(0, 10)}.csv`);
+  toast(`Exported ${rows.length} equipment item(s)`, "ok");
 }
 
 function openAddEquipment(existing, onAdded) {
