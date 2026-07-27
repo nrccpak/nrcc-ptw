@@ -1744,6 +1744,38 @@ async function viewPermitDetail(m) {
 }
 
 /* -------------------- 6. Permit + isolation logic -------------------- */
+
+// Re-read a permit inside an approval transaction and refuse unless it is still
+// awaiting a decision. Two Issuers can open the same permit; without this the
+// second one silently overwrites the first one's approval (and its audit stamp).
+async function txPermitAwaitingDecision(tx, permitId) {
+  const ref = doc(db, "permits", permitId);
+  const snap = await tx.get(ref);
+  if (!snap.exists()) gate("This permit no longer exists.");
+  const cur = snap.data();
+  if (cur.status !== "submitted")
+    gate(`This permit is now ${STATUS_LABEL[cur.status] || cur.status} — it was not approved again. Reopen it to see the current state.`);
+  return { ref, cur };
+}
+// Re-read the equipment inside an approval transaction and refuse unless its
+// certificate pointer is still what the dialog was drawn from. This is what
+// makes a stale page safe: the whole certificate branch below is chosen from
+// `equip.activeIsolationId`, which may be minutes old by the time Approve is
+// clicked. `expected` is the certificate id the branch assumed, or null for
+// "there was no certificate".
+async function txEquipmentPointer(tx, equipmentId, expected) {
+  const ref = doc(db, "equipment", equipmentId);
+  const snap = await tx.get(ref);
+  if (!snap.exists()) gate("This equipment record no longer exists.");
+  const actual = snap.data().activeIsolationId || null;
+  if (actual !== (expected || null)) {
+    gate(actual
+      ? "This equipment is now under a different isolation certificate than when this page was loaded. Reopen the permit and review before approving."
+      : "This equipment's isolation was removed while this page was open. Reopen the permit and review before approving.");
+  }
+  return { ref, data: snap.data() };
+}
+
 async function approvePermit(p, equip) {
   const type = State.config.permitTypes.find((t) => t.code === p.type);
   const approval = () => ({ issuerUid: State.profile.id, issuerName: State.profile.name, ...myMeta(), timestamp: nowISO() });
@@ -1774,7 +1806,13 @@ async function approvePermit(p, equip) {
     if (eqStatus === "isolated" || eqStatus === "pending") warn += `<div class="warn-box">${esc(equip.tag)} is currently under an <b>isolation (LOTO)</b> for other work. Confirm this work is compatible before activating.</div>`;
     if (eqStatus === "trialRun") warn += `<div class="danger-box"><b>${esc(equip.tag)} is ENERGISED for a trial run.</b> Do not activate work that needs it de-energised.</div>`;
     confirmBoxHTML("Approve permit", `${warn}<p>Approve <b>${esc(p.permitNo)}</b> and activate the work?</p>`, "Approve & activate", async () => {
-      await fsWrite(updateDoc(doc(db, "permits", p.id), { status: "active", approval: approval(), updatedAt: nowISO() }));
+      // No pointer check here on purpose: a non-isolation permit may be approved
+      // onto isolated or trial-run equipment — that is a warning for the Issuer
+      // to weigh (above), not a block. Only the double-approval race is closed.
+      await lifecycleTx("approval", async (tx) => {
+        const { ref } = await txPermitAwaitingDecision(tx, p.id);
+        tx.update(ref, { status: "active", approval: approval(), updatedAt: nowISO() });
+      });
       closeModal(); toast("Permit approved & activated", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1817,10 +1855,19 @@ async function approvePermit(p, equip) {
        ${signedOff ? `<div class="warn-box"><b>${signedOff} crew(s) on this lockout have already signed off work-complete.</b> Approving attaches new work to the certificate and keeps the isolation in place — de-isolation will now also wait for this permit.</div>` : ""}
        <div class="info-box">${esc(equip.tag)} is already isolated under certificate <b class="mono">${esc(iso.isoNo || "")}</b>. This permit will <b>attach to the shared isolation</b> and become Active immediately.</div>
        <p>Approve <b>${esc(p.permitNo)}</b>?</p>`, "Approve & attach", async () => {
-      const batch = writeBatch(db);
-      batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
-      batch.update(doc(db, "permits", p.id), { status: "active", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
-      await fsWrite(batch.commit());
+      await lifecycleTx("approval", async (tx) => {
+        const { ref: pRef } = await txPermitAwaitingDecision(tx, p.id);
+        await txEquipmentPointer(tx, equip.id, iso.id);
+        const isoRef = doc(db, "isolations", iso.id);
+        const iSnap = await tx.get(isoRef);
+        if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+        // Attaching a crew to a lockout is only safe while the locks are on and
+        // staying on. If it has since gone to trial run or de-isolation, refuse.
+        if (iSnap.data().status !== "active")
+          gate(`This certificate is now ${STATUS_LABEL[iSnap.data().status] || iSnap.data().status} — the permit was not attached. Reopen it and review.`);
+        tx.update(isoRef, { attachedPermitIds: arrayUnion(p.id) });
+        tx.update(pRef, { status: "active", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
+      });
       closeModal(); toast("Permit approved & attached to isolation", "ok"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
@@ -1832,16 +1879,31 @@ async function approvePermit(p, equip) {
       `${concurrentWarn}
        <div class="warn-box">Isolation certificate <b class="mono">${esc(iso.isoNo || "")}</b> for ${esc(equip.tag)} is assigned to <b>${esc(iso.assignedTo?.name || "")}</b> and awaiting confirmation. This permit will attach to it and activate automatically once the isolation is confirmed.</div>
        <p>Approve <b>${esc(p.permitNo)}</b>?</p>`, "Approve & attach", async () => {
-      const batch = writeBatch(db);
-      batch.update(doc(db, "isolations", iso.id), { attachedPermitIds: arrayUnion(p.id) });
-      batch.update(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
-      await fsWrite(batch.commit());
+      await lifecycleTx("approval", async (tx) => {
+        const { ref: pRef } = await txPermitAwaitingDecision(tx, p.id);
+        await txEquipmentPointer(tx, equip.id, iso.id);
+        const isoRef = doc(db, "isolations", iso.id);
+        const iSnap = await tx.get(isoRef);
+        if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+        const st = iSnap.data().status;
+        // The certificate may have been confirmed while this dialog was open. It
+        // is still safe to attach, but the permit must then go straight to Active
+        // rather than waiting for a confirmation that has already happened.
+        if (st !== "assigned" && st !== "active")
+          gate(`This certificate is now ${STATUS_LABEL[st] || st} — the permit was not attached. Reopen it and review.`);
+        tx.update(isoRef, { attachedPermitIds: arrayUnion(p.id) });
+        tx.update(pRef, { status: st === "active" ? "active" : "awaitingIsolation", isolationRef: iso.id, isoNo: iso.isoNo || null, approval: approval(), updatedAt: nowISO() });
+      });
       closeModal(); toast("Approved — awaiting isolation confirmation"); go("detail", { id: p.id }); refreshPendingBadge();
     });
     return;
   }
 
-  // no usable isolation → create a new certificate and assign it
+  // no usable isolation → create a new certificate and assign it.
+  // A certificate is anchored to an equipment record (the isolation status and
+  // the pointer both live there), so without one there is nothing to isolate —
+  // the old code would have thrown a TypeError on equip.id here.
+  if (!equip) return toast("This permit's equipment record is missing, so an isolation certificate cannot be created. Ask an Admin to restore it.", "err");
   const users = await isolatorUsers();
   if (!users.length) return toast("No active Isolator users found. Ask an Admin to assign the Isolator role to a user first.", "err");
   modal({ title: "Approve & create isolation certificate", wide: true, body: `
@@ -1856,18 +1918,30 @@ async function approvePermit(p, equip) {
   $("[data-ok]").onclick = async () => {
     const au = users.find((u) => u.id === $("#assignTo").value);
     const isoId = uid(); const isoNo = makeIsoNo();
-    const batch = writeBatch(db);
-    batch.set(doc(db, "isolations", isoId), {
-      isoNo, equipmentRef: equip.id, equipmentTag: equip.tag,
-      points: p.isolationPoints || [], status: "assigned",
-      assignedTo: { uid: au?.id || null, name: au?.name || "", ...userMeta(au) }, assignedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, assignedAt: nowISO(),
-      confirmedBy: null, confirmedAt: null,
-      removalAssignedTo: null, removalAssignedAt: null, removalConfirmedBy: null, removedAt: null,
-      attachedPermitIds: [p.id], createdBy: State.profile.name, createdByMeta: myMeta(), createdAt: nowISO()
-    });
-    batch.update(doc(db, "equipment", equip.id), { isolationStatus: "pending", activeIsolationId: isoId, updatedAt: nowISO() });
-    batch.update(doc(db, "permits", p.id), { status: "awaitingIsolation", isolationRef: isoId, isoNo, approval: approval(), updatedAt: nowISO() });
-    await fsWrite(batch.commit());
+    try {
+      // THE critical transaction. This branch is reached because the equipment
+      // had no certificate *when this page loaded* — which may be minutes old.
+      // Writing blind here is how a second certificate gets created on equipment
+      // that already has a live one: the pointer below is overwritten, the first
+      // certificate is orphaned, and when the second is de-isolated the equipment
+      // reads Available while a crew is still under the first one's locks.
+      // Re-reading the pointer inside the transaction makes that impossible —
+      // if anything claimed the equipment meanwhile, this aborts instead.
+      await lifecycleTx("approval", async (tx) => {
+        const { ref: pRef } = await txPermitAwaitingDecision(tx, p.id);
+        const { ref: eqRef } = await txEquipmentPointer(tx, equip.id, null);
+        tx.set(doc(db, "isolations", isoId), {
+          isoNo, equipmentRef: equip.id, equipmentTag: equip.tag,
+          points: p.isolationPoints || [], status: "assigned",
+          assignedTo: { uid: au?.id || null, name: au?.name || "", ...userMeta(au) }, assignedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, assignedAt: nowISO(),
+          confirmedBy: null, confirmedAt: null,
+          removalAssignedTo: null, removalAssignedAt: null, removalConfirmedBy: null, removedAt: null,
+          attachedPermitIds: [p.id], createdBy: State.profile.name, createdByMeta: myMeta(), createdAt: nowISO()
+        });
+        tx.update(eqRef, { isolationStatus: "pending", activeIsolationId: isoId, updatedAt: nowISO() });
+        tx.update(pRef, { status: "awaitingIsolation", isolationRef: isoId, isoNo, approval: approval(), updatedAt: nowISO() });
+      });
+    } catch (e) { return toast(e.message || "Could not approve the permit", "err"); }
     closeModal(); toast(`Certificate ${isoNo} assigned to ${au?.name || ""}`, "ok"); go("detail", { id: p.id }); refreshPendingBadge();
   };
 }
