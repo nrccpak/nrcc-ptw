@@ -211,7 +211,13 @@ function isUnreachable(e) {
 // otherwise throws an Error whose message is safe to show in a toast.
 async function lifecycleTx(action, fn) {
   try {
-    return await runTransaction(db, fn);
+    const out = await runTransaction(db, fn);
+    // Our own change is pushed back to the listeners a moment after the commit
+    // resolves, and the view we navigate to next renders immediately. Force the
+    // next read of anything a lifecycle write can touch to go to the server, so
+    // that view can never draw the pre-write state.
+    Store.markStale("permits", "isolations", "equipment");
+    return out;
   } catch (e) {
     if (e instanceof GateError) throw e;
     if (isUnreachable(e)) throw new Error(`No connection — ${action} not recorded. Try again.`);
@@ -389,6 +395,7 @@ onAuthStateChanged(auth, async (user) => {
   State.config = null;
   State.view = "dashboard";
   Notify.stop();               // tear down any previous session's listeners
+  Store.stop();                // and drop the previous user's cached collections
   if (!user) return renderLogin();
   // Neutral loading screen while the role is fetched — nothing role-gated
   // is shown until the profile is fully loaded below.
@@ -401,6 +408,9 @@ onAuthStateChanged(auth, async (user) => {
       await loadConfig();
       // Commit the profile and render only after the role is fully loaded.
       State.profile = profile;
+      // Start the listeners BEFORE the first render so the views can be served
+      // from memory, and before Notify — which subscribes to them.
+      Store.start(["permits", "isolations", "equipment"]);
       renderApp();
       Notify.start();          // live in-app assignment alerts
     } else {
@@ -700,6 +710,73 @@ function updateOfflineBar() {
   } else { bar?.remove(); }
 }
 
+/* -------------------- Live collection store --------------------
+   Every view used to re-download whole collections with getDocs, so opening the
+   dashboard, then the register, then the dashboard again paid for the same
+   documents three times. At a few hundred permits that is thousands of reads
+   per sign-in — enough to exhaust a day's quota and to make every page wait on
+   the network before it can draw anything.
+
+   The app was already holding live onSnapshot listeners on permits and
+   isolations to drive the notification bell, then throwing that data away and
+   re-fetching it anyway. This keeps it instead: one listener per collection,
+   feeding an in-memory copy that Firestore keeps current. Reads after sign-in
+   cost nothing and render immediately, and the copy is pushed-to on every
+   change rather than expiring on a timer, so it is never knowingly out of date.
+
+   HEALTH IS THE WHOLE POINT. A listener that quietly drops would leave the
+   store frozen with no visible symptom — stale data that still looks live. So
+   a collection is served from memory ONLY while its listener is attached and
+   has delivered; on any error, or before the first delivery, callers fall
+   straight back to a direct getDocs. Falling back is exactly the old
+   behaviour: slower and costlier, never wrong. */
+const Store = {
+  data: {},        // coll -> array of {id, ...doc}
+  live: {},        // coll -> listener attached AND has delivered at least once
+  stale: {},       // coll -> next read must bypass memory (see markStale)
+  watchers: {},    // coll -> [fn(docs, isFirstDelivery)]
+  subs: [],
+
+  start(colls) {
+    this.stop();
+    for (const coll of colls) {
+      this.live[coll] = false;
+      const unsub = onSnapshot(collection(db, coll), (snap) => {
+        const first = !this.live[coll];
+        this.data[coll] = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        this.live[coll] = true;
+        this.stale[coll] = false;
+        (this.watchers[coll] || []).forEach((fn) => { try { fn(this.data[coll], first); } catch (e) { console.warn("Store watcher failed", coll, e); } });
+      }, (err) => {
+        // Stop trusting this collection. Views keep working via getDocs.
+        this.live[coll] = false;
+        console.warn(`Store: ${coll} listener lost — falling back to direct reads`, err);
+      });
+      this.subs.push(unsub);
+    }
+  },
+  stop() {
+    this.subs.forEach((u) => { try { u(); } catch {} });
+    this.subs = [];
+    this.data = {}; this.live = {}; this.stale = {}; this.watchers = {};
+  },
+  // The in-memory copy, or null when it must not be trusted.
+  get(coll) {
+    return (this.live[coll] && !this.stale[coll]) ? this.data[coll] : null;
+  },
+  // Force the next read of these collections to hit the server. Used after a
+  // write: the listener push that carries our own change may land a moment
+  // after the write resolves, and a view rendered in that gap would still show
+  // the pre-write state.
+  markStale(...colls) { colls.forEach((c) => { this.stale[c] = true; }); },
+  onChange(coll, fn) {
+    (this.watchers[coll] = this.watchers[coll] || []).push(fn);
+    // A listener that has already delivered must not leave a late subscriber
+    // waiting for the next change to catch up.
+    if (this.live[coll]) { try { fn(this.data[coll], true); } catch (e) { console.warn("Store watcher failed", coll, e); } }
+  }
+};
+
 /* -------------------- In-app assignment alerts --------------------
    Free, in-app only: two live Firestore listeners (permits + isolations)
    detect every point in the lifecycle where work is handed to a person,
@@ -740,39 +817,45 @@ const Notify = {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
   },
 
+  // Rides the Store's listener rather than opening a second one on the same
+  // collection — the alerts and the cached copy are driven by the same push.
   _watch(coll, extract) {
-    const unsub = onSnapshot(collection(db, coll), (snap) => {
+    Store.onChange(coll, (docs) => {
       const first = !this.primed[coll];
       const silent = this.wasEmpty && first;   // brand-new device → seed quietly
       const fired = [];
-      snap.forEach((docSnap) => {
-        const d = { id: docSnap.id, ...docSnap.data() };
+      let added = false;
+      for (const d of docs) {
         for (const ev of extract(d)) {
           if (this.seen.has(ev.sig)) continue;
-          this.seen.add(ev.sig);
+          this.seen.add(ev.sig); added = true;
           if (!silent) fired.push(ev);
         }
-      });
+      }
       this.primed[coll] = true;
-      this._save();
+      // Only touch localStorage when the seen-set actually grew. This used to
+      // run on every snapshot — a synchronous stringify + write of up to 800
+      // entries, on the main thread, every time anyone saved anything.
+      if (added) this._save();
       if (fired.length) this._fire(fired);
-    }, (err) => console.warn("Notify: " + coll + " listener error", err));
-    this.subs.push(unsub);
+    });
   },
 
   _recheckOverdue() {
-    // Re-evaluate loaded permits for the overdue event only.
-    fetchAll("permits").then((permits) => {
-      const fired = [];
-      permits.forEach((p) => {
-        for (const ev of this.permitEvents(p)) {
-          if (ev.kind !== "overdue" || this.seen.has(ev.sig)) continue;
-          this.seen.add(ev.sig); fired.push(ev);
-        }
-      });
-      this._save();
-      if (fired.length) this._fire(fired);
-    }).catch(() => {});
+    // Overdue is time-based: no document changes, so no listener fires. Re-run
+    // the check against the copy the Store already holds — this used to
+    // re-download the whole permits collection every five minutes for the
+    // lifetime of the session, purely to compare timestamps.
+    const permits = Store.get("permits");
+    if (!permits) return;      // listener down — skip a tick rather than refetch
+    const fired = [];
+    permits.forEach((p) => {
+      for (const ev of this.permitEvents(p)) {
+        if (ev.kind !== "overdue" || this.seen.has(ev.sig)) continue;
+        this.seen.add(ev.sig); fired.push(ev);
+      }
+    });
+    if (fired.length) { this._save(); this._fire(fired); }
   },
 
   /* ---- which events apply to THIS user for a given doc ---- */
@@ -932,16 +1015,29 @@ const Notify = {
 };
 
 /* data fetch helpers */
-async function fetchAll(coll) {
+// Served from the Store's live copy when that copy is trustworthy, otherwise
+// straight from the server. Pass { fresh: true } to require a server read even
+// when the copy is good — used by the checks that gate a state change, so a
+// safety decision is never taken on anything but data read at that moment.
+//
+// The ARRAY is a copy, so callers may filter/sort/push freely. The DOCUMENTS in
+// it are shared with the Store: treat them as read-only. To change one, write
+// it to Firestore and let the listener bring it back, or replace the entry in
+// your own array with a modified copy — never assign onto it in place.
+async function fetchAll(coll, { fresh = false } = {}) {
+  if (!fresh) {
+    const cached = Store.get(coll);
+    if (cached) return cached.slice();
+  }
   const snap = await getDocs(collection(db, coll));
   return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 }
-async function fetchPermits() { const a = await fetchAll("permits"); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
+async function fetchPermits(o) { const a = await fetchAll("permits", o); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
 // Active equipment only. Archived items (superseded by a data refresh) stay in
 // the collection so historical permits/certificates still resolve by
 // equipmentRef via getDoc, but are hidden from the active register and pickers.
-async function fetchEquipment() { const a = (await fetchAll("equipment")).filter((e) => !e.archived); a.sort((x, y) => (x.tag || "").localeCompare(y.tag || "")); return a; }
-async function fetchIsolations() { const a = await fetchAll("isolations"); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
+async function fetchEquipment(o) { const a = (await fetchAll("equipment", o)).filter((e) => !e.archived); a.sort((x, y) => (x.tag || "").localeCompare(y.tag || "")); return a; }
+async function fetchIsolations(o) { const a = await fetchAll("isolations", o); a.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || "")); return a; }
 async function activeUsers() { const u = await fetchAll("users"); return u.filter((x) => x.active).sort((a, b) => (a.name || "").localeCompare(b.name || "")); }
 // Only active users holding the Isolator role — used for isolation / de-isolation assignment.
 async function isolatorUsers() { return (await activeUsers()).filter((x) => x.role === "isolator"); }
@@ -1302,7 +1398,9 @@ async function viewNewPermit(m) {
     async function chooseEq(e) {
       // Cycle-based availability gate: equipment whose current work cycle is in
       // hand-back (or with earlier permits left unclosed) cannot be selected.
-      // The approval gate re-checks authoritatively — this is early feedback.
+      // The approval gate re-checks authoritatively — this is early feedback,
+      // and it runs on every pick, so it reads the live cached copy rather than
+      // paying for two full collections each time an Issuer tries a tag.
       const [permits, isos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
       const block = equipmentBlock(e.id, permits, isos, editing?.id);
       if (block) {
@@ -1410,7 +1508,8 @@ async function viewNewPermit(m) {
     // Cycle-based availability: equipment mid hand-back (or with unclosed
     // earlier permits) cannot receive a new submission. Re-checked at approval.
     if (status === "submitted") {
-      const [subPermits, subIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+      // Gates a state change → server read, not the cached copy (see approvePermit).
+      const [subPermits, subIsos] = await Promise.all([fetchPermits({ fresh: true }), fetchIsolations({ fresh: true }).catch(() => [])]);
       const block = equipmentBlock(eqId, subPermits, subIsos, editing?.id);
       if (block) return toast(`${e.tag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
     }
@@ -1650,7 +1749,8 @@ async function viewPermitDetail(m) {
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
   $("#submitNow") && ($("#submitNow").onclick = async () => {
-    const [subPermits, subIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+    // Gates a state change → server read, not the cached copy (see approvePermit).
+    const [subPermits, subIsos] = await Promise.all([fetchPermits({ fresh: true }), fetchIsolations({ fresh: true }).catch(() => [])]);
     const block = equipmentBlock(p.equipmentRef, subPermits, subIsos, p.id);
     if (block) return toast(`${p.equipmentTag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
     try {
@@ -1783,7 +1883,11 @@ async function approvePermit(p, equip) {
   // AVAILABILITY GATE (authoritative — the picker/submission checks are only
   // early feedback): equipment whose work cycle is in hand-back, or carrying
   // permits awaiting closure, cannot receive new work until all are closed.
-  const [allPermits, allIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+  // Read fresh from the server, never from the cached copy: this condition
+  // spans the whole permit collection, so unlike the permit status and the
+  // certificate pointer it cannot be re-checked inside the approval
+  // transaction. This read is the only place it is enforced.
+  const [allPermits, allIsos] = await Promise.all([fetchPermits({ fresh: true }), fetchIsolations({ fresh: true }).catch(() => [])]);
   const block = equipmentBlock(p.equipmentRef, allPermits, allIsos, p.id);
   if (block) {
     return confirmBoxHTML("Cannot approve — equipment not available",
@@ -2155,7 +2259,14 @@ async function viewEquipment(m) {
     }
     if (isIssuer) $$("[data-edit]").forEach((b) => b.onclick = () => {
       const it = equip.find((e) => e.id === b.dataset.edit);
-      if (it) openEditEquipment(it, equip, (upd) => { Object.assign(it, upd); draw(); });
+      // Replace the row rather than mutating it: document objects come from the
+      // Store's shared copy, so assigning onto one would edit what every other
+      // view sees, without going through the listener.
+      if (it) openEditEquipment(it, equip, (upd) => {
+        const ix = equip.indexOf(it);
+        if (ix >= 0) equip[ix] = { ...it, ...upd };
+        draw();
+      });
     });
   };
   if (State.params.status) $("#fStatus").value = State.params.status;
@@ -2218,7 +2329,7 @@ function openAddEquipment(existing, onAdded) {
     if (!tag) return toast("Enter a tag", "err");
     if (existing.some((e) => e.tag.toLowerCase() === tag.toLowerCase())) return toast("That tag already exists", "err");
     const rec = { tag, description: $("#aDesc").value.trim(), line: $("#aLine").value, area: $("#aArea").value, isolationStatus: "available", activeIsolationId: null, createdBy: State.profile.name, createdAt: nowISO() };
-    try { const ref = await addDoc(collection(db, "equipment"), rec); closeModal(); toast("Equipment added", "ok"); onAdded({ id: ref.id, ...rec }); }
+    try { const ref = await addDoc(collection(db, "equipment"), rec); Store.markStale("equipment"); closeModal(); toast("Equipment added", "ok"); onAdded({ id: ref.id, ...rec }); }
     catch (e) { toast(e.message, "err"); }
   };
 }
@@ -2248,7 +2359,7 @@ function openEditEquipment(item, existing, onSaved) {
     if (!tag) return toast("Enter a tag", "err");
     if (existing.some((e) => e.id !== item.id && e.tag.toLowerCase() === tag.toLowerCase())) return toast("That tag already exists", "err");
     const upd = { tag, description: $("#eDesc").value.trim(), line: $("#eLine").value, area: $("#eArea").value };
-    try { await updateDoc(doc(db, "equipment", item.id), upd); closeModal(); toast("Equipment updated", "ok"); onSaved(upd); }
+    try { await updateDoc(doc(db, "equipment", item.id), upd); Store.markStale("equipment"); closeModal(); toast("Equipment updated", "ok"); onSaved(upd); }
     catch (e) { toast(e.message, "err"); }
   };
 }
@@ -2297,7 +2408,7 @@ async function openDeleteEquipment(item, onChanged) {
        <p>Archive it instead? Archiving hides it from the active list but keeps it so historical records stay intact. (Reversible.)</p>`,
       "Archive instead", async () => {
         await fsWrite(updateDoc(doc(db, "equipment", item.id), { archived: true, archivedAt: nowISO(), archivedBy: State.profile.name, updatedAt: nowISO() }));
-        closeModal(); toast(`${item.tag} archived`, "ok"); onChanged();
+        Store.markStale("equipment"); closeModal(); toast(`${item.tag} archived`, "ok"); onChanged();
       });
   }
   confirmBoxHTML("Delete equipment",
@@ -2305,7 +2416,7 @@ async function openDeleteEquipment(item, onChanged) {
      <p>No permits or certificates reference this equipment, so it is safe to remove.</p>`,
     "Delete permanently", async () => {
       await fsWrite(deleteDoc(doc(db, "equipment", item.id)));
-      closeModal(); toast(`${item.tag} deleted`, "ok"); onChanged();
+      Store.markStale("equipment"); closeModal(); toast(`${item.tag} deleted`, "ok"); onChanged();
     }, true);
 }
 
@@ -2388,6 +2499,7 @@ function openImport(existing, onDone) {
       }
       closeModal();
       toast(replace ? `Archived ${existing.length}, imported ${parsed.length} equipment` : `Imported ${parsed.length} equipment`, "ok");
+      Store.markStale("equipment");
       onDone(await fetchEquipment());
     } catch (e) { toast(e.message, "err"); }
   };
