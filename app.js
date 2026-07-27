@@ -591,6 +591,8 @@ onAuthStateChanged(auth, async (user) => {
       // Start the listeners BEFORE the first render so the views can be served
       // from memory, and before Notify — which subscribes to them.
       Store.start(["permits", "isolations", "equipment"]);
+      // Any collection changing offers the current list view a redraw.
+      ["permits", "isolations", "equipment"].forEach((c) => Store.onChange(c, () => LiveView.ping()));
       renderApp();
       Notify.start();          // live in-app assignment alerts
     } else {
@@ -872,6 +874,7 @@ function go(view, params = {}) {
   // triggered some other way, a non-Admin can never render Admin controls.
   if (view === "admin" && !isAdmin()) view = "dashboard";
   State.view = view; State.params = params;
+  LiveView.reset();            // the outgoing view stops refreshing itself
   const hv = ["isolations", "isodetail", "detail"].includes(view) ? "permits" : view;
   $$(".navitem,.bn-item").forEach((n) => n.classList.toggle("active", n.dataset.v === hv));
   const titles = { dashboard: "Dashboard", new: "New Permit", permits: "Permit Register", isolations: "Isolation Certificates", isodetail: "Isolation Certificate", equipment: "Equipment", admin: "Administration", detail: "Permit Detail" };
@@ -954,6 +957,57 @@ const Store = {
     // A listener that has already delivered must not leave a late subscriber
     // waiting for the next change to catch up.
     if (this.live[coll]) { try { fn(this.data[coll], true); } catch (e) { console.warn("Store watcher failed", coll, e); } }
+  }
+};
+
+/* -------------------- Live view refresh --------------------
+   The Store keeps the data current, but a screen drawn once stays drawn: an
+   Issuer watching the dashboard would not see a permit arrive, and the
+   "Awaiting your approval" count sat stale until they navigated away and back.
+   Before the Store existed this was expensive to fix — refreshing meant
+   re-downloading every collection on a timer, which is what exhausted the read
+   quota. Now the fresh data is already in memory, so redrawing is nearly free.
+
+   Deliberately limited to the LIST views (dashboard and the three registers).
+   Detail pages are left alone: they are where someone stands about to approve
+   or de-isolate, and repainting the buttons under a thumb is worse than showing
+   a few-second-old record — the approval transaction, not the screen, is what
+   guarantees the decision is made on current data.
+
+   Three rules keep a repaint from being disruptive:
+     - never while a dialog is open, so nothing moves mid-decision
+     - only the view that is still on screen (a token, so a slow refresh from a
+       screen already navigated away from cannot write over its replacement)
+     - debounced, so a burst of changes causes one repaint rather than ten   */
+const LiveView = {
+  fn: null, token: 0, timer: null,
+
+  // Called by the router before a new view renders: forget the old view's
+  // refresh and invalidate anything still in flight for it.
+  reset() {
+    this.fn = null; this.token++;
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    return this.token;
+  },
+  // A view registers how to redraw itself. `token` is the value it captured
+  // when it started, so a view that finished loading after the user moved on
+  // silently declines to register.
+  bind(token, fn) {
+    if (token !== this.token) return;
+    this.fn = async () => { if (token === this.token) await fn(); };
+  },
+  // Data changed underneath.
+  ping() {
+    if (!this.fn) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(async () => {
+      this.timer = null;
+      const fn = this.fn;
+      if (!fn) return;
+      // A dialog open means someone is part-way through a decision.
+      if ($("#modal-root")?.innerHTML.trim()) return;
+      try { await fn(); } catch (e) { console.warn("Live refresh failed", e); }
+    }, 400);
   }
 };
 
@@ -1268,6 +1322,10 @@ async function viewDashboard(m) {
     <div class="actions"><button class="btn btn-accent">+ New Permit</button></div></div>
     <div id="dash">Loading…</div>`;
   m.querySelector(".actions .btn").onclick = () => go("new");
+  const token = LiveView.token;
+  // Everything below rebuilds only #dash, so a live refresh replaces the
+  // content without the surrounding page flashing back to "Loading…".
+  const paint = async () => {
   // The three collections are independent, so fetch them concurrently — run
   // sequentially this was three full round trips back to back before the page
   // could render anything.
@@ -1326,7 +1384,9 @@ async function viewDashboard(m) {
     <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th></tr></thead><tbody>
     ${(isIssuer ? active : mine).slice(0, 8).map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
     </tbody></table></div>`;
-  $("#dash").innerHTML = html;
+  const host = $("#dash");
+  if (!host) return;            // navigated away while the data was loading
+  host.innerHTML = html;
   bindPermitRows();
   // KPI tiles drill through to their pre-filtered list; keyboard-activatable too.
   $$(".stat-link[data-nav]").forEach((t) => {
@@ -1336,6 +1396,9 @@ async function viewDashboard(m) {
   });
   const ob = $("#overdueBanner"); if (ob) ob.onclick = () => go("permits", { status: "overdue" });
   $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
+  };
+  await paint();
+  LiveView.bind(token, paint);
 }
 
 function permitRow(p, showStatus = false, isolations = []) {
@@ -1380,11 +1443,12 @@ async function viewPermits(m) {
   // Certificates are needed to derive each live permit's hand-back stage
   // (work in progress → awaiting de-isolation → awaiting closure), and are
   // independent of the permits themselves — so fetch both concurrently.
-  const [all, isosLoaded] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+  const token = LiveView.token;
+  let [all, isosLoaded] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
   isos = isosLoaded;
   // Index the certificates once for the whole view — draw() runs on every
   // filter change and keystroke, and derives a stage for each row.
-  const isoMap = isoIndex(isos);
+  let isoMap = isoIndex(isos);
   const draw = () => {
     const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value, fm = $("#fMine").checked;
     const rows = all.filter((p) =>
@@ -1409,6 +1473,13 @@ async function viewPermits(m) {
   ["fType", "fStatus", "fDept"].forEach((id) => $("#" + id).addEventListener("input", draw));
   $("#fMine").addEventListener("change", draw);
   draw();
+  // draw() rewrites only #ptable, so a live refresh leaves the search box and
+  // the filter selections exactly as the user left them.
+  LiveView.bind(token, async () => {
+    [all, isos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+    isoMap = isoIndex(isos);
+    if ($("#ptable")) draw();
+  });
 }
 
 // Download the currently-filtered permit register as a CSV file (client-side).
@@ -2396,6 +2467,7 @@ async function viewEquipment(m) {
         <option value="isolatedAny">isolated / trial run</option>
         ${["available", "pending", "isolated", "trialRun"].map((s) => `<option>${s}</option>`).join("")}</select></div>
     <div class="card pad0" id="etable">Loading…</div>`;
+  const token = LiveView.token;
   let equip = await fetchEquipment();
   let lastRows = [];
   const updateBulkBtn = () => {
@@ -2453,6 +2525,12 @@ async function viewEquipment(m) {
   $("#q").addEventListener("input", debounce(draw));
   ["fLine", "fArea", "fStatus"].forEach((id) => $("#" + id).addEventListener("input", draw));
   draw();
+  // Filters, search text and any tick-box selection survive: draw() rewrites
+  // only #etable and re-reads `selected` as it goes.
+  LiveView.bind(token, async () => {
+    equip = await fetchEquipment();
+    if ($("#etable")) draw();
+  });
   if (isIssuer) {
     $("#add").onclick = () => openAddEquipment(equip, (added) => { equip.push(added); draw(); });
   }
@@ -2863,7 +2941,8 @@ async function viewIsolations(m) {
       <select id="fs"><option value="">All statuses</option>${["assigned", "active", "trialRun", "removalPending", "removed"].map((s) => `<option>${s}</option>`).join("")}</select></div>
     <div class="card pad0" id="itable">Loading…</div>`;
   bindTabs();
-  const all = await fetchIsolations();
+  const token = LiveView.token;
+  let all = await fetchIsolations();
   const draw = () => {
     const q = $("#q").value.toLowerCase(), fs = $("#fs").value;
     const rows = all.filter((i) => (!fs || i.status === fs) && (!q || ((i.isoNo || "") + " " + i.equipmentTag).toLowerCase().includes(q)));
@@ -2878,6 +2957,10 @@ async function viewIsolations(m) {
   $("#q").addEventListener("input", debounce(draw));
   $("#fs").addEventListener("input", draw);
   draw();
+  LiveView.bind(token, async () => {
+    all = await fetchIsolations();
+    if ($("#itable")) draw();
+  });
 }
 
 async function viewIsolationDetail(m) {
