@@ -894,9 +894,10 @@ async function viewDashboard(m) {
     <div class="actions"><button class="btn btn-accent">+ New Permit</button></div></div>
     <div id="dash">Loading…</div>`;
   m.querySelector(".actions .btn").onclick = () => go("new");
-  const permits = await fetchPermits();
-  const equip = await fetchEquipment();
-  const isoAll = await fetchIsolations();
+  // The three collections are independent, so fetch them concurrently — run
+  // sequentially this was three full round trips back to back before the page
+  // could render anything.
+  const [permits, equip, isoAll] = await Promise.all([fetchPermits(), fetchEquipment(), fetchIsolations()]);
   const mine = permits.filter((p) => p.requester?.uid === State.profile.id);
   const active = permits.filter((p) => ["active", "extended"].includes(p.status));
   const pending = permits.filter((p) => p.status === "submitted");
@@ -995,10 +996,11 @@ async function viewPermits(m) {
   $("#fDept").innerHTML += State.config.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
   if (State.params.status) $("#fStatus").value = State.params.status;
   if (State.params.mine) $("#fMine").checked = true;
-  const all = await fetchPermits();
   // Certificates are needed to derive each live permit's hand-back stage
-  // (work in progress → awaiting de-isolation → awaiting closure).
-  isos = await fetchIsolations().catch(() => []);
+  // (work in progress → awaiting de-isolation → awaiting closure), and are
+  // independent of the permits themselves — so fetch both concurrently.
+  const [all, isosLoaded] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+  isos = isosLoaded;
   const draw = () => {
     const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value, fm = $("#fMine").checked;
     const rows = all.filter((p) =>
@@ -1192,7 +1194,7 @@ async function viewNewPermit(m) {
       // Cycle-based availability gate: equipment whose current work cycle is in
       // hand-back (or with earlier permits left unclosed) cannot be selected.
       // The approval gate re-checks authoritatively — this is early feedback.
-      const [permits, isos] = [await fetchPermits(), await fetchIsolations().catch(() => [])];
+      const [permits, isos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
       const block = equipmentBlock(e.id, permits, isos, editing?.id);
       if (block) {
         $("#eqId").value = ""; $("#eqChosen").innerHTML = ""; eqSearch.value = ""; eqResults.innerHTML = "";
@@ -1299,7 +1301,8 @@ async function viewNewPermit(m) {
     // Cycle-based availability: equipment mid hand-back (or with unclosed
     // earlier permits) cannot receive a new submission. Re-checked at approval.
     if (status === "submitted") {
-      const block = equipmentBlock(eqId, await fetchPermits(), await fetchIsolations().catch(() => []), editing?.id);
+      const [subPermits, subIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+      const block = equipmentBlock(eqId, subPermits, subIsos, editing?.id);
       if (block) return toast(`${e.tag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
     }
     // Gas-reading sanity check (advisory, like the hazard checklist): flag
@@ -1386,9 +1389,15 @@ async function viewPermitDetail(m) {
   const isOwner = p.requester?.uid === State.profile.id;
   // De-isolation is the Isolator's job; Admin kept only as a superuser fallback.
   const isIsoOrAdmin = ["isolator", "admin"].includes(State.profile.role);
-  const eqSnap = await getDoc(doc(db, "equipment", p.equipmentRef)).catch(() => null);
+  // Equipment, certificate and the sibling-permit list all hang off the permit
+  // we just loaded but not off each other, so fetch them concurrently rather
+  // than paying a separate round trip for each.
+  const [eqSnap, isoSnap, sharedPermits] = await Promise.all([
+    getDoc(doc(db, "equipment", p.equipmentRef)).catch(() => null),
+    p.isolationRef ? getDoc(doc(db, "isolations", p.isolationRef)).catch(() => null) : null,
+    p.isolationRef ? fetchPermits() : null
+  ]);
   const equip = eqSnap && eqSnap.exists() ? { id: eqSnap.id, ...eqSnap.data() } : null;
-  const isoSnap = p.isolationRef ? await getDoc(doc(db, "isolations", p.isolationRef)).catch(() => null) : null;
   const isoDoc = isoSnap && isoSnap.exists() ? { id: isoSnap.id, ...isoSnap.data() } : null;
   // Equipment temporarily energised for a trial run — surface a persistent
   // "Re-isolate now" action (the post-trial prompt is easy to dismiss or miss).
@@ -1409,10 +1418,9 @@ async function viewPermitDetail(m) {
   // sibling permits here gives the whole picture in one place, and lets us fetch
   // once for both that list and the shared-cert de-isolation readiness check.
   let siblings = [];
-  if (p.isolationRef) {
-    const allPermits = await fetchPermits();
-    siblings = allPermits.filter((x) => x.isolationRef === p.isolationRef && x.id !== id);
-    if (awaitingDeiso && isoDoc) deisoReady = isoDoc.status === "removalPending" || isoReadyForDeiso(isoDoc, allPermits);
+  if (p.isolationRef && sharedPermits) {
+    siblings = sharedPermits.filter((x) => x.isolationRef === p.isolationRef && x.id !== id);
+    if (awaitingDeiso && isoDoc) deisoReady = isoDoc.status === "removalPending" || isoReadyForDeiso(isoDoc, sharedPermits);
   }
   const shared = siblings.length > 0;
   const siblingsWorking = siblings.filter((x) => ["active", "extended"].includes(x.status) && !x.workCompletion).length;
@@ -1514,7 +1522,8 @@ async function viewPermitDetail(m) {
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
   $("#submitNow") && ($("#submitNow").onclick = async () => {
-    const block = equipmentBlock(p.equipmentRef, await fetchPermits(), await fetchIsolations().catch(() => []), p.id);
+    const [subPermits, subIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
+    const block = equipmentBlock(p.equipmentRef, subPermits, subIsos, p.id);
     if (block) return toast(`${p.equipmentTag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
     await fsWrite(updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() })); toast("Submitted", "ok"); go("detail", { id });
   });
@@ -1569,8 +1578,7 @@ async function approvePermit(p, equip) {
   // AVAILABILITY GATE (authoritative — the picker/submission checks are only
   // early feedback): equipment whose work cycle is in hand-back, or carrying
   // permits awaiting closure, cannot receive new work until all are closed.
-  const allPermits = await fetchPermits();
-  const allIsos = await fetchIsolations().catch(() => []);
+  const [allPermits, allIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
   const block = equipmentBlock(p.equipmentRef, allPermits, allIsos, p.id);
   if (block) {
     return confirmBoxHTML("Cannot approve — equipment not available",
@@ -2234,9 +2242,13 @@ async function viewIsolationDetail(m) {
   const s = await getDoc(doc(db, "isolations", id));
   if (!s.exists()) { m.innerHTML = `<div class="danger-box">Certificate not found.</div>`; return; }
   const iso = { id, ...s.data() };
-  const eqS = await getDoc(doc(db, "equipment", iso.equipmentRef)).catch(() => null);
+  // The equipment record and the attached-permit list are independent of each
+  // other, so load them concurrently.
+  const [eqS, permits] = await Promise.all([
+    getDoc(doc(db, "equipment", iso.equipmentRef)).catch(() => null),
+    fetchPermits()
+  ]);
   const equip = eqS && eqS.exists() ? { id: eqS.id, ...eqS.data() } : null;
-  const permits = await fetchPermits();
   const attached = permits.filter((p) => p.isolationRef === id);
   const me = State.profile.id, canI = ["issuer", "admin"].includes(State.profile.role);
   const isAdmin = State.profile.role === "admin";
