@@ -304,12 +304,20 @@ if ("serviceWorker" in navigator) {
 // Periodically nudge the service worker to revalidate the app code (and so
 // detect a new deploy) during long-running sessions. Throttled to ~30 min and
 // also fired when the tab/app is brought back to the foreground.
+//
+// This has to re-request app.js specifically: the service worker raises the
+// update banner by comparing the cached and network ETags of that one URL in
+// its fetch handler, so nothing else triggers a mid-session check.
+// `no-cache` (not `reload`) is what we want — it forces revalidation with the
+// server but still allows a 304, so an unchanged app costs a few hundred bytes
+// instead of re-downloading the whole file every 30 minutes and on every
+// return to the foreground.
 let lastUpdateCheck = Date.now();
 function checkForUpdate() {
   if (Date.now() - lastUpdateCheck < 30 * 60 * 1000) return;
   lastUpdateCheck = Date.now();
   if (navigator.serviceWorker && navigator.serviceWorker.controller)
-    fetch("app.js", { cache: "reload" }).catch(() => {});
+    fetch("app.js", { cache: "no-cache" }).catch(() => {});
 }
 setInterval(checkForUpdate, 30 * 60 * 1000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) checkForUpdate(); });
@@ -615,8 +623,11 @@ function renderApp() {
   $("#logout").onclick = () => signOut(auth);
   updateOfflineBar();
   Notify.mountUI();
-  go(State.view || "dashboard");
-  refreshPendingBadge();
+  // The dashboard refreshes the badge itself from the permits it already
+  // loaded, so only pay for a separate fetch when landing elsewhere.
+  const landing = State.view || "dashboard";
+  go(landing);
+  if (landing !== "dashboard") refreshPendingBadge();
 }
 
 function go(view, params = {}) {
@@ -915,10 +926,13 @@ function isoReadyForDeiso(iso, permits, byIso) {
     (["active", "extended"].includes(p.status) && !!p.workCompletion));
 }
 
-async function refreshPendingBadge() {
+// Pass `known` when the caller already holds the permit list (the dashboard
+// does) — the badge is only a count of submitted permits, and downloading the
+// whole collection a second time to derive it is pure waste.
+async function refreshPendingBadge(known) {
   if (!["issuer", "admin"].includes(State.profile.role)) return;
   try {
-    const permits = await fetchPermits();
+    const permits = known || await fetchPermits();
     const pending = permits.filter((p) => p.status === "submitted").length;
     const b = $('.navitem[data-v="dashboard"] [data-badge]');
     if (b) { b.classList.toggle("hidden", pending === 0); b.textContent = pending; }
@@ -935,6 +949,7 @@ async function viewDashboard(m) {
   // sequentially this was three full round trips back to back before the page
   // could render anything.
   const [permits, equip, isoAll] = await Promise.all([fetchPermits(), fetchEquipment(), fetchIsolations()]);
+  refreshPendingBadge(permits);   // reuse what we just loaded — no second fetch
   const mine = permits.filter((p) => p.requester?.uid === State.profile.id);
   const active = permits.filter((p) => ["active", "extended"].includes(p.status));
   const pending = permits.filter((p) => p.status === "submitted");
