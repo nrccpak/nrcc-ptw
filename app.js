@@ -88,10 +88,21 @@ function overdueChip() { return `<span class="badge-st st-overdue" title="Planne
 // Like isOverdue, the stage is derived in the UI (never stored) from the
 // workCompletion sign-off plus the isolation certificate's status.
 const STAGE_LABEL = { inProgress: "Work in progress", awaitingDeisolation: "Awaiting de-isolation", awaitingClosure: "Awaiting closure" };
+// Certificates indexed by id. Building this once per render turns the per-row
+// certificate lookup in permitStage from a scan of the whole certificate list
+// into a single map hit — the difference between permits x certificates work
+// and permits work when a register of any size is drawn.
+function isoIndex(isolations) {
+  return isolations instanceof Map ? isolations : new Map((isolations || []).map((i) => [i.id, i]));
+}
+// `isolations` may be the raw array or an isoIndex() map — callers rendering
+// many rows should pass the map, one-off callers can keep passing the array.
 function permitStage(p, isolations) {
   if (!p || !["active", "extended"].includes(p.status)) return null;
   if (!p.workCompletion) return "inProgress";
-  const iso = p.isolationRef ? (isolations || []).find((i) => i.id === p.isolationRef) : null;
+  const iso = !p.isolationRef ? null
+    : isolations instanceof Map ? isolations.get(p.isolationRef)
+    : (isolations || []).find((i) => i.id === p.isolationRef);
   const deisolated = !p.isolationRef || (iso && iso.status === "removed");
   return deisolated ? "awaitingClosure" : "awaitingDeisolation";
 }
@@ -107,11 +118,15 @@ function stageChip(stage) {
 function equipmentBlock(eqId, permits, isolations, excludeId) {
   const live = permits.filter((p) => p.equipmentRef === eqId && p.id !== excludeId &&
     ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
-  const closing = live.filter((p) => permitStage(p, isolations) === "awaitingClosure");
+  const isoMap = isoIndex(isolations);
+  const closing = live.filter((p) => permitStage(p, isoMap) === "awaitingClosure");
   if (closing.length) return { kind: "awaitingClosure", permits: closing };
-  for (const iid of new Set(live.map((p) => p.isolationRef).filter(Boolean))) {
-    const iso = isolations.find((i) => i.id === iid);
-    if (iso && (iso.status === "removalPending" || (iso.status === "active" && isoReadyForDeiso(iso, permits))))
+  const liveIsoIds = new Set(live.map((p) => p.isolationRef).filter(Boolean));
+  if (!liveIsoIds.size) return null;
+  const byIso = permitsByIso(permits);
+  for (const iid of liveIsoIds) {
+    const iso = isoMap.get(iid);
+    if (iso && (iso.status === "removalPending" || (iso.status === "active" && isoReadyForDeiso(iso, permits, byIso))))
       return { kind: "awaitingDeisolation", permits: live.filter((p) => p.isolationRef === iid) };
   }
   return null;
@@ -869,9 +884,23 @@ async function isolatorUsers() { return (await activeUsers()).filter((x) => x.ro
 // attached to it has had its work confirmed complete (or is otherwise closed).
 // This is what makes the Isolator's de-isolation step open automatically after
 // the last crew signs off — without the requester writing to the certificate.
-function isoReadyForDeiso(iso, permits) {
+// Permits grouped by the certificate they are attached to. Answering "is this
+// certificate ready for de-isolation?" for many certificates otherwise re-scans
+// the entire permit list once per certificate.
+function permitsByIso(permits) {
+  const m = new Map();
+  for (const p of permits || []) {
+    if (!p.isolationRef) continue;
+    const arr = m.get(p.isolationRef);
+    if (arr) arr.push(p); else m.set(p.isolationRef, [p]);
+  }
+  return m;
+}
+// `byIso` is an optional permitsByIso() index — pass it when checking several
+// certificates against the same permit list.
+function isoReadyForDeiso(iso, permits, byIso) {
   if (!iso || iso.status !== "active") return false;
-  const att = permits.filter((p) => p.isolationRef === iso.id);
+  const att = byIso ? (byIso.get(iso.id) || []) : permits.filter((p) => p.isolationRef === iso.id);
   if (!att.length) return false;
   return att.every((p) =>
     ["closed", "rejected", "expired"].includes(p.status) ||
@@ -923,14 +952,20 @@ async function viewDashboard(m) {
   // De-isolation is a physical lockout job, so it is an Isolator task only —
   // the Issuer does NOT de-isolate (Admin is kept as a system superuser).
   const isIso = State.profile.role === "isolator";
+  // Readiness is needed twice below (to pick the tasks, then to label each row).
+  // Work it out once per certificate against a single grouped index rather than
+  // re-scanning every permit for each certificate, twice over.
+  const byIso = permitsByIso(permits);
+  const isoMap = isoIndex(isoAll);
+  const readyForDeiso = new Set(isoAll.filter((i) => isoReadyForDeiso(i, permits, byIso)).map((i) => i.id));
   const tasks = isoAll.filter((i) =>
     (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
     (i.status === "removalPending" && (isIso || isAdmin || i.removalAssignedTo?.uid === me)) ||
-    (isoReadyForDeiso(i, permits) && (isIso || isAdmin)));
+    (readyForDeiso.has(i.id) && (isIso || isAdmin)));
   if (tasks.length) {
     html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Isolation tasks</h3></div>
       <table class="tbl"><thead><tr><th>Certificate</th><th>Equipment</th><th>Status</th><th>Assigned to</th></tr></thead><tbody>
-      ${tasks.map((i) => { const deiso = i.status === "removalPending" || isoReadyForDeiso(i, permits); return `<tr class="row" data-iid="${i.id}">
+      ${tasks.map((i) => { const deiso = i.status === "removalPending" || readyForDeiso.has(i.id); return `<tr class="row" data-iid="${i.id}">
         <td><span class="mono">${esc(i.isoNo || i.id)}</span></td><td>${esc(i.equipmentTag)}</td>
         <td>${badge(deiso ? "removalPending" : i.status)}</td><td>${esc((deiso ? i.removalAssignedTo?.name : i.assignedTo?.name) || "—")}</td></tr>`; }).join("")}
       </tbody></table></div>`;
@@ -943,7 +978,7 @@ async function viewDashboard(m) {
   }
   html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My recent permits"}</h3></div>
     <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th></tr></thead><tbody>
-    ${(isIssuer ? active : mine).slice(0, 8).map((p) => permitRow(p, true, isoAll)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+    ${(isIssuer ? active : mine).slice(0, 8).map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
     </tbody></table></div>`;
   $("#dash").innerHTML = html;
   bindPermitRows();
@@ -1001,12 +1036,15 @@ async function viewPermits(m) {
   // independent of the permits themselves — so fetch both concurrently.
   const [all, isosLoaded] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
   isos = isosLoaded;
+  // Index the certificates once for the whole view — draw() runs on every
+  // filter change and keystroke, and derives a stage for each row.
+  const isoMap = isoIndex(isos);
   const draw = () => {
     const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value, fm = $("#fMine").checked;
     const rows = all.filter((p) =>
       (!ft || p.type === ft) &&
       (!fs || (fs === "overdue" ? isOverdue(p)
-        : fs.startsWith("stage:") ? permitStage(p, isos) === fs.slice(6)
+        : fs.startsWith("stage:") ? permitStage(p, isoMap) === fs.slice(6)
         : fs === "activeAll" ? ["active", "extended"].includes(p.status) : p.status === fs)) &&
       (!fd || p.requestingDepartment?.department === fd) &&
       (!fm || p.requester?.uid === State.profile.id) &&
@@ -1017,7 +1055,7 @@ async function viewPermits(m) {
         <td><span class="mono">${esc(p.permitNo)}</span></td>
         <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName)}</span></td>
         <td>${esc(p.equipmentTag)}</td><td>${esc(p.requestingDepartment?.department || "—")}</td>
-        <td>${badge(p.status)}${stageChip(permitStage(p, isos))}${isOverdue(p) ? " " + overdueChip() : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
+        <td>${badge(p.status)}${stageChip(permitStage(p, isoMap))}${isOverdue(p) ? " " + overdueChip() : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
       || `<tr><td colspan="7" class="empty">No permits match.</td></tr>`}</tbody></table>`;
     bindPermitRows();
   };
