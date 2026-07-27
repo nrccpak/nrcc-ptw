@@ -16,7 +16,7 @@ import {
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, addDoc,
-  writeBatch, arrayUnion, arrayRemove, onSnapshot
+  writeBatch, arrayUnion, arrayRemove, onSnapshot, runTransaction
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig, appBranding } from "./firebase-config.js";
 
@@ -171,6 +171,53 @@ function parseCsvLine(line) {
 function fsWrite(p) {
   if (navigator.onLine) return p;
   return Promise.race([p, new Promise((res) => setTimeout(res, 600))]);
+}
+
+/* -------------------- Safety-lifecycle writes --------------------
+   Approving, rejecting, isolating, de-isolating, trial-running and closing are
+   SAFETY decisions. They must never be reported as done unless the server has
+   actually accepted them.
+
+   fsWrite above is deliberately optimistic — offline it resolves after 600ms so
+   a benign edit (a draft, an equipment description) queues and syncs later. For
+   a lifecycle change that is exactly wrong: the Issuer would be told "approved"
+   for a write still sitting in the local queue, which may yet be rejected by the
+   security rules, and nobody would ever learn.
+
+   A timeout that merely REJECTS would not fix it either: the queued mutation
+   still applies whenever the connection returns, so "not recorded" would become
+   its own lie. Firestore TRANSACTIONS are the honest primitive — they are never
+   queued, they require a server round trip, and they fail outright when one
+   cannot be made. That gives a true yes/no, and lets the same call re-read and
+   re-check its preconditions atomically with the write it is protecting.
+
+   navigator.onLine is deliberately NOT consulted: it only reports whether a
+   network interface exists, and returns true on a captive portal or a plant LAN
+   with no route to Firestore. The server's acknowledgement is the only truth. */
+
+// A precondition failed inside a transaction (the data changed under us). Its
+// message is written for the user and is shown as-is.
+class GateError extends Error {}
+function gate(msg) { throw new GateError(msg); }
+
+// True for the transport-level failures that mean "we never reached the server".
+function isUnreachable(e) {
+  const s = `${e?.code || ""} ${e?.message || ""}`.toLowerCase();
+  return /unavailable|deadline|network|offline|failed to get document because the client is offline/.test(s);
+}
+
+// Run a lifecycle change as a transaction. `action` names the change for the
+// failure message ("approval", "closure", …). Resolves only on a real commit;
+// otherwise throws an Error whose message is safe to show in a toast.
+async function lifecycleTx(action, fn) {
+  try {
+    return await runTransaction(db, fn);
+  } catch (e) {
+    if (e instanceof GateError) throw e;
+    if (isUnreachable(e)) throw new Error(`No connection — ${action} not recorded. Try again.`);
+    if (e?.code === "permission-denied") throw new Error(`Not permitted — ${action} not recorded.`);
+    throw e;
+  }
 }
 
 /* -------------------- People & roles -------------------- */
@@ -1383,17 +1430,32 @@ async function viewNewPermit(m) {
     const finalize = async () => {
       const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
       const validity = { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: editing?.validity?.extendedTo ?? null };
+      // Saving a DRAFT stays optimistic — it is the requester's own scratch copy,
+      // queueing it offline loses nothing and the app is meant to work in the
+      // plant. SUBMITTING is a lifecycle step: the Issuer has to actually receive
+      // it, so it must be acknowledged by the server or reported as failed.
+      const submitting = status === "submitted";
       try {
         if (editing) {
           // Update the existing draft in place. Identity / audit fields (permitNo,
           // requester, approval, createdAt…) are deliberately left untouched so the
           // write satisfies the security rules and the audit trail stays intact.
-          await fsWrite(updateDoc(doc(db, "permits", editing.id), {
+          const fields = {
             type: type.code, typeName: type.name, status,
             equipmentRef: eqId, equipmentTag: e.tag, line: e.line, area: e.area,
             requestingDepartment, workDescription: desc, location: $("#loc").value.trim(),
             validity, checklist, ppe, gasTest, isolationPoints, updatedAt: nowISO()
-          }));
+          };
+          const ref = doc(db, "permits", editing.id);
+          if (submitting) {
+            await lifecycleTx("submission", async (tx) => {
+              const snap = await tx.get(ref);
+              if (!snap.exists()) gate("This permit no longer exists.");
+              if (!["draft", "submitted"].includes(snap.data().status))
+                gate(`This permit is now ${STATUS_LABEL[snap.data().status] || snap.data().status} — it can no longer be edited.`);
+              tx.update(ref, fields);
+            });
+          } else await fsWrite(updateDoc(ref, fields));
           toast(status === "draft" ? "Draft updated" : "Permit submitted for approval", "ok");
           return go("detail", { id: editing.id });
         }
@@ -1412,9 +1474,13 @@ async function viewNewPermit(m) {
           sync: { createdOffline: !navigator.onLine },
           createdAt: nowISO(), updatedAt: nowISO()
         };
-        const ref = await fsWrite(addDoc(collection(db, "permits"), permit));
+        // addDoc cannot run inside a transaction, so mint the id up front and
+        // set() it — same result, and it lets a submission be transactional.
+        const newRef = doc(collection(db, "permits"));
+        if (submitting) await lifecycleTx("submission", async (tx) => { tx.set(newRef, permit); });
+        else await fsWrite(setDoc(newRef, permit));
         toast(status === "draft" ? "Draft saved" : "Permit submitted for approval", "ok");
-        go("detail", { id: ref.id });
+        go("detail", { id: newRef.id });
       } catch (err) { toast(err.message, "err"); }
     };
 
@@ -1587,29 +1653,63 @@ async function viewPermitDetail(m) {
     const [subPermits, subIsos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
     const block = equipmentBlock(p.equipmentRef, subPermits, subIsos, p.id);
     if (block) return toast(`${p.equipmentTag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
-    await fsWrite(updateDoc(doc(db, "permits", id), { status: "submitted", updatedAt: nowISO() })); toast("Submitted", "ok"); go("detail", { id });
+    try {
+      await lifecycleTx("submission", async (tx) => {
+        const ref = doc(db, "permits", id);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) gate("This permit no longer exists.");
+        if (snap.data().status !== "draft")
+          gate(`This permit is now ${STATUS_LABEL[snap.data().status] || snap.data().status} — it was not submitted again.`);
+        tx.update(ref, { status: "submitted", updatedAt: nowISO() });
+      });
+      toast("Submitted", "ok"); go("detail", { id });
+    } catch (e) { toast(e.message || "Could not submit the permit", "err"); }
   });
   $("#reject") && ($("#reject").onclick = () => {
     modal({ title: "Reject permit", body: `<label class="field"><span>Reason</span><textarea id="rr" placeholder="Why is this being rejected?"></textarea></label>`,
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Reject</button>` });
     $("[data-c]").onclick = closeModal;
     $("[data-ok]").onclick = async () => {
-      // Read the certificate (if any) first, then commit every change in one batch.
-      let isoX = null;
-      if (p.isolationRef) { const s = await getDoc(doc(db, "isolations", p.isolationRef)); if (s.exists()) isoX = s.data(); }
-      const batch = writeBatch(db);
-      batch.update(doc(db, "permits", id), { status: "rejected", rejection: { by: State.profile.id, byName: State.profile.name, ...myMeta(), reason: $("#rr").value.trim(), timestamp: nowISO() }, updatedAt: nowISO() });
-      if (isoX) {
-        const isoRef = doc(db, "isolations", p.isolationRef);
-        const remCount = (isoX.attachedPermitIds || []).filter((x) => x !== id).length;
-        if (remCount) batch.update(isoRef, { attachedPermitIds: arrayRemove(id) });
-        else if (isoX.status === "assigned") {
-          batch.update(isoRef, { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled — permit rejected before isolation" });
-          batch.update(doc(db, "equipment", p.equipmentRef), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-        } else batch.update(isoRef, { attachedPermitIds: [], status: "removalPending" });
-      }
-      await fsWrite(batch.commit());
-      closeModal(); toast("Permit rejected"); go("detail", { id }); refreshPendingBadge();
+      const reason = $("#rr").value.trim();
+      try {
+        // The certificate side effects here decide whether locks stay on, so the
+        // read and the write have to be one atomic unit: re-read the permit and
+        // its certificate inside the transaction rather than trusting the copy
+        // this page loaded.
+        await lifecycleTx("rejection", async (tx) => {
+          const pRef = doc(db, "permits", id);
+          const pSnap = await tx.get(pRef);
+          if (!pSnap.exists()) gate("This permit no longer exists.");
+          const cur = pSnap.data();
+          if (!["submitted", "awaitingIsolation"].includes(cur.status))
+            gate(`This permit is now ${STATUS_LABEL[cur.status] || cur.status} — it was not rejected.`);
+          const isoRef = cur.isolationRef ? doc(db, "isolations", cur.isolationRef) : null;
+          const iSnap = isoRef ? await tx.get(isoRef) : null;
+          const eqRef = cur.equipmentRef ? doc(db, "equipment", cur.equipmentRef) : null;
+          // Read the equipment before any write — a transaction may not read
+          // after it has written.
+          const eqSnap = eqRef && iSnap && iSnap.exists() ? await tx.get(eqRef) : null;
+
+          tx.update(pRef, { status: "rejected", rejection: { by: State.profile.id, byName: State.profile.name, ...myMeta(), reason, timestamp: nowISO() }, updatedAt: nowISO() });
+          if (iSnap && iSnap.exists()) {
+            const isoX = iSnap.data();
+            const remCount = (isoX.attachedPermitIds || []).filter((x) => x !== id).length;
+            if (remCount) tx.update(isoRef, { attachedPermitIds: arrayRemove(id) });
+            else if (isoX.status === "assigned") {
+              // Locks were never applied — cancel the certificate and free the
+              // equipment, but only if it still points at THIS certificate.
+              tx.update(isoRef, { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, removalNote: "Cancelled — permit rejected before isolation" });
+              if (eqSnap && eqSnap.exists() && eqSnap.data().activeIsolationId === cur.isolationRef)
+                tx.update(eqRef, { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+            } else if (isoX.status !== "removed") {
+              // Locks are physically ON with no permits left — an Isolator must
+              // still remove them, so the certificate goes to de-isolation.
+              tx.update(isoRef, { attachedPermitIds: [], status: "removalPending" });
+            }
+          }
+        });
+        closeModal(); toast("Permit rejected"); go("detail", { id }); refreshPendingBadge();
+      } catch (e) { toast(e.message || "Could not reject the permit", "err"); }
     };
   });
   $("#approve") && ($("#approve").onclick = () => approvePermit(p, equip));
@@ -1622,8 +1722,19 @@ async function viewPermitDetail(m) {
       const ne = $("#ne").value;
       if (!ne) return toast("Pick a new end date/time", "err");
       if (new Date(ne) <= new Date()) return toast("The new end must be in the future.", "err");
-      await fsWrite(updateDoc(doc(db, "permits", id), { status: "extended", "validity.extendedTo": ne, "validity.openEnded": false, updatedAt: nowISO() }));
-      closeModal(); toast("Permit extended", "ok"); go("detail", { id });
+      try {
+        await lifecycleTx("extension", async (tx) => {
+          const ref = doc(db, "permits", id);
+          const snap = await tx.get(ref);
+          if (!snap.exists()) gate("This permit no longer exists.");
+          // Extending a permit that has since been closed or rejected would put
+          // it back into a live state — refuse.
+          if (!["active", "extended"].includes(snap.data().status))
+            gate(`This permit is now ${STATUS_LABEL[snap.data().status] || snap.data().status} — it was not extended.`);
+          tx.update(ref, { status: "extended", "validity.extendedTo": ne, "validity.openEnded": false, updatedAt: nowISO() });
+        });
+        closeModal(); toast("Permit extended", "ok"); go("detail", { id });
+      } catch (e) { toast(e.message || "Could not extend the permit", "err"); }
     };
   });
   $("#workdone") && ($("#workdone").onclick = () => confirmWorkComplete(p, equip));
@@ -1776,10 +1887,21 @@ async function confirmWorkComplete(p, equip) {
     if (!remarks) return toast("Enter completion remarks", "err");
     if (!$("#wcAck").checked) return toast("Tick the confirmation statement", "err");
     try {
-      await fsWrite(updateDoc(doc(db, "permits", p.id), {
-        workCompletion: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, safeToReturn: true, timestamp: nowISO() },
-        updatedAt: nowISO()
-      }));
+      await lifecycleTx("work completion", async (tx) => {
+        const ref = doc(db, "permits", p.id);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) gate("This permit no longer exists.");
+        const cur = snap.data();
+        // Re-checked server-side: the permit may have been closed or rejected
+        // while this dialog was open, and work-complete must not resurrect it.
+        if (!["active", "extended"].includes(cur.status))
+          gate(`This permit is now ${STATUS_LABEL[cur.status] || cur.status} — work completion was not recorded.`);
+        if (cur.workCompletion) gate("Work completion has already been recorded for this permit.");
+        tx.update(ref, {
+          workCompletion: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, safeToReturn: true, timestamp: nowISO() },
+          updatedAt: nowISO()
+        });
+      });
       closeModal(); toast(isolated ? "Work complete — equipment can now be de-isolated" : "Work complete — Issuer can now close the permit", "ok"); go("detail", { id: p.id });
     } catch (e) { toast(e.message || "Could not confirm work completion", "err"); }
   };
@@ -1803,7 +1925,25 @@ async function closePermit(p, equip) {
      <label class="field"><span>Closure remarks</span><textarea id="crem" placeholder="Work complete, area cleared…"></textarea></label>`,
     "Close permit", async () => {
       const remarks = $("#crem")?.value.trim() || "";
-      await fsWrite(updateDoc(doc(db, "permits", p.id), { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() }));
+      await lifecycleTx("closure", async (tx) => {
+        const pRef = doc(db, "permits", p.id);
+        const pSnap = await tx.get(pRef);
+        if (!pSnap.exists()) gate("This permit no longer exists.");
+        const cur = pSnap.data();
+        if (!["active", "extended"].includes(cur.status))
+          gate(`This permit is now ${STATUS_LABEL[cur.status] || cur.status} — it was not closed again.`);
+        if (!cur.workCompletion) gate("The requester must confirm the work is complete before this permit can be closed.");
+        // The de-isolation gates above were checked before the dialog opened;
+        // re-check them here against the live certificate so a lockout that is
+        // still on (or back on for a trial) cannot be closed out from under.
+        if (cur.isolationRef) {
+          const iSnap = await tx.get(doc(db, "isolations", cur.isolationRef));
+          const st = iSnap.exists() ? iSnap.data().status : null;
+          if (st === "trialRun") gate("Re-isolate after the trial run before closing.");
+          if (st && st !== "removed") gate("An Isolator must de-isolate the equipment before this permit can be closed.");
+        }
+        tx.update(pRef, { status: "closed", closure: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks, timestamp: nowISO() }, updatedAt: nowISO() });
+      });
       closeModal(); toast("Permit closed", "ok"); go("detail", { id: p.id });
     });
 }
@@ -1823,11 +1963,29 @@ async function trialRun(p, equip) {
   $("[data-ok]").onclick = async () => {
     if (!($("#clr1").checked && $("#clr2").checked && $("#clr3").checked)) return toast("Confirm all three checks", "err");
     const tr = { requestedBy: State.profile.name, requestedAt: nowISO(), authorisedBy: State.profile.name, authorisedByMeta: myMeta(), authorisedAt: nowISO(), reIsolatedAt: null, status: "open" };
-    const batch = writeBatch(db);
-    batch.update(doc(db, "permits", p.id), { trialRuns: arrayUnion(tr), updatedAt: nowISO() });
-    if (isoRef) batch.update(isoRef, { status: "trialRun" });
-    if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
-    await fsWrite(batch.commit());
+    try {
+      // Energising equipment that crews may be working on is the highest-stakes
+      // write in the app — it must never be queued optimistically, and the
+      // certificate must still be the confirmed-active one we showed the dialog
+      // for (not already de-isolated, not already in another trial).
+      await lifecycleTx("trial run", async (tx) => {
+        const pRef = doc(db, "permits", p.id);
+        const pSnap = await tx.get(pRef);
+        if (!pSnap.exists()) gate("This permit no longer exists.");
+        if (!["active", "extended"].includes(pSnap.data().status))
+          gate(`This permit is now ${STATUS_LABEL[pSnap.data().status] || pSnap.data().status} — the trial run was not started.`);
+        if (isoRef) {
+          const iSnap = await tx.get(isoRef);
+          if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+          const st = iSnap.data().status;
+          if (st === "trialRun") gate("A trial run is already in progress on this certificate.");
+          if (st !== "active") gate(`The isolation is now ${STATUS_LABEL[st] || st} — the trial run was not started.`);
+        }
+        tx.update(pRef, { trialRuns: arrayUnion(tr), updatedAt: nowISO() });
+        if (isoRef) tx.update(isoRef, { status: "trialRun" });
+        if (equip) tx.update(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
+      });
+    } catch (e) { return toast(e.message || "Could not start the trial run", "err"); }
     closeModal(); toast("Trial run started — equipment energised", "");
     // offer re-isolate immediately
     setTimeout(() => offerReisolate(p, equip), 400);
@@ -1838,13 +1996,23 @@ function offerReisolate(p, equip) {
   confirmBoxHTML("Trial run in progress", `<div class="danger-box"><b>${esc(equip?.tag)} is ENERGISED.</b></div>
     <p>When the trial is complete, re-isolate to resume work, or close the permit if the job is done.</p>`,
     "Re-isolate now", async () => {
-      const snap = await getDoc(doc(db, "permits", p.id)); const pp = snap.data();
-      const trs = (pp.trialRuns || []).map((t, i, a) => i === a.length - 1 ? { ...t, reIsolatedAt: nowISO(), status: "closed" } : t);
-      const batch = writeBatch(db);
-      batch.update(doc(db, "permits", p.id), { trialRuns: trs, updatedAt: nowISO() });
-      if (p.isolationRef) batch.update(doc(db, "isolations", p.isolationRef), { status: "active" });
-      if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
-      await fsWrite(batch.commit());
+      await lifecycleTx("re-isolation", async (tx) => {
+        // Read the trial-run list inside the transaction: closing out the wrong
+        // entry (or one already closed by someone else) would leave the audit
+        // trail claiming the equipment is still energised, or vice versa.
+        const pRef = doc(db, "permits", p.id);
+        const snap = await tx.get(pRef);
+        if (!snap.exists()) gate("This permit no longer exists.");
+        const pp = snap.data();
+        const isoRef = p.isolationRef ? doc(db, "isolations", p.isolationRef) : null;
+        const iSnap = isoRef ? await tx.get(isoRef) : null;
+        if (iSnap && iSnap.exists() && iSnap.data().status !== "trialRun")
+          gate("This certificate is no longer in a trial run — nothing to re-isolate.");
+        const trs = (pp.trialRuns || []).map((t, i, a) => i === a.length - 1 ? { ...t, reIsolatedAt: nowISO(), status: "closed" } : t);
+        tx.update(pRef, { trialRuns: trs, updatedAt: nowISO() });
+        if (isoRef) tx.update(isoRef, { status: "active" });
+        if (equip) tx.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
+      });
       closeModal(); toast("Re-isolated — work may resume", "ok"); go("detail", { id: p.id });
     });
 }
@@ -2383,11 +2551,27 @@ async function viewIsolationDetail(m) {
       if (!$("#ckAll").checked) return toast("Tick the confirmation statement", "err");
       const pts = (iso.points || []).map((pt, i) => ({ ...pt, lockTag: $(`[data-lk="${i}"]`)?.value.trim() || pt.lockTag || "" }));
       try {
-        const batch = writeBatch(db);
-        batch.update(doc(db, "isolations", id), { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
-        if (equip) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
-        for (const p of attached) if (p.status === "awaitingIsolation") batch.update(doc(db, "permits", p.id), { status: "active", updatedAt: nowISO() });
-        await fsWrite(batch.commit());
+        await lifecycleTx("isolation confirmation", async (tx) => {
+          const isoRef = doc(db, "isolations", id);
+          const iSnap = await tx.get(isoRef);
+          if (!iSnap.exists()) gate("This certificate no longer exists.");
+          const cur = iSnap.data();
+          // Signing that locks are ON is the one-way step of the whole system —
+          // re-read it here so two Isolators cannot both sign the same one, and
+          // so a certificate cancelled meanwhile cannot be revived.
+          if (cur.status !== "assigned")
+            gate(`This certificate is now ${STATUS_LABEL[cur.status] || cur.status} — the isolation was not confirmed again.`);
+          // Read every attached permit before writing anything.
+          const attachedIds = cur.attachedPermitIds || [];
+          const pSnaps = await Promise.all(attachedIds.map((pid) => tx.get(doc(db, "permits", pid))));
+
+          tx.update(isoRef, { points: pts, status: "active", confirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, confirmedAt: nowISO() });
+          if (equip) tx.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
+          pSnaps.forEach((s, i) => {
+            if (s.exists() && s.data().status === "awaitingIsolation")
+              tx.update(doc(db, "permits", attachedIds[i]), { status: "active", updatedAt: nowISO() });
+          });
+        });
         closeModal(); toast("Isolation confirmed — waiting permits activated", "ok"); go("isodetail", { id });
       } catch (e) { toast(e.message || "Could not confirm isolation", "err"); }
     };
@@ -2396,22 +2580,48 @@ async function viewIsolationDetail(m) {
   if (canRemove) $("#rem").onclick = () => confirmBoxHTML("Confirm de-isolation",
     `<p>All locks and tags have been removed from <b>${esc(iso.equipmentTag)}</b>? The equipment returns to <b>Available</b>.</p>`,
     "Confirm de-isolation", async () => {
-      const batch = writeBatch(db);
-      batch.update(doc(db, "isolations", id), { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
-      // Only reset the equipment if THIS certificate is still its current one —
-      // never mark it Available out from under a newer certificate.
-      if (equip && equip.activeIsolationId === id) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-      await fsWrite(batch.commit());
+      await lifecycleTx("de-isolation", async (tx) => {
+        const isoRef = doc(db, "isolations", id);
+        const iSnap = await tx.get(isoRef);
+        if (!iSnap.exists()) gate("This certificate no longer exists.");
+        const cur = iSnap.data();
+        if (cur.status === "removed") gate("This certificate has already been de-isolated.");
+        if (cur.status === "trialRun") gate("The equipment is energised for a trial run — re-isolate before de-isolating.");
+        // Only reset the equipment if THIS certificate is still its current one —
+        // never mark it Available out from under a newer certificate. Re-read it
+        // inside the transaction so the check cannot be beaten by a stale page.
+        const eqRef = equip ? doc(db, "equipment", equip.id) : null;
+        const eqSnap = eqRef ? await tx.get(eqRef) : null;
+        tx.update(isoRef, { status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() } });
+        if (eqSnap && eqSnap.exists() && eqSnap.data().activeIsolationId === id)
+          tx.update(eqRef, { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      });
       closeModal(); toast("De-isolation confirmed — equipment available", "ok"); go("isodetail", { id });
     });
 
   if (canRelease) $("#release").onclick = () => confirmBoxHTML("Release isolation",
     `<p>This certificate has <b>no open permits</b>. Confirm all locks and tags are removed from <b>${esc(iso.equipmentTag)}</b> and return it to <b>Available</b>?</p>`,
     "Release isolation", async () => {
-      const batch = writeBatch(db);
-      batch.update(doc(db, "isolations", id), { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
-      if (equip && equip.activeIsolationId === id) batch.update(doc(db, "equipment", equip.id), { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
-      await fsWrite(batch.commit());
+      await lifecycleTx("release", async (tx) => {
+        const isoRef = doc(db, "isolations", id);
+        const iSnap = await tx.get(isoRef);
+        if (!iSnap.exists()) gate("This certificate no longer exists.");
+        const cur = iSnap.data();
+        if (cur.status !== "active") gate(`This certificate is now ${STATUS_LABEL[cur.status] || cur.status} — it was not released.`);
+        // "No open permits" is what makes releasing safe. A permit may have been
+        // approved onto this certificate while the dialog was open, so re-check
+        // every attachment server-side rather than trusting the loaded page.
+        const attachedIds = cur.attachedPermitIds || [];
+        const pSnaps = await Promise.all(attachedIds.map((pid) => tx.get(doc(db, "permits", pid))));
+        const stillOpen = pSnaps.filter((s) => s.exists() &&
+          ["draft", "submitted", "awaitingIsolation", "active", "extended"].includes(s.data().status)).length;
+        if (stillOpen) gate(`${stillOpen} permit(s) are now attached to this certificate — it can no longer be released.`);
+        const eqRef = equip ? doc(db, "equipment", equip.id) : null;
+        const eqSnap = eqRef ? await tx.get(eqRef) : null;
+        tx.update(isoRef, { attachedPermitIds: [], status: "removed", removedAt: nowISO(), removalConfirmedBy: { uid: me, name: State.profile.name, ...myMeta() }, removalNote: "Released by Issuer/Admin — no open permits" });
+        if (eqSnap && eqSnap.exists() && eqSnap.data().activeIsolationId === id)
+          tx.update(eqRef, { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      });
       closeModal(); toast("Isolation released — equipment available", "ok"); go("isodetail", { id });
     }, true);
 }
