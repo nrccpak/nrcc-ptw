@@ -143,6 +143,87 @@ const BLOCK_TEXT = {
   awaitingClosure: "an earlier permit is awaiting closure by the Issuer",
   awaitingDeisolation: "its lockout is in hand-back (de-isolation pending)",
 };
+
+/* -------------------- Equipment work cycle (NOT YET IN USE) --------------------
+   Groundwork only. Nothing below is called from any production path yet; it is
+   here so its agreement with the live gate can be measured before anything is
+   allowed to depend on it (tests/cycle-equivalence.mjs).
+
+   WHY THIS EXISTS. equipmentBlock() above answers "can new work start on this
+   equipment?" by scanning every permit and every certificate. Because that is a
+   QUERY, it can be neither wrapped in a Firestore transaction (transactions may
+   only get() named documents) nor expressed in security rules (which cannot
+   query either). So the rule lives solely in client JavaScript, is checked
+   before a dialog opens rather than atomically with the write, and cannot be
+   enforced against a stale or misbehaving client at all.
+
+   The fix is to make the same answer a property of ONE document — the equipment
+   record — maintained by each lifecycle transition. A single-document read can
+   sit inside the transaction that it guards, and can be enforced in rules.
+
+   `cycle` shape:
+     { v, state, open: { [permitId]: { s, c } }, certId, certState, seq }
+       state     "idle" | "working" | "handback"   — always derived, never set
+       open      one entry per LIVE permit on this equipment
+       s         "w" working | "d" crew has signed off work-complete
+       c         id of the lockout holding this permit, or null if none/removed
+       certId    the equipment's current certificate (mirrors activeIsolationId)
+       certState that certificate's status
+       seq       ++ per transition; drift detection once dual-writing begins  */
+
+// Derived availability. Order matters: the removalPending check must come first
+// because locks can be physically on with no permits left at all (rejecting the
+// last permit on a confirmed certificate leaves exactly that state).
+function computeCycleState(cycle) {
+  if (cycle.certState === "removalPending") return "handback";
+  const entries = Object.values(cycle.open || {});
+  if (!entries.length) return "idle";
+  // A crew signed off and is held by no lockout → the Issuer must close it.
+  if (entries.some((e) => e.s === "d" && !e.c)) return "handback";
+  // Every crew on the equipment's own lockout has signed off → de-isolation is
+  // due. Restricted to certId/`active` to mirror isoReadyForDeiso, which only
+  // treats a CONFIRMED certificate as ready (an assigned or trial-run one is
+  // not in hand-back).
+  if (cycle.certId && cycle.certState === "active") {
+    const onCert = entries.filter((e) => e.c === cycle.certId);
+    if (onCert.length && onCert.every((e) => e.s === "d")) return "handback";
+  }
+  return "working";
+}
+
+// Derive a complete cycle block for one equipment item from the raw
+// collections. This is the reference implementation: the backfill/repair tool
+// will use it, and the equivalence harness uses it as the oracle.
+//
+// PRECONDITION, measured not assumed (tests/cycle-equivalence.mjs, section 2):
+// no live permit may reference a certificate other than its equipment's current
+// one. A single-document model cannot see the status of a certificate the
+// equipment does not point at, so where such orphans exist this model is MORE
+// PERMISSIVE than the query gate — it allows work the current code blocks,
+// which is the wrong direction to be wrong in. Approval transactions (#36) stop
+// new orphans being created; any pre-existing ones must be found and resolved
+// before availability is allowed to be decided from `cycle`.
+function buildCycle(equip, permits, isolations) {
+  const isoById = isoIndex(isolations);
+  const open = {};
+  for (const p of permits) {
+    if (p.equipmentRef !== equip.id) continue;
+    if (!["submitted", "awaitingIsolation", "active", "extended"].includes(p.status)) continue;
+    const iso = p.isolationRef ? isoById.get(p.isolationRef) : null;
+    // Decoupled means the same thing as permitStage's `deisolated`: no lockout,
+    // or a lockout that has been removed. A reference to a certificate that no
+    // longer exists counts as STILL coupled — the locks are unaccounted for,
+    // which is not a reason to call the equipment free.
+    const c = !p.isolationRef ? null : (iso && iso.status === "removed") ? null : p.isolationRef;
+    const done = ["active", "extended"].includes(p.status) && !!p.workCompletion;
+    open[p.id] = { s: done ? "d" : "w", c };
+  }
+  const certId = equip.activeIsolationId || null;
+  const cert = certId ? isoById.get(certId) : null;
+  const cycle = { v: 1, open, certId, certState: cert ? cert.status : null, seq: 0 };
+  cycle.state = computeCycleState(cycle);
+  return cycle;
+}
 function blockBox(equipTag, block, isolations) {
   return `<div class="danger-box"><b>${esc(equipTag)} is not available for a new permit</b> — ${BLOCK_TEXT[block.kind]}. Every permit must be closed before new work can start on this equipment.
     <div class="attached-list" style="margin-top:.5rem">${block.permits.map((p) => `<div class="a"><span class="mono">${esc(p.permitNo)}</span> ${esc(p.typeName)} · ${esc(p.requester?.name || "")} ${badge(p.status)}${stageChip(permitStage(p, isolations))}</div>`).join("")}</div></div>`;
