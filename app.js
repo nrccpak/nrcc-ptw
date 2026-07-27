@@ -191,6 +191,105 @@ function computeCycleState(cycle) {
   return "working";
 }
 
+/* -------------------- Data audit --------------------
+   Read-only integrity check over the three collections. It exists because a
+   lockout that the equipment record does not point at is invisible to the
+   equipment: nothing derived from that one document can see it, so it cannot be
+   reported, cleaned up, or reasoned about by any single-document rule. The
+   approval transactions now stop new ones being created; this finds any that
+   were created before that, plus the neighbouring kinds of broken reference
+   that make a permit or a certificate impossible to resolve.
+
+   Pure so it can be tested (tests/data-audit.mjs). Reads nothing, writes
+   nothing — the caller supplies the collections. `equipment` MUST be the
+   unfiltered collection, archived items included: an archived record still
+   carries the pointer that a live certificate is checked against. */
+const AUDIT_LIVE_PERMIT = ["submitted", "awaitingIsolation", "active", "extended"];
+const AUDIT_LIVE_CERT = ["assigned", "active", "trialRun", "removalPending"];
+
+function auditData(permits, isolations, equipment) {
+  permits = permits || []; isolations = isolations || []; equipment = equipment || [];
+  const isoById = new Map(isolations.map((i) => [i.id, i]));
+  const eqById = new Map(equipment.map((e) => [e.id, e]));
+  const findings = [];
+  const add = (id, severity, title, why, items) => { if (items.length) findings.push({ id, severity, title, why, items }); };
+
+  // The Tier 3 precondition. A live permit held by a certificate that its
+  // equipment does not point at: the equipment cannot see that lockout, so a
+  // rule derived from the equipment alone would treat it as free.
+  add("orphanHeld", "critical",
+    "Live permit held by a certificate its equipment does not point at",
+    "The equipment record cannot see this lockout, so availability derived from the equipment would wrongly treat it as free. Close or de-isolate these, or correct the equipment's current certificate.",
+    permits.filter((p) => {
+      if (!AUDIT_LIVE_PERMIT.includes(p.status) || !p.isolationRef) return false;
+      const iso = isoById.get(p.isolationRef);
+      if (!iso || iso.status === "removed") return false;
+      const eq = eqById.get(p.equipmentRef);
+      return !!eq && (eq.activeIsolationId || null) !== p.isolationRef;
+    }).map((p) => ({ label: `${p.permitNo || p.id} — ${p.equipmentTag || p.equipmentRef}`,
+      note: `held by ${isoById.get(p.isolationRef)?.isoNo || p.isolationRef}, equipment points at ${eqById.get(p.equipmentRef)?.activeIsolationId ? (isoById.get(eqById.get(p.equipmentRef).activeIsolationId)?.isoNo || "another certificate") : "no certificate"}`,
+      view: "detail", id: p.id })));
+
+  // A certificate that believes it is live while its equipment has moved on.
+  // Locks may still be physically applied with nothing pointing at them.
+  add("orphanCert", "critical",
+    "Live certificate the equipment does not point at",
+    "Locks may still be applied with no equipment record referring to them. Confirm on site, then de-isolate or release the certificate.",
+    isolations.filter((i) => {
+      if (!AUDIT_LIVE_CERT.includes(i.status)) return false;
+      const eq = eqById.get(i.equipmentRef);
+      return !!eq && (eq.activeIsolationId || null) !== i.id;
+    }).map((i) => ({ label: `${i.isoNo || i.id} — ${i.equipmentTag || i.equipmentRef}`,
+      note: `certificate is ${STATUS_LABEL[i.status] || i.status}`, view: "isodetail", id: i.id })));
+
+  // Equipment pointing at a certificate that is gone or finished — it will read
+  // as isolated/pending forever and block new work with nothing to release.
+  add("stalePointer", "warning",
+    "Equipment pointing at a removed or missing certificate",
+    "The equipment will keep reading as isolated with no certificate to act on. Clearing the pointer returns it to service.",
+    equipment.filter((e) => {
+      if (!e.activeIsolationId) return false;
+      const iso = isoById.get(e.activeIsolationId);
+      return !iso || iso.status === "removed";
+    }).map((e) => ({ label: e.tag || e.id,
+      note: isoById.get(e.activeIsolationId) ? "certificate is removed" : "certificate does not exist",
+      view: "equipment" })));
+
+  // Isolation status and pointer telling different stories.
+  add("statusMismatch", "warning",
+    "Equipment isolation status disagrees with its certificate",
+    "Cosmetic in most views, but the status is what the equipment register and pickers show.",
+    equipment.filter((e) => {
+      const st = e.isolationStatus || "available";
+      const iso = e.activeIsolationId ? isoById.get(e.activeIsolationId) : null;
+      const live = iso && iso.status !== "removed";
+      return (st === "available") === !!live;
+    }).map((e) => ({ label: e.tag || e.id,
+      note: `status ${STATUS_LABEL[e.isolationStatus || "available"] || e.isolationStatus} but ${e.activeIsolationId ? "certificate " + (isoById.get(e.activeIsolationId) ? STATUS_LABEL[isoById.get(e.activeIsolationId).status] : "missing") : "no certificate"}`,
+      view: "equipment" })));
+
+  // Broken references — these make a record impossible to resolve at all.
+  add("danglingIso", "warning",
+    "Permit referencing a certificate that does not exist",
+    "The permit's hand-back stage cannot be derived, so it may never become closable.",
+    permits.filter((p) => p.isolationRef && !isoById.has(p.isolationRef))
+      .map((p) => ({ label: p.permitNo || p.id, note: `missing certificate ${p.isolationRef}`, view: "detail", id: p.id })));
+
+  add("danglingEquip", "warning",
+    "Permit referencing equipment that does not exist",
+    "Approval cannot create a certificate for this permit — the equipment record it needs is gone.",
+    permits.filter((p) => p.equipmentRef && !eqById.has(p.equipmentRef))
+      .map((p) => ({ label: p.permitNo || p.id, note: `missing equipment ${p.equipmentTag || p.equipmentRef}`, view: "detail", id: p.id })));
+
+  add("certNoEquip", "warning",
+    "Certificate referencing equipment that does not exist",
+    "The certificate cannot be de-isolated normally, because de-isolation resets the equipment record.",
+    isolations.filter((i) => AUDIT_LIVE_CERT.includes(i.status) && i.equipmentRef && !eqById.has(i.equipmentRef))
+      .map((i) => ({ label: i.isoNo || i.id, note: `missing equipment ${i.equipmentTag || i.equipmentRef}`, view: "isodetail", id: i.id })));
+
+  return findings;
+}
+
 // Derive a complete cycle block for one equipment item from the raw
 // collections. This is the reference implementation: the backfill/repair tool
 // will use it, and the equivalence harness uses it as the oracle.
@@ -2603,6 +2702,11 @@ async function viewAdmin(m) {
       <div class="section-title">Job Titles (one per line — order is preserved; used in sign-up and user management)</div>
       <textarea id="cTitles" rows="6">${esc(jobTitles().join("\n"))}</textarea>
       <div style="margin-top:1rem;text-align:right"><button class="btn btn-accent" id="saveCfg">Save configuration</button></div>
+    </div>
+    <div class="card"><h3>Data audit</h3>
+      <div class="csub">Read-only check for permits, certificates and equipment that reference each other inconsistently — most importantly a lockout that its equipment record does not point at, which nothing derived from the equipment can see. Changes nothing.</div>
+      <div style="margin-top:1rem"><button class="btn btn-ghost" id="runAudit">Run data audit</button></div>
+      <div id="auditOut"></div>
     </div>`;
   // users
   const users = await fetchAll("users");
@@ -2648,6 +2752,47 @@ async function viewAdmin(m) {
       State.config = { ...State.config, lines, areas, ppeList, departments, jobTitles: jobTitlesList };
       toast("Configuration saved", "ok");
     } catch (e) { toast(e.message, "err"); }
+  };
+
+  $("#runAudit").onclick = async () => {
+    const out = $("#auditOut");
+    out.innerHTML = `<div class="help" style="margin-top:1rem">Reading all permits, certificates and equipment…</div>`;
+    try {
+      // Fresh from the server — an audit that reports on a cached copy is
+      // worthless. Equipment unfiltered: an ARCHIVED record still holds the
+      // pointer a live certificate has to be checked against, and fetchEquipment
+      // hides those.
+      const [permits, isolations, equipment] = await Promise.all([
+        fetchAll("permits", { fresh: true }),
+        fetchAll("isolations", { fresh: true }),
+        fetchAll("equipment", { fresh: true })
+      ]);
+      const findings = auditData(permits, isolations, equipment);
+      const critical = findings.filter((f) => f.severity === "critical");
+      const scanned = `<div class="help" style="margin-top:.8rem">Checked ${permits.length} permit(s), ${isolations.length} certificate(s), ${equipment.length} equipment record(s).</div>`;
+      if (!findings.length) {
+        out.innerHTML = `<div class="ok-box" style="margin-top:1rem"><b>No inconsistencies found.</b> Every live permit and certificate is accounted for by its equipment record.</div>${scanned}`;
+        return;
+      }
+      out.innerHTML = findings.map((f) => `
+        <div class="${f.severity === "critical" ? "danger-box" : "warn-box"}" style="margin-top:1rem">
+          <b>${esc(f.title)} — ${f.items.length}</b>
+          <div style="margin:.3rem 0 .5rem">${esc(f.why)}</div>
+          <div class="attached-list">${f.items.slice(0, 25).map((it) => `<div class="a">
+            ${it.view && it.id ? `<a href="#" data-goto="${esc(it.view)}" data-gid="${esc(it.id)}"><span class="mono">${esc(it.label)}</span></a>` : `<span class="mono">${esc(it.label)}</span>`}
+            <span style="color:var(--muted)">— ${esc(it.note)}</span></div>`).join("")}
+            ${f.items.length > 25 ? `<div class="a"><span style="color:var(--muted)">…and ${f.items.length - 25} more</span></div>` : ""}
+          </div>
+        </div>`).join("") +
+        (critical.length
+          ? `<div class="danger-box" style="margin-top:1rem"><b>${critical.length} critical finding type(s).</b> These are the cases where a lockout exists that its equipment record cannot see. Resolve them before availability is decided from the equipment record alone.</div>`
+          : `<div class="info-box" style="margin-top:1rem">No critical findings — every live lockout is visible from its equipment record.</div>`) + scanned;
+      out.querySelectorAll("[data-goto]").forEach((a) => a.onclick = (e) => {
+        e.preventDefault(); go(a.dataset.goto, { id: a.dataset.gid });
+      });
+    } catch (e) {
+      out.innerHTML = `<div class="danger-box" style="margin-top:1rem">Could not run the audit: ${esc(e.message || String(e))}</div>`;
+    }
   };
 }
 
