@@ -72,6 +72,14 @@ function fmt(iso) {
 }
 function fmtDate(iso) { if (!iso) return "—"; const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleDateString([], { year: "numeric", month: "short", day: "2-digit" }); }
 function initials(name) { return (name || "?").split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase(); }
+// Coalesce bursts of calls into one. Used on free-text search boxes: each
+// keystroke otherwise refilters the whole list and rebuilds the entire table,
+// so typing an 8-character tag redrew it eight times. Dropdowns are NOT
+// debounced — a single discrete choice should apply immediately.
+function debounce(fn, ms = 150) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
 // Planned end of a permit (an explicit extension wins; open-ended never expires).
 function permitEnd(p) { return p?.validity?.openEnded ? null : (p?.validity?.extendedTo || p?.validity?.plannedEnd || null); }
 // A still-live permit whose planned end has passed is "overdue". We never change
@@ -1059,7 +1067,8 @@ async function viewPermits(m) {
       || `<tr><td colspan="7" class="empty">No permits match.</td></tr>`}</tbody></table>`;
     bindPermitRows();
   };
-  ["q", "fType", "fStatus", "fDept"].forEach((id) => $("#" + id).addEventListener("input", draw));
+  $("#q").addEventListener("input", debounce(draw));
+  ["fType", "fStatus", "fDept"].forEach((id) => $("#" + id).addEventListener("input", draw));
   $("#fMine").addEventListener("change", draw);
   draw();
 }
@@ -1204,7 +1213,7 @@ async function viewNewPermit(m) {
     $("#dept").onchange = fillSub; fillSub();
     // equipment search
     const eqSearch = $("#eqSearch"), eqResults = $("#eqResults");
-    eqSearch.addEventListener("input", () => {
+    eqSearch.addEventListener("input", debounce(() => {
       const q = eqSearch.value.toLowerCase().trim();
       if (!q) { eqResults.innerHTML = ""; return; }
       // Tag-first ranking: exact tag > tag starts-with > tag contains >
@@ -1227,7 +1236,7 @@ async function viewNewPermit(m) {
         : `<div class="help">No match. ${["issuer", "admin"].includes(State.profile.role) ? '<a href="#" id="quickAdd">Add new equipment</a>' : "Ask an Issuer/Admin to add this equipment."}</div>`;
       $$("[data-eq]").forEach((d) => d.onclick = () => chooseEq(equip.find((e) => e.id === d.dataset.eq)));
       const qa = $("#quickAdd"); if (qa) qa.onclick = (e) => { e.preventDefault(); openAddEquipment(equip, (added) => { equip.push(added); chooseEq(added); }); };
-    });
+    }));
     async function chooseEq(e) {
       // Cycle-based availability gate: equipment whose current work cycle is in
       // hand-back (or with earlier permits left unclosed) cannot be selected.
@@ -1893,7 +1902,8 @@ async function viewEquipment(m) {
     });
   };
   if (State.params.status) $("#fStatus").value = State.params.status;
-  ["q", "fLine", "fArea", "fStatus"].forEach((id) => $("#" + id).addEventListener("input", draw));
+  $("#q").addEventListener("input", debounce(draw));
+  ["fLine", "fArea", "fStatus"].forEach((id) => $("#" + id).addEventListener("input", draw));
   draw();
   if (isIssuer) {
     $("#add").onclick = () => openAddEquipment(equip, (added) => { equip.push(added); draw(); });
@@ -2270,7 +2280,8 @@ async function viewIsolations(m) {
       || `<tr><td colspan="6" class="empty">No certificates yet — they are created when isolation permits are approved.</td></tr>`}</tbody></table>`;
     $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
   };
-  ["q", "fs"].forEach((id) => $("#" + id).addEventListener("input", draw));
+  $("#q").addEventListener("input", debounce(draw));
+  $("#fs").addEventListener("input", draw);
   draw();
 }
 
