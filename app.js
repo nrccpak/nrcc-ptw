@@ -458,7 +458,8 @@ const ICON = {
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>',
   pdf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
-  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>'
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>',
+  doccheck: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="m8.5 14.5 2 2 4-4"/></svg>'
 };
 
 // Relative "time ago" for the notifications panel.
@@ -1337,13 +1338,22 @@ async function viewDashboard(m) {
   const isolated = equip.filter((e) => e.isolationStatus === "isolated" || e.isolationStatus === "trialRun");
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
   const overdue = (isIssuer ? permits : mine).filter(isOverdue);
+  const isoMap = isoIndex(isoAll);
+  // The other half of the Issuer's queue. A permit whose crew has signed off
+  // and whose lockout (if any) is already removed needs nothing but closure —
+  // but the permit sits in "active" until then, so it used to be reachable
+  // only by searching the register. Surfaced here exactly like approvals.
+  const awaitingClosure = isIssuer ? active.filter((p) => permitStage(p, isoMap) === "awaitingClosure") : [];
 
   // Each tile is a shortcut into a pre-filtered list. `nav` = {view, params};
   // omit it (as the empty banner does) to render a plain, non-clickable tile.
   const stat = (num, lab, ic, nav) => `<div class="stat${nav ? " stat-link" : ""}"${nav ? ` role="button" tabindex="0" data-nav='${esc(JSON.stringify(nav))}' aria-label="${esc(lab)}: ${num}. View list"` : ""}><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
-  let html = `<div class="cols cols-4" style="margin-bottom:1.2rem">
+  // Five tiles for an Issuer, four for everyone else — the row is auto-fit
+  // (see .stat-grid) so the extra tile stays on the same line.
+  let html = `<div class="cols stat-grid" style="margin-bottom:1.2rem">
     ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
     ${stat(isIssuer ? pending.length : mine.filter((p) => p.status === "submitted").length, isIssuer ? "Awaiting your approval" : "My submitted", ICON.newdoc, isIssuer ? { view: "permits", params: { status: "submitted" } } : { view: "permits", params: { status: "submitted", mine: true } })}
+    ${isIssuer ? stat(awaitingClosure.length, "Awaiting your closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } }) : ""}
     ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
     ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
@@ -1360,7 +1370,6 @@ async function viewDashboard(m) {
   // Work it out once per certificate against a single grouped index rather than
   // re-scanning every permit for each certificate, twice over.
   const byIso = permitsByIso(permits);
-  const isoMap = isoIndex(isoAll);
   const readyForDeiso = new Set(isoAll.filter((i) => isoReadyForDeiso(i, permits, byIso)).map((i) => i.id));
   const tasks = isoAll.filter((i) =>
     (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
@@ -1379,6 +1388,19 @@ async function viewDashboard(m) {
     html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Awaiting approval</h3></div>
       <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Requester</th><th></th></tr></thead><tbody>
       ${pending.map((p) => permitRow(p)).join("")}</tbody></table></div>`;
+  }
+  if (awaitingClosure.length) {
+    // Work-complete time is the useful column here (how long the permit has
+    // been sitting on the Issuer's desk); an overdue one is the most urgent.
+    html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Awaiting closure</h3></div>
+      <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Work complete</th><th>Requester</th></tr></thead><tbody>
+      ${awaitingClosure.map((p) => `<tr class="row" data-pid="${p.id}">
+        <td><span class="mono">${esc(p.permitNo)}</span>${isOverdue(p) ? " " + overdueChip() : ""}</td>
+        <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName || p.type)}</span></td>
+        <td>${esc(p.equipmentTag || "—")}</td>
+        <td>${fmt(p.workCompletion?.timestamp)}</td>
+        <td>${esc(p.requester?.name || "—")}</td></tr>`).join("")}
+      </tbody></table></div>`;
   }
   html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My recent permits"}</h3></div>
     <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th></tr></thead><tbody>
