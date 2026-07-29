@@ -1321,6 +1321,53 @@ async function refreshPendingBadge(known) {
   } catch {}
 }
 
+/* -------------------- Queue attention --------------------
+   The KPI row is five identical white cards, so the two tiles that mean "you
+   have work" read no differently from the three that are background numbers.
+   These helpers give the actionable two a state: calm while the queue is
+   empty, amber once something is waiting, red once the oldest item has waited
+   longer than QUEUE_ALERT_HRS.
+
+   Age, not count, is what deserves the escalation. "3 awaiting closure" does
+   not say whether that is three from ten minutes ago or one that has held a
+   machine locked out since yesterday — and the second is the safety problem,
+   because equipment awaiting closure is blocked for new work (equipmentBlock).
+
+   One threshold rather than a ladder of shades: the question is "is anything
+   sitting too long?", and intermediate colours only blur the answer. The calm
+   state matters as much as the loud one — a tile that is permanently amber
+   stops being read within a week, and then the real backlog goes unnoticed. */
+const QUEUE_ALERT_HRS = 8;
+
+// Compact age for the tile sub-line: "40 min", "6 h", "2 d".
+function ageText(iso) {
+  const t = Date.parse(iso);
+  if (isNaN(t)) return "";
+  const m = Math.max(0, Math.floor((Date.now() - t) / 60000));
+  if (m < 60) return m <= 1 ? "just now" : m + " min";
+  const h = Math.floor(m / 60);
+  return h < 24 ? h + " h" : Math.floor(h / 24) + " d";
+}
+const laterOf = (a, b) => {
+  const ta = Date.parse(a), tb = Date.parse(b);
+  if (isNaN(ta)) return b;
+  if (isNaN(tb)) return a;
+  return tb > ta ? b : a;
+};
+// `since` maps an item to the moment it started waiting on THIS person — never
+// simply createdAt, because a permit raised last week but approved an hour ago
+// has not been awaiting closure for a week. See each caller for its own rule.
+function queueState(items, since) {
+  if (!items.length) return { tone: "calm" };
+  const times = items.map((i) => Date.parse(since(i))).filter((t) => !isNaN(t));
+  if (!times.length) return { tone: "warn" };       // waiting, but undatable
+  const oldest = Math.min(...times);
+  return {
+    tone: Date.now() - oldest >= QUEUE_ALERT_HRS * 3600000 ? "alert" : "warn",
+    oldest: new Date(oldest).toISOString()
+  };
+}
+
 /* -------------------- 5a. Dashboard -------------------- */
 async function viewDashboard(m) {
   m.innerHTML = `<div class="page-head"><div><div class="kick">Overview</div><h2>Welcome, ${esc(State.profile.name.split(" ")[0])}</h2></div>
@@ -1368,26 +1415,64 @@ async function viewDashboard(m) {
   // signed off (the far more common route, and one with no stored status).
   const pendingIso = isIso ? isoAll.filter((i) => i.status === "assigned") : [];
   const pendingDeiso = isIso ? isoAll.filter((i) => i.status === "removalPending" || readyForDeiso.has(i.id)) : [];
+  // When the last crew on a certificate signed off — i.e. when its locks
+  // became removable. Stored timestamps are UTC ISO, so they sort as text.
+  const lastSignOff = (ps) => (ps || []).map((p) => p.workCompletion?.timestamp).filter(Boolean).sort().pop();
 
   // Each tile is a shortcut into a pre-filtered list. `nav` = {view, params};
   // omit it (as the empty banner does) to render a plain, non-clickable tile.
-  const stat = (num, lab, ic, nav) => `<div class="stat${nav ? " stat-link" : ""}"${nav ? ` role="button" tabindex="0" data-nav='${esc(JSON.stringify(nav))}' aria-label="${esc(lab)}: ${num}. View list"` : ""}><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
-  // Tiles two and three are "what is waiting for me", and what that means
-  // depends on the role: an Issuer approves then closes, an Isolator applies
-  // locks then removes them. A Requester has only one such queue — the permits
-  // they have sent for approval — so their row is four tiles, not five.
+  // `q` is a queueState(): pass it only for a tile the viewer can act on —
+  // that is what earns the colour, the age line and the urgent wording, and
+  // withholding it everywhere else is what keeps the colour meaningful.
+  const stat = (num, lab, ic, nav, q) => {
+    // Colour is never the only signal: the sub-line says the same thing in
+    // words for anyone who cannot rely on it, and so does the aria-label.
+    const age = q && q.oldest ? ageText(q.oldest) : "";
+    const sub = !q ? ""
+      : q.tone === "calm" ? `<div class="sub">Nothing waiting</div>`
+      : `<div class="sub">${age ? `oldest ${esc(age)}` : "waiting"}${q.tone === "alert" ? " · needs attention" : ""}</div>`;
+    const say = !q ? "" : q.tone === "calm" ? ", nothing waiting"
+      : q.tone === "alert" ? `, oldest waiting ${age} — needs attention` : `, oldest waiting ${age}`;
+    const cls = `stat${nav ? " stat-link" : ""}${q ? " stat-q stat-" + q.tone : ""}`;
+    return `<div class="${cls}"${nav ? ` role="button" tabindex="0" data-nav='${esc(JSON.stringify(nav))}' aria-label="${esc(lab)}: ${num}${esc(say)}. View list"` : ""}><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div>${sub}</div>`;
+  };
+  // What is waiting for me, in the terms of the role holding the screen: an
+  // Issuer approves then closes, an Isolator applies locks then removes them.
+  //
+  // These lead the row. The eye lands top-left first, and that position used
+  // to hold "Active permits" — a number nobody acts on — which left the only
+  // two tiles anyone has to act on sitting mid-row, styled identically to the
+  // background counts either side of them.
+  //
+  // A Requester has no such queue: "My submitted" is waiting on somebody else,
+  // so it takes neither the colour nor the front of the row. Amber on a tile
+  // you cannot action is just noise, and it would spend the alarm.
   const queueTiles = isIssuer
-    ? stat(pending.length, "Awaiting your approval", ICON.newdoc, { view: "permits", params: { status: "submitted" } }) +
-      stat(awaitingClosure.length, "Awaiting your closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } })
+    // A permit sitting in "submitted" is not written to again until someone
+    // approves or rejects it, so updatedAt is the moment it was submitted.
+    ? stat(pending.length, "Awaiting your approval", ICON.newdoc, { view: "permits", params: { status: "submitted" } },
+        queueState(pending, (p) => p.updatedAt || p.createdAt)) +
+      // Closable from the later of the two sign-offs it waits on: the crew
+      // confirming the work is finished, and the locks actually coming off.
+      stat(awaitingClosure.length, "Awaiting your closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } },
+        queueState(awaitingClosure, (p) => laterOf(p.workCompletion?.timestamp, p.isolationRef ? isoMap.get(p.isolationRef)?.removedAt : null)))
     : isIso
-    ? stat(pendingIso.length, "Pending isolation", ICON.lockplus, { view: "isolations", params: { status: "assigned" } }) +
-      stat(pendingDeiso.length, "Pending de-isolation", ICON.unlock, { view: "isolations", params: { status: "pendingDeiso" } })
+    ? stat(pendingIso.length, "Pending isolation", ICON.lockplus, { view: "isolations", params: { status: "assigned" } },
+        queueState(pendingIso, (i) => i.assignedAt || i.createdAt)) +
+      // Two ways into this queue, so two clocks: an explicit hand-back
+      // assignment, or — the common route — the last crew signing off, which
+      // is the moment the locks became removable.
+      stat(pendingDeiso.length, "Pending de-isolation", ICON.unlock, { view: "isolations", params: { status: "pendingDeiso" } },
+        queueState(pendingDeiso, (i) => i.status === "removalPending"
+          ? (i.removalAssignedAt || i.updatedAt || i.createdAt)
+          : lastSignOff(byIso.get(i.id))))
     : stat(mine.filter((p) => p.status === "submitted").length, "My submitted", ICON.newdoc, { view: "permits", params: { status: "submitted", mine: true } });
   // Five tiles for an Issuer or Isolator, four for everyone else — the row is
   // auto-fit (see .stat-grid) so the extra tile stays on the same line.
   let html = `<div class="cols stat-grid" style="margin-bottom:1.2rem">
+    ${isIssuer || isIso ? queueTiles : ""}
     ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
-    ${queueTiles}
+    ${isIssuer || isIso ? "" : queueTiles}
     ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
     ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;

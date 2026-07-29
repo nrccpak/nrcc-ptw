@@ -149,6 +149,22 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
   display:grid;place-items:center;background:var(--steel-soft)}
 .stat .ic svg{width:18px;height:18px;color:var(--steel)}
 /* Clickable KPI tiles: hint interactivity on hover/focus and lift slightly. */
+/* Queue tiles — the ones that mean "you have work". Only these ever take
+   colour, and only while something is actually waiting, so that an amber tile
+   still registers as news. The accent is an inset bar rather than a border so
+   a tile changing state never shifts the row by a pixel. */
+.stat-q .sub{font-size:.72rem;font-weight:700;color:var(--muted);margin-top:.3rem;letter-spacing:.01em}
+.stat-q::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:transparent}
+.stat-calm .num{color:var(--muted)}
+.stat-warn{background:linear-gradient(100deg,var(--amber-soft) 0%,var(--card) 62%)}
+.stat-warn::before{background:var(--amber)}
+.stat-warn .ic{background:var(--amber-soft)}
+.stat-warn .ic svg{color:var(--amber-d)}
+.stat-alert{background:linear-gradient(100deg,var(--red-soft) 0%,var(--card) 62%);border-color:#F0C9C9}
+.stat-alert::before{background:var(--red)}
+.stat-alert .ic{background:var(--red-soft)}
+.stat-alert .ic svg{color:var(--red)}
+.stat-alert .num,.stat-alert .sub{color:#9b2c2c}
 .stat-link{cursor:pointer;transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease}
 .stat-link:hover,.stat-link:focus-visible{transform:translateY(-2px);box-shadow:var(--shadow-md,0 6px 18px rgba(15,23,42,.12));border-color:var(--steel);outline:none}
 .stat-link:focus-visible{box-shadow:0 0 0 3px var(--steel-soft)}
