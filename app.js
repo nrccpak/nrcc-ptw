@@ -459,7 +459,11 @@ const ICON = {
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>',
   pdf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>',
-  doccheck: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="m8.5 14.5 2 2 4-4"/></svg>'
+  doccheck: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="m8.5 14.5 2 2 4-4"/></svg>',
+  // Locks to apply (closed shackle, plus) and locks to remove (open shackle) —
+  // deliberately a family with ICON.lock, which marks equipment already isolated.
+  lockplus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/><path d="M12 14v4M10 16h4"/></svg>',
+  unlock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>'
 };
 
 // Relative "time ago" for the notifications panel.
@@ -1345,19 +1349,6 @@ async function viewDashboard(m) {
   // only by searching the register. Surfaced here exactly like approvals.
   const awaitingClosure = isIssuer ? active.filter((p) => permitStage(p, isoMap) === "awaitingClosure") : [];
 
-  // Each tile is a shortcut into a pre-filtered list. `nav` = {view, params};
-  // omit it (as the empty banner does) to render a plain, non-clickable tile.
-  const stat = (num, lab, ic, nav) => `<div class="stat${nav ? " stat-link" : ""}"${nav ? ` role="button" tabindex="0" data-nav='${esc(JSON.stringify(nav))}' aria-label="${esc(lab)}: ${num}. View list"` : ""}><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
-  // Five tiles for an Issuer, four for everyone else — the row is auto-fit
-  // (see .stat-grid) so the extra tile stays on the same line.
-  let html = `<div class="cols stat-grid" style="margin-bottom:1.2rem">
-    ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
-    ${stat(isIssuer ? pending.length : mine.filter((p) => p.status === "submitted").length, isIssuer ? "Awaiting your approval" : "My submitted", ICON.newdoc, isIssuer ? { view: "permits", params: { status: "submitted" } } : { view: "permits", params: { status: "submitted", mine: true } })}
-    ${isIssuer ? stat(awaitingClosure.length, "Awaiting your closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } }) : ""}
-    ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
-    ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
-  if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
-
   const me = State.profile.id;
   const isAdmin = State.profile.role === "admin";
   // Any Isolator sees all open isolation / de-isolation tasks (not just ones
@@ -1366,11 +1357,41 @@ async function viewDashboard(m) {
   // De-isolation is a physical lockout job, so it is an Isolator task only —
   // the Issuer does NOT de-isolate (Admin is kept as a system superuser).
   const isIso = State.profile.role === "isolator";
-  // Readiness is needed twice below (to pick the tasks, then to label each row).
-  // Work it out once per certificate against a single grouped index rather than
-  // re-scanning every permit for each certificate, twice over.
+  // Readiness is needed three times below (the de-isolation tile, picking the
+  // tasks, then labelling each row). Work it out once per certificate against
+  // a single grouped index rather than re-scanning every permit each time.
   const byIso = permitsByIso(permits);
   const readyForDeiso = new Set(isoAll.filter((i) => isoReadyForDeiso(i, permits, byIso)).map((i) => i.id));
+  // The Isolator's two queues, counted exactly as the task table below picks
+  // its rows: locks to apply, then locks to remove — where "to remove" covers
+  // both an explicit removalPending and a certificate whose crews have all
+  // signed off (the far more common route, and one with no stored status).
+  const pendingIso = isIso ? isoAll.filter((i) => i.status === "assigned") : [];
+  const pendingDeiso = isIso ? isoAll.filter((i) => i.status === "removalPending" || readyForDeiso.has(i.id)) : [];
+
+  // Each tile is a shortcut into a pre-filtered list. `nav` = {view, params};
+  // omit it (as the empty banner does) to render a plain, non-clickable tile.
+  const stat = (num, lab, ic, nav) => `<div class="stat${nav ? " stat-link" : ""}"${nav ? ` role="button" tabindex="0" data-nav='${esc(JSON.stringify(nav))}' aria-label="${esc(lab)}: ${num}. View list"` : ""}><div class="ic">${ic}</div><div class="num">${num}</div><div class="lab">${lab}</div></div>`;
+  // Tiles two and three are "what is waiting for me", and what that means
+  // depends on the role: an Issuer approves then closes, an Isolator applies
+  // locks then removes them. A Requester has only one such queue — the permits
+  // they have sent for approval — so their row is four tiles, not five.
+  const queueTiles = isIssuer
+    ? stat(pending.length, "Awaiting your approval", ICON.newdoc, { view: "permits", params: { status: "submitted" } }) +
+      stat(awaitingClosure.length, "Awaiting your closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } })
+    : isIso
+    ? stat(pendingIso.length, "Pending isolation", ICON.lockplus, { view: "isolations", params: { status: "assigned" } }) +
+      stat(pendingDeiso.length, "Pending de-isolation", ICON.unlock, { view: "isolations", params: { status: "pendingDeiso" } })
+    : stat(mine.filter((p) => p.status === "submitted").length, "My submitted", ICON.newdoc, { view: "permits", params: { status: "submitted", mine: true } });
+  // Five tiles for an Issuer or Isolator, four for everyone else — the row is
+  // auto-fit (see .stat-grid) so the extra tile stays on the same line.
+  let html = `<div class="cols stat-grid" style="margin-bottom:1.2rem">
+    ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
+    ${queueTiles}
+    ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
+    ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
+  if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
+
   const tasks = isoAll.filter((i) =>
     (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
     (i.status === "removalPending" && (isIso || isAdmin || i.removalAssignedTo?.uid === me)) ||
@@ -2960,19 +2981,36 @@ async function viewIsolations(m) {
   m.innerHTML = `<div class="page-head"><div><div class="kick">Records</div><h2>Isolation Certificates</h2></div></div>
     ${tabsHtml("i")}
     <div class="filters"><input class="search" id="q" placeholder="Search certificate no or equipment…">
-      <select id="fs"><option value="">All statuses</option>${["assigned", "active", "trialRun", "removalPending", "removed"].map((s) => `<option>${s}</option>`).join("")}</select></div>
+      <select id="fs"><option value="">All statuses</option>
+        <option value="pendingDeiso">pending de-isolation</option>
+        ${["assigned", "active", "trialRun", "removalPending", "removed"].map((s) => `<option>${s}</option>`).join("")}</select></div>
     <div class="card pad0" id="itable">Loading…</div>`;
   bindTabs();
+  if (State.params.status) $("#fs").value = State.params.status;   // arrived from a dashboard tile
   const token = LiveView.token;
-  let all = await fetchIsolations();
+  // Permits are needed only to derive readiness for de-isolation — a
+  // certificate whose crews have all signed off carries no status of its own
+  // saying so — but that derivation is what the Isolator's queue is, so load
+  // them alongside the certificates rather than after.
+  let [all, permits] = await Promise.all([fetchIsolations(), fetchPermits().catch(() => [])]);
+  // Readiness depends only on the loaded data, so compute it per load, not per
+  // keystroke: draw() runs on every filter change and search character.
+  let ready = new Set();
+  const index = () => {
+    const byIso = permitsByIso(permits);
+    ready = new Set(all.filter((i) => isoReadyForDeiso(i, permits, byIso)).map((i) => i.id));
+  };
+  index();
   const draw = () => {
     const q = $("#q").value.toLowerCase(), fs = $("#fs").value;
-    const rows = all.filter((i) => (!fs || i.status === fs) && (!q || ((i.isoNo || "") + " " + i.equipmentTag).toLowerCase().includes(q)));
+    const rows = all.filter((i) =>
+      (!fs || (fs === "pendingDeiso" ? i.status === "removalPending" || ready.has(i.id) : i.status === fs)) &&
+      (!q || ((i.isoNo || "") + " " + i.equipmentTag).toLowerCase().includes(q)));
     $("#itable").innerHTML = `<table class="tbl"><thead><tr><th>Certificate</th><th>Equipment</th><th>Status</th><th>Assigned to</th><th>Permits</th><th>Created</th></tr></thead><tbody>
-      ${rows.map((i) => `<tr class="row" data-iid="${i.id}">
+      ${rows.map((i) => { const deiso = i.status === "removalPending" || ready.has(i.id); return `<tr class="row" data-iid="${i.id}">
         <td><span class="mono">${esc(i.isoNo || i.id)}</span></td><td>${esc(i.equipmentTag)}</td>
-        <td>${badge(i.status)}</td><td>${esc(i.assignedTo?.name || "—")}</td>
-        <td>${(i.attachedPermitIds || []).length}</td><td>${fmtDate(i.createdAt)}</td></tr>`).join("")
+        <td>${badge(deiso ? "removalPending" : i.status)}</td><td>${esc((deiso ? i.removalAssignedTo?.name : i.assignedTo?.name) || "—")}</td>
+        <td>${(i.attachedPermitIds || []).length}</td><td>${fmtDate(i.createdAt)}</td></tr>`; }).join("")
       || `<tr><td colspan="6" class="empty">No certificates yet — they are created when isolation permits are approved.</td></tr>`}</tbody></table>`;
     $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
   };
@@ -2980,7 +3018,8 @@ async function viewIsolations(m) {
   $("#fs").addEventListener("input", draw);
   draw();
   LiveView.bind(token, async () => {
-    all = await fetchIsolations();
+    [all, permits] = await Promise.all([fetchIsolations(), fetchPermits().catch(() => [])]);
+    index();
     if ($("#itable")) draw();
   });
 }
