@@ -38,14 +38,15 @@ function grabLine(sig) {
 const M = new Function(`
   ${grabLine("const DASH_ROWS =")}
   ${grabLine("const PERMIT_STALE_DAYS =")}
+  ${grabLine("const PERMIT_LONG_STALE_DAYS =")}
   ${grabLine("function permitLiveSince(p)")}
-  ${grab("function isStale(p)")}
+  ${grab("function staleLevel(p)")}
   ${grab("function isoIndex(isolations)")}
   ${grab("function permitStage(p, isolations)")}
   ${grab("function byWorkAge(isolations)")}
-  return { DASH_ROWS, PERMIT_STALE_DAYS, permitLiveSince, isStale, isoIndex, byWorkAge };
+  return { DASH_ROWS, PERMIT_STALE_DAYS, PERMIT_LONG_STALE_DAYS, permitLiveSince, staleLevel, isoIndex, byWorkAge };
 `)();
-const { DASH_ROWS, PERMIT_STALE_DAYS, permitLiveSince, isStale, isoIndex, byWorkAge } = M;
+const { DASH_ROWS, PERMIT_STALE_DAYS, PERMIT_LONG_STALE_DAYS, permitLiveSince, staleLevel, isoIndex, byWorkAge } = M;
 
 const DAY = 86400000;
 const daysAgo = (d) => new Date(Date.now() - d * DAY).toISOString();
@@ -66,6 +67,8 @@ function check(name, cond) { cond ? pass++ : fail++; console.log(`${cond ? "  PA
 console.log("\nSite settings:");
 check("the card shows 12 rows", DASH_ROWS === 12);
 check("stale after 7 days", PERMIT_STALE_DAYS === 7);
+check("long stale after 21 days", PERMIT_LONG_STALE_DAYS === 21);
+check("the two levels are ordered", PERMIT_STALE_DAYS < PERMIT_LONG_STALE_DAYS);
 
 console.log("\nLongest-live first, among work still in progress:");
 {
@@ -107,19 +110,21 @@ console.log("\n'Live for' is measured from approval, not from raising the draft:
 {
   const p = { permitNo: "X", createdAt: daysAgo(40), approval: { timestamp: daysAgo(2) } };
   check("approval wins over createdAt", permitLiveSince(p) === p.approval.timestamp);
-  check("a draft that sat for 38 days is not a 40-day-old job", !isStale(p));
+  check("a draft that sat for 38 days is not a 40-day-old job", staleLevel(p) === 0);
   const legacy = { permitNo: "OLD-RECORD", createdAt: daysAgo(10), validity: { start: daysAgo(9) } };
   check("records with no approval stamp fall back", permitLiveSince(legacy) === legacy.validity.start);
-  check("and are still judged stale on that fallback", isStale(legacy));
+  check("and are still judged stale on that fallback", staleLevel(legacy) === 1);
 }
 
-console.log("\nThe stale chip lands on the forgotten, not on everything:");
+console.log("\nThe row colour lands on the forgotten, not on everything:");
 {
-  check("a day-old job is not stale", !isStale(permit("A", 1)));
-  check("just under the line", !isStale(permit("B", PERMIT_STALE_DAYS - 0.1)));
-  check("exactly on the line", isStale(permit("C", PERMIT_STALE_DAYS)));
-  check("months old", isStale(permit("D", 90)));
-  check("undatable records are not accused", !isStale({ permitNo: "?" }));
+  check("a day-old job is plain", staleLevel(permit("A", 1)) === 0);
+  check("just under the first line", staleLevel(permit("B", PERMIT_STALE_DAYS - 0.1)) === 0);
+  check("exactly on the first line → amber", staleLevel(permit("C", PERMIT_STALE_DAYS)) === 1);
+  check("still amber below the second line", staleLevel(permit("D", PERMIT_LONG_STALE_DAYS - 0.1)) === 1);
+  check("exactly on the second line → red", staleLevel(permit("E", PERMIT_LONG_STALE_DAYS)) === 2);
+  check("months old → red", staleLevel(permit("F", 90)) === 2);
+  check("undatable records are not accused", staleLevel({ permitNo: "?" }) === 0);
 }
 
 console.log("\nUndatable permits sink rather than claiming to be the oldest:");

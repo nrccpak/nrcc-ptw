@@ -98,15 +98,19 @@ function overdueChip() { return `<span class="badge-st st-overdue" title="Planne
 function permitLiveSince(p) { return p?.approval?.timestamp || p?.validity?.start || p?.createdAt || null; }
 // Most permits here are open-ended, so no planned end ever passes and the
 // Overdue flag can never apply to them — elapsed time is the only thing left
-// that says a job may have been forgotten. Work still in progress past this
-// many days is chipped for review. Deliberately generous: a chip that lands on
-// nearly every row says nothing at all.
-const PERMIT_STALE_DAYS = 7;
-function isStale(p) {
+// that says a job may have been forgotten. Work still in progress past these
+// many days colours its whole row on the dashboard. Both are deliberately
+// generous: a marking that lands on nearly every row says nothing at all.
+const PERMIT_STALE_DAYS = 7;         // amber
+const PERMIT_LONG_STALE_DAYS = 21;   // red
+// 0 = fine, 1 = stale, 2 = long stale. Two levels rather than one so the card
+// shows the shape of the backlog at a glance, not merely that one exists.
+function staleLevel(p) {
   const t = Date.parse(permitLiveSince(p));
-  return !isNaN(t) && Date.now() - t >= PERMIT_STALE_DAYS * 86400000;
+  if (isNaN(t)) return 0;            // undatable: never accuse it
+  const days = (Date.now() - t) / 86400000;
+  return days >= PERMIT_LONG_STALE_DAYS ? 2 : days >= PERMIT_STALE_DAYS ? 1 : 0;
 }
-function staleChip() { return `<span class="badge-st st-stale" title="Live ${PERMIT_STALE_DAYS} days or more with no work-completion sign-off">Stale</span>`; }
 // A live permit's stored status stays "active"/"extended" from approval until
 // the Issuer closes it, which hides how far the hand-back has progressed.
 // Like isOverdue, the stage is derived in the UI (never stored) from the
@@ -1588,13 +1592,17 @@ function permitRow(p, liveWork = false, isolations = []) {
   // A Requester's card mixes in drafts and closed permits, where "live for"
   // is meaningless — only a permit that is actually live has been live.
   const live = ["active", "extended"].includes(p.status);
-  return `<tr class="row" data-pid="${p.id}">
+  // The row itself carries staleness — no chip. Only work still in progress
+  // can be stale: one already in hand-back is waiting on a named person and is
+  // reported on its own card, so colouring it here would blame the wrong queue.
+  const stale = liveWork && live && stage === "inProgress" ? staleLevel(p) : 0;
+  return `<tr class="row${stale ? " stale-" + stale : ""}" data-pid="${p.id}">
     <td><span class="mono">${esc(p.permitNo)}</span></td>
     <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName || p.type)}</span></td>
     <td>${esc(p.equipmentTag || "—")}</td>
     ${liveWork ? `<td>${badge(p.status)}${stageChip(stage)}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
     <td>${esc(p.requester?.name || "—")}</td>
-    ${liveWork ? `<td>${live ? esc(ageText(permitLiveSince(p))) : "—"}${live && stage === "inProgress" && isStale(p) ? " " + staleChip() : ""}</td>` : `<td></td>`}
+    ${liveWork ? `<td>${live ? esc(ageText(permitLiveSince(p))) : "—"}</td>` : `<td></td>`}
   </tr>`;
 }
 function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.pid })); }
