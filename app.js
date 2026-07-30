@@ -91,6 +91,22 @@ function isOverdue(p) {
   const d = new Date(end); return !isNaN(d) && d.getTime() < Date.now();
 }
 function overdueChip() { return `<span class="badge-st st-overdue" title="Planned end has passed">Overdue</span>`; }
+// How long a permit has been live on site: from approval, not from when the
+// draft was raised. A permit that sat unsubmitted in a Requester's drafts for
+// a week has not been live for a week. The fallbacks cover records written
+// before the approval stamp existed.
+function permitLiveSince(p) { return p?.approval?.timestamp || p?.validity?.start || p?.createdAt || null; }
+// Most permits here are open-ended, so no planned end ever passes and the
+// Overdue flag can never apply to them — elapsed time is the only thing left
+// that says a job may have been forgotten. Work still in progress past this
+// many days is chipped for review. Deliberately generous: a chip that lands on
+// nearly every row says nothing at all.
+const PERMIT_STALE_DAYS = 7;
+function isStale(p) {
+  const t = Date.parse(permitLiveSince(p));
+  return !isNaN(t) && Date.now() - t >= PERMIT_STALE_DAYS * 86400000;
+}
+function staleChip() { return `<span class="badge-st st-stale" title="Live ${PERMIT_STALE_DAYS} days or more with no work-completion sign-off">Stale</span>`; }
 // A live permit's stored status stays "active"/"extended" from approval until
 // the Issuer closes it, which hides how far the hand-back has progressed.
 // Like isOverdue, the stage is derived in the UI (never stored) from the
@@ -1374,16 +1390,24 @@ function queueState(items, since) {
   };
 }
 
-// Order for the dashboard's "Active work" card, which is a live queue: overdue
-// first, then whatever is closest to its planned end. Permits arrive
-// newest-raised-first from the fetch, which answers a question nobody asks
-// there — and one the card cannot even show, having no date column. The effect
-// was that a permit running for three weeks was invisible while a dozen raised
-// this morning filled the card. Open-ended permits have no deadline to be near,
-// so they sort last rather than first.
-function byAttention(a, b) {
-  return (isOverdue(b) ? 1 : 0) - (isOverdue(a) ? 1 : 0) ||
-    (Date.parse(permitEnd(a)) || Infinity) - (Date.parse(permitEnd(b)) || Infinity);
+// Order for the dashboard's "Active work" card. Two rules, both of them
+// consequences of most permits on this site being open-ended:
+//
+//   1. Work still in progress leads. A permit whose crew has already signed
+//      off is not forgotten — it is waiting on the Issuer or the Isolator, and
+//      it has its own card for that. It stays on this one, because the
+//      equipment is still isolated, but it does not take the top.
+//   2. Within a group, longest-live first. An open-ended permit has no planned
+//      end to be late against, so isOverdue is structurally false for it and
+//      elapsed time is the only signal that a job has been forgotten.
+//
+// Deadlines deliberately play no part: the dashboard's red overdue banner sits
+// directly above these cards and already carries that, so repeating it here
+// would only crowd out the permits nothing else reports on.
+function byWorkAge(isolations) {
+  const rank = (p) => (permitStage(p, isolations) === "inProgress" ? 0 : 1);
+  return (a, b) => rank(a) - rank(b) ||
+    (Date.parse(permitLiveSince(a)) || Infinity) - (Date.parse(permitLiveSince(b)) || Infinity);
 }
 
 /* -------------------- 5a. Dashboard -------------------- */
@@ -1529,13 +1553,13 @@ async function viewDashboard(m) {
   // A Requester's card is a different thing: it spans every status they have,
   // draft to closed, and "recent" is precisely what the fetch order already
   // means — so it keeps it. Copy before sorting; `active` is used above.
-  const listed = isIssuer ? [...active].sort(byAttention) : mine;
+  const listed = isIssuer ? [...active].sort(byWorkAge(isoMap)) : mine;
   const shown = listed.slice(0, DASH_ROWS);
   const moreNav = isIssuer ? { view: "permits", params: { status: "activeAll" } } : { view: "permits", params: { mine: true } };
   html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My recent permits"}</h3></div>
-    <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th></tr></thead><tbody>
-    ${shown.map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
-    ${listed.length > shown.length ? `<tr class="row more-row" role="button" tabindex="0" data-nav='${esc(JSON.stringify(moreNav))}'><td colspan="5">Showing ${shown.length} of ${listed.length} · View all</td></tr>` : ""}
+    <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th><th>Live for</th></tr></thead><tbody>
+    ${shown.map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="6" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+    ${listed.length > shown.length ? `<tr class="row more-row" role="button" tabindex="0" data-nav='${esc(JSON.stringify(moreNav))}'><td colspan="6">Showing ${shown.length} of ${listed.length} · View all</td></tr>` : ""}
     </tbody></table></div>`;
   const host = $("#dash");
   if (!host) return;            // navigated away while the data was loading
@@ -1555,14 +1579,22 @@ async function viewDashboard(m) {
   LiveView.bind(token, paint);
 }
 
-function permitRow(p, showStatus = false, isolations = []) {
+// Two shapes, one per dashboard card. The approval queue wants neither status
+// (every row is "submitted") nor an age (nothing has started yet); the live
+// card wants the derived hand-back stage and how long the permit has been on
+// site — without that column the card is sorted by something it never shows.
+function permitRow(p, liveWork = false, isolations = []) {
+  const stage = liveWork ? permitStage(p, isolations) : null;
+  // A Requester's card mixes in drafts and closed permits, where "live for"
+  // is meaningless — only a permit that is actually live has been live.
+  const live = ["active", "extended"].includes(p.status);
   return `<tr class="row" data-pid="${p.id}">
     <td><span class="mono">${esc(p.permitNo)}</span></td>
     <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName || p.type)}</span></td>
     <td>${esc(p.equipmentTag || "—")}</td>
-    ${showStatus ? `<td>${badge(p.status)}${stageChip(permitStage(p, isolations))}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
+    ${liveWork ? `<td>${badge(p.status)}${stageChip(stage)}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
     <td>${esc(p.requester?.name || "—")}</td>
-    ${!showStatus ? `<td></td>` : ""}
+    ${liveWork ? `<td>${live ? esc(ageText(permitLiveSince(p))) : "—"}${live && stage === "inProgress" && isStale(p) ? " " + staleChip() : ""}</td>` : `<td></td>`}
   </tr>`;
 }
 function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.pid })); }
