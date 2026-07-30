@@ -1,11 +1,16 @@
-/* The order of the dashboard's "Active work" card. The card shows the first
-   DASH_ROWS of a live queue and drops the rest, so the sort decides what an
-   Issuer sees and what they never do. Two properties matter:
+/* The order of the dashboard's "Active work" card, and the staleness rule that
+   goes with it. The card shows the first DASH_ROWS of a live queue and drops
+   the rest, so the sort decides what an Issuer sees and what they never do.
 
-     - overdue permits come first, whatever their dates
-     - within a group, the one closest to its planned end leads
+   The site this runs on raises mostly OPEN-ENDED permits: no planned end, so
+   nothing ever falls due and the Overdue flag can never apply. Everything here
+   turns on that — elapsed time is the only signal a job has been forgotten.
 
-   Runs the shipped comparator lifted out of app.js.
+     - work still in progress leads; permits already in hand-back do not
+     - within a group, longest-live first
+     - "live" is measured from approval, not from raising the draft
+
+   Runs the shipped helpers lifted out of app.js.
    Run: node tests/dashboard-order.mjs                                       */
 import fs from "fs";
 import path from "path";
@@ -32,72 +37,105 @@ function grabLine(sig) {
 
 const M = new Function(`
   ${grabLine("const DASH_ROWS =")}
-  ${grab("function permitEnd(p)")}
-  ${grab("function isOverdue(p)")}
-  ${grab("function byAttention(a, b)")}
-  return { DASH_ROWS, byAttention };
+  ${grabLine("const PERMIT_STALE_DAYS =")}
+  ${grabLine("function permitLiveSince(p)")}
+  ${grab("function isStale(p)")}
+  ${grab("function isoIndex(isolations)")}
+  ${grab("function permitStage(p, isolations)")}
+  ${grab("function byWorkAge(isolations)")}
+  return { DASH_ROWS, PERMIT_STALE_DAYS, permitLiveSince, isStale, isoIndex, byWorkAge };
 `)();
-const { DASH_ROWS, byAttention } = M;
+const { DASH_ROWS, PERMIT_STALE_DAYS, permitLiveSince, isStale, isoIndex, byWorkAge } = M;
 
-const HOUR = 3600000;
-const iso = (hrs) => new Date(Date.now() + hrs * HOUR).toISOString();
-// A live permit ending in `hrs` hours (negative = already past, so overdue).
-const p = (permitNo, hrs, status = "active") =>
-  ({ permitNo, status, validity: hrs === null ? { openEnded: true } : { plannedEnd: iso(hrs) } });
-const order = (list) => [...list].sort(byAttention).map((x) => x.permitNo);
+const DAY = 86400000;
+const daysAgo = (d) => new Date(Date.now() - d * DAY).toISOString();
+
+// An open-ended permit, live for `days`, with no isolation — the ordinary case
+// on this site. `done` gives it a work-completion sign-off (i.e. hand-back).
+const permit = (permitNo, days, done = false) => ({
+  permitNo, status: "active",
+  validity: { openEnded: true },
+  approval: { timestamp: daysAgo(days) },
+  ...(done ? { workCompletion: { timestamp: daysAgo(0) } } : {})
+});
+const order = (list, isos = []) => [...list].sort(byWorkAge(isoIndex(isos))).map((x) => x.permitNo);
 
 let pass = 0, fail = 0;
 function check(name, cond) { cond ? pass++ : fail++; console.log(`${cond ? "  PASS" : "  FAIL"}  ${name}`); }
 
-console.log("\nThe card shows 12 rows:");
-check("DASH_ROWS is 12", DASH_ROWS === 12);
+console.log("\nSite settings:");
+check("the card shows 12 rows", DASH_ROWS === 12);
+check("stale after 7 days", PERMIT_STALE_DAYS === 7);
 
-console.log("\nOverdue permits lead, whatever else is in the list:");
+console.log("\nLongest-live first, among work still in progress:");
 {
-  const list = [p("SOON", 1), p("LATE", -30), p("LATER", 200), p("JUST-OVER", -0.5)];
-  const o = order(list);
-  check("both overdue come first", o.slice(0, 2).every((n) => n === "LATE" || n === "JUST-OVER"));
-  check("most overdue leads", o[0] === "LATE");
-  check("the rest follow by nearest end", o.slice(2).join() === "SOON,LATER");
+  check("oldest leads", order([permit("B", 3), permit("C", 1), permit("A", 20)]).join() === "A,B,C");
+  check("open-ended permits still order — no planned end needed",
+    order([permit("NEW", 0.2), permit("OLD", 9)]).join() === "OLD,NEW");
 }
 
-console.log("\nWithin the live group, the nearest deadline leads:");
+console.log("\nPermits already in hand-back drop below work in progress:");
 {
-  check("ordered by planned end", order([p("C", 72), p("A", 2), p("B", 30)]).join() === "A,B,C");
+  // The 30-day permit is finished and waiting on the Issuer — it has its own
+  // card, so it must not push a job someone is still standing at off the top.
+  const o = order([permit("SIGNED-OFF", 30, true), permit("WORKING", 2)]);
+  check("a signed-off permit yields to live work", o.join() === "WORKING,SIGNED-OFF");
+  check("it stays on the card rather than vanishing", o.length === 2);
+}
+{
+  // Awaiting de-isolation is hand-back too: work done, locks still on.
+  const iso = [{ id: "I1", status: "active" }];
+  const held = { permitNo: "HELD", status: "active", validity: { openEnded: true },
+    approval: { timestamp: daysAgo(40) }, isolationRef: "I1", workCompletion: { timestamp: daysAgo(1) } };
+  check("awaiting de-isolation also yields", order([held, permit("WORKING", 1)], iso).join() === "WORKING,HELD");
+}
+{
+  // Within the hand-back group the same age rule applies.
+  const o = order([permit("RECENT", 2, true), permit("ANCIENT", 60, true)]);
+  check("hand-back rows are ordered oldest first too", o.join() === "ANCIENT,RECENT");
 }
 
-console.log("\nAn extended permit is judged on its extended end, not the original:");
+console.log("\nDeadlines play no part — the overdue banner above carries those:");
 {
-  const extended = { permitNo: "EXT", status: "extended", validity: { plannedEnd: iso(-40), extendedTo: iso(48) } };
-  const o = order([extended, p("SOON", 3)]);
-  check("extending clears the overdue flag", o.join() === "SOON,EXT");
+  const overdueSoon = { permitNo: "OVERDUE-YESTERDAY", status: "active",
+    validity: { plannedEnd: daysAgo(1) }, approval: { timestamp: daysAgo(2) } };
+  check("a 2-day overdue permit does not outrank a 30-day open-ended one",
+    order([overdueSoon, permit("OLD-OPEN", 30)]).join() === "OLD-OPEN,OVERDUE-YESTERDAY");
 }
 
-console.log("\nOpen-ended permits sort last, not first:");
+console.log("\n'Live for' is measured from approval, not from raising the draft:");
 {
-  // permitEnd returns null for these; a null date must not read as "year zero".
-  const o = order([{ permitNo: "OPEN", status: "active", validity: { openEnded: true } }, p("DATED", 500)]);
-  check("no deadline is not the nearest deadline", o.join() === "DATED,OPEN");
-  const o2 = order([{ permitNo: "OPEN", status: "active", validity: { openEnded: true } }, p("LATE", -5)]);
-  check("still behind an overdue permit", o2.join() === "LATE,OPEN");
+  const p = { permitNo: "X", createdAt: daysAgo(40), approval: { timestamp: daysAgo(2) } };
+  check("approval wins over createdAt", permitLiveSince(p) === p.approval.timestamp);
+  check("a draft that sat for 38 days is not a 40-day-old job", !isStale(p));
+  const legacy = { permitNo: "OLD-RECORD", createdAt: daysAgo(10), validity: { start: daysAgo(9) } };
+  check("records with no approval stamp fall back", permitLiveSince(legacy) === legacy.validity.start);
+  check("and are still judged stale on that fallback", isStale(legacy));
 }
 
-console.log("\nMalformed records sink rather than jumping the queue:");
+console.log("\nThe stale chip lands on the forgotten, not on everything:");
 {
-  const o = order([{ permitNo: "NODATES", status: "active" }, p("SOON", 4)]);
-  check("a permit with no validity block sorts last", o.join() === "SOON,NODATES");
-  const o2 = order([{ permitNo: "JUNK", status: "active", validity: { plannedEnd: "tomorrow-ish" } }, p("SOON", 4)]);
-  check("an unparseable end date sorts last", o2.join() === "SOON,JUNK");
+  check("a day-old job is not stale", !isStale(permit("A", 1)));
+  check("just under the line", !isStale(permit("B", PERMIT_STALE_DAYS - 0.1)));
+  check("exactly on the line", isStale(permit("C", PERMIT_STALE_DAYS)));
+  check("months old", isStale(permit("D", 90)));
+  check("undatable records are not accused", !isStale({ permitNo: "?" }));
 }
 
-console.log("\nThe truncation keeps the urgent end of the list:");
+console.log("\nUndatable permits sink rather than claiming to be the oldest:");
 {
-  // 20 permits, one of them long overdue and raised long ago: the case the
-  // old newest-first order pushed off the bottom of the card.
+  check("no timestamps at all sorts last",
+    order([{ permitNo: "NODATE", status: "active" }, permit("OLD", 5)]).join() === "OLD,NODATE");
+}
+
+console.log("\nThe truncation keeps the forgotten end of the list:");
+{
+  // 19 jobs raised today plus one running since last month — the case the old
+  // newest-first order pushed off the bottom of the card.
   const many = [];
-  for (let n = 0; n < 19; n++) many.push(p("NEW" + n, 100 + n));
-  many.push(p("FORGOTTEN", -400));
-  const shown = [...many].sort(byAttention).slice(0, DASH_ROWS).map((x) => x.permitNo);
+  for (let n = 0; n < 19; n++) many.push(permit("TODAY" + n, 0.1));
+  many.push(permit("FORGOTTEN", 45));
+  const shown = [...many].sort(byWorkAge(isoIndex([]))).slice(0, DASH_ROWS).map((x) => x.permitNo);
   check("the forgotten permit is on the card, and first", shown[0] === "FORGOTTEN");
   check("the card is capped", shown.length === DASH_ROWS);
 }
