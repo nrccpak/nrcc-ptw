@@ -209,6 +209,12 @@ table.tbl tr.row:hover{background:var(--bg-2);cursor:pointer}
 table.tbl tr:last-child td{border-bottom:none}
 .mono{font-family:Consolas,"SF Mono",Menlo,monospace;font-weight:700;color:var(--navy);font-size:.84rem}
 .empty{text-align:center;color:var(--muted);padding:2.4rem 1rem;font-size:.9rem}
+/* "Showing 12 of 27 · View all" — a row of the table, but a link to the full
+   list rather than a record, so it reads as a footer and not as a permit. */
+table.tbl tr.more-row td{text-align:center;padding:.75rem 1rem;font-size:.82rem;
+  font-weight:700;color:var(--steel);background:var(--bg-2)}
+table.tbl tr.more-row:focus-visible{outline:none}
+table.tbl tr.more-row:focus-visible td{box-shadow:inset 0 0 0 2px var(--steel)}
 
 /* ---------- Filters bar ---------- */
 .filters{display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center}

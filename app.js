@@ -1338,6 +1338,12 @@ async function refreshPendingBadge(known) {
    state matters as much as the loud one — a tile that is permanently amber
    stops being read within a week, and then the real backlog goes unnoticed. */
 const QUEUE_ALERT_HRS = 8;
+// How many rows the dashboard's permit card shows. A cap keeps the card to
+// roughly one screen so the tiles and the two task tables above it stay
+// reachable — on a phone an uncapped list would bury them under a long scroll.
+// The rows that fall off are the least urgent (see byAttention), and the card
+// always says how many it is not showing.
+const DASH_ROWS = 12;
 
 // Compact age for the tile sub-line: "40 min", "6 h", "2 d".
 function ageText(iso) {
@@ -1366,6 +1372,18 @@ function queueState(items, since) {
     tone: Date.now() - oldest >= QUEUE_ALERT_HRS * 3600000 ? "alert" : "warn",
     oldest: new Date(oldest).toISOString()
   };
+}
+
+// Order for the dashboard's "Active work" card, which is a live queue: overdue
+// first, then whatever is closest to its planned end. Permits arrive
+// newest-raised-first from the fetch, which answers a question nobody asks
+// there — and one the card cannot even show, having no date column. The effect
+// was that a permit running for three weeks was invisible while a dozen raised
+// this morning filled the card. Open-ended permits have no deadline to be near,
+// so they sort last rather than first.
+function byAttention(a, b) {
+  return (isOverdue(b) ? 1 : 0) - (isOverdue(a) ? 1 : 0) ||
+    (Date.parse(permitEnd(a)) || Infinity) - (Date.parse(permitEnd(b)) || Infinity);
 }
 
 /* -------------------- 5a. Dashboard -------------------- */
@@ -1508,16 +1526,24 @@ async function viewDashboard(m) {
         <td>${esc(p.requester?.name || "—")}</td></tr>`).join("")}
       </tbody></table></div>`;
   }
+  // A Requester's card is a different thing: it spans every status they have,
+  // draft to closed, and "recent" is precisely what the fetch order already
+  // means — so it keeps it. Copy before sorting; `active` is used above.
+  const listed = isIssuer ? [...active].sort(byAttention) : mine;
+  const shown = listed.slice(0, DASH_ROWS);
+  const moreNav = isIssuer ? { view: "permits", params: { status: "activeAll" } } : { view: "permits", params: { mine: true } };
   html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My recent permits"}</h3></div>
     <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th></tr></thead><tbody>
-    ${(isIssuer ? active : mine).slice(0, 8).map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+    ${shown.map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="5" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+    ${listed.length > shown.length ? `<tr class="row more-row" role="button" tabindex="0" data-nav='${esc(JSON.stringify(moreNav))}'><td colspan="5">Showing ${shown.length} of ${listed.length} · View all</td></tr>` : ""}
     </tbody></table></div>`;
   const host = $("#dash");
   if (!host) return;            // navigated away while the data was loading
   host.innerHTML = html;
   bindPermitRows();
-  // KPI tiles drill through to their pre-filtered list; keyboard-activatable too.
-  $$(".stat-link[data-nav]").forEach((t) => {
+  // Anything carrying a nav drills through to its pre-filtered list — the KPI
+  // tiles and the "showing N of M" footer alike; keyboard-activatable too.
+  $$("[data-nav]").forEach((t) => {
     const nav = () => { const n = JSON.parse(t.dataset.nav); go(n.view, n.params); };
     t.onclick = nav;
     t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nav(); } };
