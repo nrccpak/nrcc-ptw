@@ -36,7 +36,7 @@ const M = new Function(`
   ${grabLine("const QUEUE_ALERT_HRS =")}
   ${grab("function ageText(iso)")}
   ${grab("const laterOf = (a, b) =>")}
-  ${grab("function queueState(items, since)")}
+  ${grab("function queueState(items, since, alertHrs = QUEUE_ALERT_HRS)")}
   return { QUEUE_ALERT_HRS, ageText, laterOf, queueState };
 `)();
 
@@ -74,6 +74,16 @@ console.log("\nOne stale item alarms the tile even in a crowd of fresh ones:");
 {
   // The inverse: the newest must not rescue a queue either.
   check("all stale → alert", queueState([agoISO(9), agoISO(20)], at).tone === "alert");
+}
+
+console.log("\nA queue may set its own threshold, and the default stays 8 h:");
+{
+  // The Requester's tile passes the row threshold (7 days) so that the tile
+  // and the rows underneath it can never disagree about what is overdue.
+  const sevenDays = 7 * 24;
+  check("6 days is nothing on a 7-day queue", queueState([agoISO(6 * 24)], at, sevenDays).tone === "warn");
+  check("8 days is too long on a 7-day queue", queueState([agoISO(8 * 24)], at, sevenDays).tone === "alert");
+  check("the same 6-day item alarms the default 8 h queue", queueState([agoISO(6 * 24)], at).tone === "alert");
 }
 
 console.log("\nItems with no usable timestamp still show as waiting:");

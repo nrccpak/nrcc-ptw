@@ -103,13 +103,43 @@ function permitLiveSince(p) { return p?.approval?.timestamp || p?.validity?.star
 // generous: a marking that lands on nearly every row says nothing at all.
 const PERMIT_STALE_DAYS = 7;         // amber
 const PERMIT_LONG_STALE_DAYS = 21;   // red
-// 0 = fine, 1 = stale, 2 = long stale. Two levels rather than one so the card
+// 0 = fine, 1 = stale, 2 = long stale. Two levels rather than one so a card
 // shows the shape of the backlog at a glance, not merely that one exists.
-function staleLevel(p) {
-  const t = Date.parse(permitLiveSince(p));
+// Takes the moment the wait began rather than the permit, because "waiting
+// since" differs by who is looking: the Issuer's card counts from approval,
+// the Requester's from whenever the permit last landed back on their desk.
+function staleLevel(since) {
+  const t = Date.parse(since);
   if (isNaN(t)) return 0;            // undatable: never accuse it
   const days = (Date.now() - t) / 86400000;
   return days >= PERMIT_LONG_STALE_DAYS ? 2 : days >= PERMIT_STALE_DAYS ? 1 : 0;
+}
+// The two things — the only two — that a Requester can act on: a draft they
+// have never submitted, and a live permit whose job they have not yet
+// confirmed finished. The second is the one that quietly costs: until that
+// sign-off the Isolator cannot de-isolate and the Issuer cannot close, so the
+// permit holds its equipment out of service while nobody is waiting on it.
+function awaitsRequester(p) {
+  return p?.status === "draft" ||
+    (["active", "extended"].includes(p?.status) && !p.workCompletion);
+}
+// When it started waiting on them. A draft's clock restarts whenever they open
+// and save it — a draft edited yesterday is not a forgotten one — while a live
+// permit runs from approval, the same clock the Issuer's card uses.
+function requesterWaitSince(p) {
+  return p?.status === "draft" ? (p?.updatedAt || p?.createdAt || null) : permitLiveSince(p);
+}
+// Order for the Requester's own card. Anything waiting on them comes first,
+// longest-waiting at the top — the point of the card is the permit they have
+// forgotten, and with a 12-row cap a three-month-old draft was not merely
+// buried, it was off the card entirely. Everything else keeps the fetch order
+// (newest first): those permits are with the Issuer or the Isolator, or they
+// are finished, and recency is the right way to read history.
+function byOwnAttention(a, b) {
+  const ra = awaitsRequester(a) ? 0 : 1, rb = awaitsRequester(b) ? 0 : 1;
+  if (ra !== rb) return ra - rb;
+  if (ra === 1) return 0;            // stable sort keeps fetch order below
+  return (Date.parse(requesterWaitSince(a)) || Infinity) - (Date.parse(requesterWaitSince(b)) || Infinity);
 }
 // A live permit's stored status stays "active"/"extended" from approval until
 // the Issuer closes it, which hides how far the hand-back has progressed.
@@ -1383,13 +1413,19 @@ const laterOf = (a, b) => {
 // `since` maps an item to the moment it started waiting on THIS person — never
 // simply createdAt, because a permit raised last week but approved an hour ago
 // has not been awaiting closure for a week. See each caller for its own rule.
-function queueState(items, since) {
+// `alertHrs` is how long is too long for THIS queue, and it is not one number
+// for the whole app. Eight hours is right where people are blocked waiting on
+// a signature — an unapproved permit means a crew standing around. It is
+// nonsense for a Requester's queue, where the wait is a job that runs for days:
+// at eight hours the tile would be red above rows that are still plain. That
+// tile passes the row threshold instead, so tile and rows always agree.
+function queueState(items, since, alertHrs = QUEUE_ALERT_HRS) {
   if (!items.length) return { tone: "calm" };
   const times = items.map((i) => Date.parse(since(i))).filter((t) => !isNaN(t));
   if (!times.length) return { tone: "warn" };       // waiting, but undatable
   const oldest = Math.min(...times);
   return {
-    tone: Date.now() - oldest >= QUEUE_ALERT_HRS * 3600000 ? "alert" : "warn",
+    tone: Date.now() - oldest >= alertHrs * 3600000 ? "alert" : "warn",
     oldest: new Date(oldest).toISOString()
   };
 }
@@ -1490,9 +1526,12 @@ async function viewDashboard(m) {
   // two tiles anyone has to act on sitting mid-row, styled identically to the
   // background counts either side of them.
   //
-  // A Requester has no such queue: "My submitted" is waiting on somebody else,
-  // so it takes neither the colour nor the front of the row. Amber on a tile
-  // you cannot action is just noise, and it would spend the alarm.
+  // A Requester has one too, and it is the easiest of the three to overlook:
+  // a draft they never submitted, and — the one that costs — a finished job
+  // they never confirmed complete, which leaves the equipment isolated with
+  // nobody waiting on anybody. "My submitted" is NOT that queue: it is waiting
+  // on the Issuer, so it stays a plain informational tile.
+  const needsMe = isIssuer || isIso ? [] : mine.filter(awaitsRequester);
   const queueTiles = isIssuer
     // A permit sitting in "submitted" is not written to again until someone
     // approves or rejects it, so updatedAt is the moment it was submitted.
@@ -1512,13 +1551,14 @@ async function viewDashboard(m) {
         queueState(pendingDeiso, (i) => i.status === "removalPending"
           ? (i.removalAssignedAt || i.updatedAt || i.createdAt)
           : lastSignOff(byIso.get(i.id))))
-    : stat(mine.filter((p) => p.status === "submitted").length, "My submitted", ICON.newdoc, { view: "permits", params: { status: "submitted", mine: true } });
-  // Five tiles for an Issuer or Isolator, four for everyone else — the row is
-  // auto-fit (see .stat-grid) so the extra tile stays on the same line.
+    : stat(needsMe.length, "Needs your action", ICON.doccheck, { view: "permits", params: { status: "awaitingRequester", mine: true } },
+        queueState(needsMe, requesterWaitSince, PERMIT_STALE_DAYS * 24)) +
+      stat(mine.filter((p) => p.status === "submitted").length, "My submitted", ICON.newdoc, { view: "permits", params: { status: "submitted", mine: true } });
+  // Five tiles for every role that has a queue — the row is auto-fit (see
+  // .stat-grid) so the extra tile stays on the same line.
   let html = `<div class="cols stat-grid" style="margin-bottom:1.2rem">
-    ${isIssuer || isIso ? queueTiles : ""}
+    ${queueTiles}
     ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
-    ${isIssuer || isIso ? "" : queueTiles}
     ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
     ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
@@ -1554,15 +1594,17 @@ async function viewDashboard(m) {
         <td>${esc(p.requester?.name || "—")}</td></tr>`).join("")}
       </tbody></table></div>`;
   }
-  // A Requester's card is a different thing: it spans every status they have,
-  // draft to closed, and "recent" is precisely what the fetch order already
-  // means — so it keeps it. Copy before sorting; `active` is used above.
-  const listed = isIssuer ? [...active].sort(byWorkAge(isoMap)) : mine;
+  // A Requester's card spans every status they hold, draft to closed. It used
+  // to be titled "recent" and left in fetch order, which is newest first —
+  // precisely the order that hides a forgotten permit, and with the 12-row cap
+  // hides it completely. It is now ordered by what is waiting on them.
+  // Copy before sorting; `active` and `mine` are both used above.
+  const listed = isIssuer ? [...active].sort(byWorkAge(isoMap)) : [...mine].sort(byOwnAttention);
   const shown = listed.slice(0, DASH_ROWS);
   const moreNav = isIssuer ? { view: "permits", params: { status: "activeAll" } } : { view: "permits", params: { mine: true } };
-  html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My recent permits"}</h3></div>
-    <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th><th>Live for</th></tr></thead><tbody>
-    ${shown.map((p) => permitRow(p, true, isoMap)).join("") || `<tr><td colspan="6" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+  html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My permits"}</h3></div>
+    <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th><th>${isIssuer ? "Live for" : "Waiting"}</th></tr></thead><tbody>
+    ${shown.map((p) => permitRow(p, true, isoMap, !isIssuer)).join("") || `<tr><td colspan="6" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
     ${listed.length > shown.length ? `<tr class="row more-row" role="button" tabindex="0" data-nav='${esc(JSON.stringify(moreNav))}'><td colspan="6">Showing ${shown.length} of ${listed.length} · View all</td></tr>` : ""}
     </tbody></table></div>`;
   const host = $("#dash");
@@ -1587,22 +1629,38 @@ async function viewDashboard(m) {
 // (every row is "submitted") nor an age (nothing has started yet); the live
 // card wants the derived hand-back stage and how long the permit has been on
 // site — without that column the card is sorted by something it never shows.
-function permitRow(p, liveWork = false, isolations = []) {
+// The age cell. On the site card it is how long the permit has been live; on
+// the Requester's card, how long the thing waiting on them has been waiting —
+// which for an unsubmitted draft is not a "live" age at all. A row nobody is
+// waiting on (submitted, closed, rejected) shows nothing rather than a number
+// that would invite the wrong reading.
+function rowAge(p, mine, live) {
+  if (mine && awaitsRequester(p)) return ageText(requesterWaitSince(p));
+  return live ? ageText(permitLiveSince(p)) : "—";
+}
+// `mine` marks the Requester's own card, where a row means something different:
+// what is waiting on THEM, not on the site. The two cards ask different
+// questions of the same permit, so they colour different rows.
+function permitRow(p, liveWork = false, isolations = [], mine = false) {
   const stage = liveWork ? permitStage(p, isolations) : null;
   // A Requester's card mixes in drafts and closed permits, where "live for"
   // is meaningless — only a permit that is actually live has been live.
   const live = ["active", "extended"].includes(p.status);
-  // The row itself carries staleness — no chip. Only work still in progress
-  // can be stale: one already in hand-back is waiting on a named person and is
-  // reported on its own card, so colouring it here would blame the wrong queue.
-  const stale = liveWork && live && stage === "inProgress" ? staleLevel(p) : 0;
+  // The row itself carries staleness — no chip. On the site card only work
+  // still in progress can be stale: one already in hand-back is waiting on a
+  // named person and is reported on its own card, so colouring it here would
+  // blame the wrong queue. On the Requester's card the same reasoning picks a
+  // different set — only what is genuinely theirs to move.
+  const stale = !liveWork ? 0
+    : mine ? (awaitsRequester(p) ? staleLevel(requesterWaitSince(p)) : 0)
+    : (live && stage === "inProgress" ? staleLevel(permitLiveSince(p)) : 0);
   return `<tr class="row${stale ? " stale-" + stale : ""}" data-pid="${p.id}">
     <td><span class="mono">${esc(p.permitNo)}</span></td>
     <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName || p.type)}</span></td>
     <td>${esc(p.equipmentTag || "—")}</td>
     ${liveWork ? `<td>${badge(p.status)}${stageChip(stage)}${isOverdue(p) ? " " + overdueChip() : ""}</td>` : ""}
     <td>${esc(p.requester?.name || "—")}</td>
-    ${liveWork ? `<td>${live ? esc(ageText(permitLiveSince(p))) : "—"}</td>` : `<td></td>`}
+    ${liveWork ? `<td>${esc(rowAge(p, mine, live))}</td>` : `<td></td>`}
   </tr>`;
 }
 function bindPermitRows() { $$("tr.row[data-pid]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.pid })); }
@@ -1621,6 +1679,7 @@ async function viewPermits(m) {
         <option value="stage:inProgress">work in progress</option>
         <option value="stage:awaitingDeisolation">awaiting de-isolation</option>
         <option value="stage:awaitingClosure">awaiting closure</option>
+        <option value="awaitingRequester">awaiting requester</option>
         ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected"].map((s) => `<option>${s}</option>`).join("")}
         <option value="overdue">overdue</option></select>
       <select id="fDept"><option value="">All departments</option></select>
@@ -1648,6 +1707,10 @@ async function viewPermits(m) {
     const rows = all.filter((p) =>
       (!ft || p.type === ft) &&
       (!fs || (fs === "overdue" ? isOverdue(p)
+        // Not a stage: it spans a draft (never submitted) and a live permit
+        // whose crew has not signed off, which is a status the stages do not
+        // reach. Useful to an Issuer too — it answers "who has not signed off?"
+        : fs === "awaitingRequester" ? awaitsRequester(p)
         : fs.startsWith("stage:") ? permitStage(p, isoMap) === fs.slice(6)
         : fs === "activeAll" ? ["active", "extended"].includes(p.status) : p.status === fs)) &&
       (!fd || p.requestingDepartment?.department === fd) &&
