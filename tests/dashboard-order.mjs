@@ -40,7 +40,7 @@ const M = new Function(`
   ${grabLine("const PERMIT_STALE_DAYS =")}
   ${grabLine("const PERMIT_LONG_STALE_DAYS =")}
   ${grabLine("function permitLiveSince(p)")}
-  ${grab("function staleLevel(p)")}
+  ${grab("function staleLevel(since)")}
   ${grab("function isoIndex(isolations)")}
   ${grab("function permitStage(p, isolations)")}
   ${grab("function byWorkAge(isolations)")}
@@ -110,21 +110,21 @@ console.log("\n'Live for' is measured from approval, not from raising the draft:
 {
   const p = { permitNo: "X", createdAt: daysAgo(40), approval: { timestamp: daysAgo(2) } };
   check("approval wins over createdAt", permitLiveSince(p) === p.approval.timestamp);
-  check("a draft that sat for 38 days is not a 40-day-old job", staleLevel(p) === 0);
+  check("a draft that sat for 38 days is not a 40-day-old job", staleLevel(permitLiveSince(p)) === 0);
   const legacy = { permitNo: "OLD-RECORD", createdAt: daysAgo(10), validity: { start: daysAgo(9) } };
   check("records with no approval stamp fall back", permitLiveSince(legacy) === legacy.validity.start);
-  check("and are still judged stale on that fallback", staleLevel(legacy) === 1);
+  check("and are still judged stale on that fallback", staleLevel(permitLiveSince(legacy)) === 1);
 }
 
 console.log("\nThe row colour lands on the forgotten, not on everything:");
 {
-  check("a day-old job is plain", staleLevel(permit("A", 1)) === 0);
-  check("just under the first line", staleLevel(permit("B", PERMIT_STALE_DAYS - 0.1)) === 0);
-  check("exactly on the first line → amber", staleLevel(permit("C", PERMIT_STALE_DAYS)) === 1);
-  check("still amber below the second line", staleLevel(permit("D", PERMIT_LONG_STALE_DAYS - 0.1)) === 1);
-  check("exactly on the second line → red", staleLevel(permit("E", PERMIT_LONG_STALE_DAYS)) === 2);
-  check("months old → red", staleLevel(permit("F", 90)) === 2);
-  check("undatable records are not accused", staleLevel({ permitNo: "?" }) === 0);
+  check("a day-old job is plain", staleLevel(permitLiveSince(permit("A", 1))) === 0);
+  check("just under the first line", staleLevel(permitLiveSince(permit("B", PERMIT_STALE_DAYS - 0.1))) === 0);
+  check("exactly on the first line → amber", staleLevel(permitLiveSince(permit("C", PERMIT_STALE_DAYS))) === 1);
+  check("still amber below the second line", staleLevel(permitLiveSince(permit("D", PERMIT_LONG_STALE_DAYS - 0.1))) === 1);
+  check("exactly on the second line → red", staleLevel(permitLiveSince(permit("E", PERMIT_LONG_STALE_DAYS))) === 2);
+  check("months old → red", staleLevel(permitLiveSince(permit("F", 90))) === 2);
+  check("undatable records are not accused", staleLevel(permitLiveSince({ permitNo: "?" })) === 0);
 }
 
 console.log("\nUndatable permits sink rather than claiming to be the oldest:");
