@@ -52,9 +52,10 @@ const mod = new Function("docStub", "arrayUnionStub", `
   ${grab("async function txTrialApprove(tx, o)")}
   ${grab("async function txTrialCancel(tx, o)")}
   ${grab("async function txTrialEnergise(tx, o)")}
+  ${grab("async function txTrialComplete(tx, o)")}
   ${grab("async function txTrialReIsolate(tx, o)")}
   return { GateError, txReadCrew, txTrialRequest, txTrialAnswer, txTrialApprove,
-           txTrialCancel, txTrialEnergise, txTrialReIsolate };
+           txTrialCancel, txTrialEnergise, txTrialComplete, txTrialReIsolate };
 `)((_db, coll, id) => ({ coll, id }), (...v) => ({ __arrayUnion: v }));
 
 /* --- simulated transaction: reads a plain store, records every write --- */
@@ -299,6 +300,46 @@ console.log("\nThe late-attach hole, closed inside the transaction:");
   hidden.isolations.C1.attachedPermitIds = [];
   await check("...even when the certificate's own list has been emptied",
     run("txTrialEnergise", hidden, { actor: ISOLATOR, knownIds: ["A", "B", "C", "D"] }), "gate");
+}
+
+/* ============ 5b. The crew says the trial is finished ============ */
+console.log("\nThe crew that asked signs the trial off — a signal, not a state change:");
+{
+  const all = [says("B", "consent"), says("C", "consent")];
+  const live = () => store(trial("energised", all), { status: "trialRun" });
+  const tx = await check("the crew that asked confirms it is finished",
+    run("txTrialComplete", live(), { actor: REQ_A, remarks: "seal holding" }), "ok");
+  const w = wrote(tx, "isolations", "C1");
+  is("the sign-off is recorded", w["trialRun.completedBy"].uid === "u-A");
+  is("the remarks are kept", w["trialRun.completionRemarks"] === "seal holding");
+  // THE point of this step: it asks for re-isolation, it does not perform it.
+  is("the certificate is NOT taken out of trialRun", w.status === undefined);
+  is("the trial is NOT moved out of energised", w["trialRun.status"] === undefined);
+  is("no equipment write — the plant is still live", wrote(tx, "equipment", "EQ1") === null);
+
+  await check("an Issuer may also close it out, for a shift change",
+    run("txTrialComplete", live(), { actor: ISSUER }), "ok");
+  await check("another crew on the lockout may not",
+    run("txTrialComplete", live(), { actor: REQ_B }), "gate");
+  await check("the Isolator does not sign the crew's word",
+    run("txTrialComplete", live(), { actor: ISOLATOR }), "gate");
+  await check("signing off twice refuses",
+    run("txTrialComplete", store(trial("energised", all, { completedBy: REQ_A, completedAt: AT }), { status: "trialRun" }),
+      { actor: REQ_A }), "gate");
+  await check("nothing to sign off before the locks come out",
+    run("txTrialComplete", store(trial("approved", all)), { actor: REQ_A }), "gate");
+  await check("nor on a quiet certificate",
+    run("txTrialComplete", store(), { actor: REQ_A }), "gate");
+  // The earlier flow left no sub-document to sign; the Isolator just re-isolates.
+  await check("a legacy energised certificate cannot be signed off",
+    run("txTrialComplete", store(null, { status: "trialRun" }), { actor: REQ_A }), "gate");
+}
+{
+  // An Isolator must never be made to wait for a signature to put locks back on.
+  const all = [says("B", "consent"), says("C", "consent")];
+  const s = store(trial("energised", all), { status: "trialRun" });
+  await check("re-isolation never waits for the crew's sign-off",
+    run("txTrialReIsolate", s, { actor: ISOLATOR }), "ok");
 }
 
 /* ===================== 6. Re-isolate ===================== */

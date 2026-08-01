@@ -230,6 +230,39 @@ await seed({ trialRun: request() });
 await allow("an Issuer authorises a cleared request",
   updateDoc(cert("sara"), { "trialRun.status": "approved", "trialRun.issuerApproval": { uid: "sara", name: "Sara", at: AT } }));
 
+/* ========= 5b. The crew's sign-off, the one write made while live ========= */
+console.log("\nThe crew may say the trial is finished while the plant is live:");
+const LIVE = { ...APPROVED, status: "energised", deisolatedBy: { uid: "imran", name: "Imran" }, deisolatedAt: AT };
+const signOff = (uid) => ({ "trialRun.completedBy": { uid, name: USERS[uid].name },
+  "trialRun.completedAt": AT, "trialRun.completionRemarks": "seal holding" });
+await seed({ status: "trialRun", trialRun: LIVE });
+await allow("the crew that asked signs it off", updateDoc(cert("amir"), signOff("amir")));
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("another crew cannot sign for them", updateDoc(cert("bilal"), signOff("bilal")));
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("a bystander certainly cannot", updateDoc(cert("zara"), signOff("zara")));
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("nor can a crew sign in someone else's name", updateDoc(cert("amir"), signOff("bilal")));
+// The whole point: it is a request for re-isolation, not re-isolation.
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("signing off cannot also re-isolate the certificate",
+  updateDoc(cert("amir"), { ...signOff("amir"), status: "active" }));
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("nor move the trial out of energised",
+  updateDoc(cert("amir"), { ...signOff("amir"), "trialRun.status": "closed" }));
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("nor rewrite who took the locks out",
+  updateDoc(cert("amir"), { ...signOff("amir"), "trialRun.deisolatedBy": { uid: "amir", name: "Amir" } }));
+await seed({ status: "trialRun", trialRun: LIVE });
+await deny("nor rewrite the consents that justified it",
+  updateDoc(cert("amir"), { ...signOff("amir"), "trialRun.consents": [] }));
+await seed({ status: "trialRun", trialRun: { ...LIVE, completedBy: { uid: "amir", name: "Amir" }, completedAt: AT } });
+await deny("a sign-off cannot be overwritten once given", updateDoc(cert("amir"), signOff("amir")));
+// Before the locks are out there is nothing to sign off.
+await seed({ trialRun: APPROVED });
+await deny("an authorised-but-not-energised trial cannot be signed off",
+  updateDoc(cert("amir"), signOff("amir")));
+
 /* ================= 6. The history cannot be edited ================= */
 console.log("\nThe trial-run log is append-only for everyone:");
 const OLD = [{ ...request(), status: "closed", outcome: "completed", reIsolatedAt: AT }];

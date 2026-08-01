@@ -61,9 +61,10 @@ const mod = new Function("docFn", "arrayUnionFn", `
   ${grab("async function txTrialApprove(tx, o)")}
   ${grab("async function txTrialCancel(tx, o)")}
   ${grab("async function txTrialEnergise(tx, o)")}
+  ${grab("async function txTrialComplete(tx, o)")}
   ${grab("async function txTrialReIsolate(tx, o)")}
   return { GateError, txTrialRequest, txTrialAnswer, txTrialApprove,
-           txTrialCancel, txTrialEnergise, txTrialReIsolate };
+           txTrialCancel, txTrialEnergise, txTrialComplete, txTrialReIsolate };
 `)((_db, coll, id) => sdkDoc(DB, coll, id), arrayUnion);
 
 const testEnv = await initializeTestEnvironment({
@@ -156,6 +157,15 @@ await expect("the Isolator removes the locks", step("imran", "txTrialEnergise", 
   is("the equipment is energised", (await readEquip()).isolationStatus === "trialRun");
   is("the Isolator is on the record", c.trialRun.deisolatedBy.uid === "imran");
 }
+// The crew tells the Isolator the trial has served its purpose. The equipment
+// stays live until the Isolator acts — this is a signal, not a state change.
+await expect("the crew signs the trial off", step("amir", "txTrialComplete", { remarks: "seal holding" }), "ok");
+{
+  const c = await readCert();
+  is("the sign-off is on the record", c.trialRun.completedBy.uid === "amir");
+  is("the equipment is STILL energised after the sign-off", (await readEquip()).isolationStatus === "trialRun");
+  is("the certificate is still in trialRun", c.status === "trialRun");
+}
 await expect("the Isolator puts them back", step("imran", "txTrialReIsolate", {}), "ok");
 {
   const c = await readCert();
@@ -214,6 +224,10 @@ is("the equipment was never energised", (await readEquip()).isolationStatus === 
 await expect("an Admin genuinely may", step("adnan", "txTrialEnergise", {}), "ok");
 await expect("an Issuer claiming Isolator cannot re-isolate either",
   step("sara", "txTrialReIsolate", {}, "isolator"), "denied");
+// The sign-off is the one crew write made while the plant is live, so check a
+// tampered client cannot ride it into anything more.
+await expect("a bystander claiming the asking crew cannot sign the trial off",
+  step("zara", "txTrialComplete", {}), "gate");
 
 console.log("\nAnd one that lies about whose crew it speaks for:");
 await seed();
