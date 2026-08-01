@@ -2728,6 +2728,227 @@ async function closePermit(p, equip) {
     });
 }
 
+/* ---------- Trial run: the six lifecycle writes ----------
+   Request → consent → Issuer authorisation → Isolator de-isolates → ENERGISED
+   → Isolator re-isolates. Each step is a `tx`-taking core plus a thin
+   lifecycleTx wrapper, so the cores can be exercised against a simulated
+   transaction (tests/trial-run-tx.mjs) rather than only in a browser.
+
+   Two rules hold across all six:
+     - every precondition is re-read INSIDE the transaction. Nothing is decided
+       from the loaded page, because the page can be minutes old and the thing
+       being decided is whether crews are standing next to live equipment.
+     - the signed-in user is passed in as `actor`, never read from State by the
+       core, so the role checks are testable and cannot drift from the UI.
+
+   Not yet wired to any button — the UI arrives in the next piece. */
+
+// Who is signing. Carries the role so the transaction can enforce the same
+// separation the UI shows, and so the audit trail records the authority the
+// signer held at the time.
+function actorStamp() {
+  const p = State.profile || {};
+  return { uid: p.id, name: p.name, role: p.role, ...myMeta() };
+}
+
+// Every permit that might be a crew on this certificate, re-read inside the
+// transaction. `attachedPermitIds` is the certificate's own list, but it can be
+// emptied while permits still point at the certificate (rejecting the last
+// permit on a confirmed lockout does exactly that), so the caller's page list is
+// unioned in and each candidate is re-checked against its own isolationRef.
+async function txReadCrew(tx, isoId, isoData, knownIds) {
+  const ids = [...new Set([...(isoData.attachedPermitIds || []), ...(knownIds || [])])].filter(Boolean);
+  const snaps = await Promise.all(ids.map((pid) => tx.get(doc(db, "permits", pid))));
+  return snaps.filter((s) => s.exists()).map((s) => ({ id: s.id, ...s.data() }))
+    .filter((p) => p.isolationRef === isoId);
+}
+
+// 1. The crew doing the work asks. Not the Issuer, not an Admin — the trial is
+//    requested by the people who need it to prove their repair.
+async function txTrialRequest(tx, o) {
+  const pRef = doc(db, "permits", o.permitId);
+  const isoRef = doc(db, "isolations", o.isoId);
+  const [pSnap, iSnap] = await Promise.all([tx.get(pRef), tx.get(isoRef)]);
+  if (!pSnap.exists()) gate("This permit no longer exists.");
+  if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+  const p = pSnap.data(), iso = { id: o.isoId, ...iSnap.data() };
+  if (!["active", "extended"].includes(p.status))
+    gate(`This permit is now ${STATUS_LABEL[p.status] || p.status} — no trial run was requested.`);
+  if (p.isolationRef !== o.isoId)
+    gate("This permit is no longer attached to that isolation certificate.");
+  if (p.requester?.uid !== o.actor.uid)
+    gate("Only the permit's own requester may ask for a trial run.");
+  if (iso.status !== "active")
+    gate(`The isolation is now ${STATUS_LABEL[iso.status] || iso.status} — no trial run was requested.`);
+  if (iso.trialRun) gate("A trial run is already in progress on this certificate.");
+  tx.update(isoRef, {
+    trialRun: {
+      status: "requested", permitId: o.permitId, permitNo: p.permitNo || null,
+      reason: o.reason || "", requestedBy: o.actor, requestedAt: o.at,
+      // The requester's own entry records who asked. trialConsentState never
+      // counts it as an answer — it can only ever speak for this one crew.
+      consents: [{ permitId: o.permitId, permitNo: p.permitNo || null, ...o.actor,
+                   decision: "requested", at: o.at, remarks: o.reason || "" }],
+      issuerApproval: null, deisolatedBy: null, deisolatedAt: null,
+      reIsolatedBy: null, reIsolatedAt: null
+    }
+  });
+}
+
+// 2. Every other crew still on the tools clears — or refuses, which kills the
+//    request outright. One "no" is enough; nobody overrules a crew on this.
+async function txTrialAnswer(tx, o) {
+  if (!["consent", "refuse"].includes(o.decision)) gate("Unrecognised answer — nothing was recorded.");
+  const isoRef = doc(db, "isolations", o.isoId);
+  const iSnap = await tx.get(isoRef);
+  if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+  const iso = { id: o.isoId, ...iSnap.data() };
+  if (trialStage(iso) !== "requested")
+    gate(iso.trialRun
+      ? "This trial run has already been decided — your answer was not recorded."
+      : "There is no trial run request on this certificate.");
+  const crew = await txReadCrew(tx, o.isoId, iso, o.knownIds);
+  const mine = trialConsentTargets(iso, crew, iso.trialRun.permitId).find((p) => p.id === o.permitId);
+  if (!mine) gate("Your permit is not one of the crews being asked to clear this trial run.");
+  if (mine.requester?.uid !== o.actor.uid) gate("Only the permit's own requester may answer for that crew.");
+  if ((iso.trialRun.consents || []).some((c) => c && c.permitId === o.permitId &&
+      (c.decision === "consent" || c.decision === "refuse")))
+    gate("Your crew has already answered this trial run request.");
+  const entry = { permitId: o.permitId, permitNo: mine.permitNo || null, ...o.actor,
+                  decision: o.decision, at: o.at, remarks: o.remarks || "" };
+  if (o.decision === "consent") {
+    // arrayUnion, not a rewritten array: two crews clearing at the same moment
+    // must not overwrite one another.
+    tx.update(isoRef, { "trialRun.consents": arrayUnion(entry) });
+    return;
+  }
+  tx.update(isoRef, {
+    trialRun: null,
+    trialRunLog: arrayUnion({ ...iso.trialRun, consents: [...(iso.trialRun.consents || []), entry],
+      status: "closed", outcome: "refused", closedBy: o.actor, closedAt: o.at })
+  });
+}
+
+// 3. The Issuer authorises. This is authority to energise, not the act of it —
+//    the locks stay on until an Isolator pulls them at step 5.
+async function txTrialApprove(tx, o) {
+  const isoRef = doc(db, "isolations", o.isoId);
+  const iSnap = await tx.get(isoRef);
+  if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+  const iso = { id: o.isoId, ...iSnap.data() };
+  if (!["issuer", "admin"].includes(o.actor.role)) gate("Only an Issuer may authorise a trial run.");
+  if (trialStage(iso) !== "requested")
+    gate(trialStage(iso) ? "This trial run has already been authorised." : "There is no trial run request on this certificate.");
+  if (iso.status !== "active")
+    gate(`The isolation is now ${STATUS_LABEL[iso.status] || iso.status} — the trial run was not authorised.`);
+  const crew = await txReadCrew(tx, o.isoId, iso, o.knownIds);
+  const st = trialConsentState(iso, crew);
+  if (st.refused.length)
+    gate(`${st.refused[0].permitNo || "A crew"} has refused this trial run — it cannot be authorised.`);
+  if (st.outstanding.length)
+    gate(`${st.outstanding.length} crew(s) have not cleared yet (${st.outstanding.map((p) => p.permitNo || p.id).join(", ")}) — the trial run was not authorised.`);
+  tx.update(isoRef, { "trialRun.status": "approved", "trialRun.issuerApproval": { ...o.actor, at: o.at } });
+}
+
+// 4. Called off before the locks came out. Once ENERGISED there is no cancel —
+//    the only way back is an Isolator re-isolating at step 6.
+async function txTrialCancel(tx, o) {
+  const isoRef = doc(db, "isolations", o.isoId);
+  const iSnap = await tx.get(isoRef);
+  if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+  const iso = { id: o.isoId, ...iSnap.data() };
+  const stage = trialStage(iso);
+  if (stage === "energised") gate("The equipment is energised — it must be re-isolated, not cancelled.");
+  if (!["requested", "approved"].includes(stage)) gate("There is no trial run request to cancel.");
+  if (iso.trialRun.requestedBy?.uid !== o.actor.uid && !["issuer", "admin"].includes(o.actor.role))
+    gate("Only the crew that asked, or an Issuer, may cancel a trial run request.");
+  tx.update(isoRef, {
+    trialRun: null,
+    trialRunLog: arrayUnion({ ...iso.trialRun, status: "closed", outcome: "cancelled",
+      closedBy: o.actor, closedAt: o.at, closeReason: o.reason || "" })
+  });
+}
+
+// 5. THE step that puts live power on equipment crews are holding permits on.
+//    Readiness is recomputed here from the permits this transaction read
+//    itself: a crew attached to the lockout after the consents were gathered
+//    never cleared, so the trial stops rather than energising around them.
+async function txTrialEnergise(tx, o) {
+  const isoRef = doc(db, "isolations", o.isoId);
+  const iSnap = await tx.get(isoRef);
+  if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+  const iso = { id: o.isoId, ...iSnap.data() };
+  if (!["isolator", "admin"].includes(o.actor.role))
+    gate("Only an Isolator may remove the locks for a trial run.");
+  const stage = trialStage(iso);
+  if (stage === "energised") gate("This trial run is already in progress — the equipment is energised.");
+  if (stage !== "approved")
+    gate(stage === "requested"
+      ? "The Issuer has not authorised this trial run yet — the equipment was not energised."
+      : "There is no authorised trial run on this certificate.");
+  const crew = await txReadCrew(tx, o.isoId, iso, o.knownIds);
+  const eqRef = o.equipmentId ? doc(db, "equipment", o.equipmentId) : null;
+  const eqSnap = eqRef ? await tx.get(eqRef) : null;          // last read before any write
+  if (!trialReadyToEnergise(iso, crew)) {
+    const st = trialConsentState(iso, crew);
+    if (st.refused.length) gate("A crew has refused this trial run — the equipment was not energised.");
+    if (st.outstanding.length)
+      gate(`${st.outstanding.length} crew(s) on this lockout have not cleared the trial run (${st.outstanding.map((p) => p.permitNo || p.id).join(", ")}) — the equipment was not energised.`);
+    gate(`The isolation is now ${STATUS_LABEL[iso.status] || iso.status} — the equipment was not energised.`);
+  }
+  if (eqSnap && !eqSnap.exists()) gate("This equipment record no longer exists.");
+  if (eqSnap && (eqSnap.data().activeIsolationId || null) !== o.isoId)
+    gate("This equipment is now under a different isolation certificate — the equipment was not energised.");
+  tx.update(isoRef, { status: "trialRun", "trialRun.status": "energised",
+    "trialRun.deisolatedBy": o.actor, "trialRun.deisolatedAt": o.at });
+  if (eqRef) tx.update(eqRef, { isolationStatus: "trialRun", updatedAt: o.at });
+}
+
+// 6. Locks back on, work may resume. Accepts a certificate energised by the
+//    FIRST version of this feature too (status trialRun, no sub-document, the
+//    record stranded on one permit) — those must not be left un-re-isolatable,
+//    and their permit-side entries are closed here so the log stops claiming
+//    the equipment is still live.
+async function txTrialReIsolate(tx, o) {
+  const isoRef = doc(db, "isolations", o.isoId);
+  const iSnap = await tx.get(isoRef);
+  if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
+  const iso = { id: o.isoId, ...iSnap.data() };
+  if (!["isolator", "admin"].includes(o.actor.role))
+    gate("Only an Isolator may re-apply the locks after a trial run.");
+  if (!isTrialEnergised(iso)) gate("This certificate is not in a trial run — there is nothing to re-isolate.");
+  const crew = await txReadCrew(tx, o.isoId, iso, o.knownIds);
+  const eqRef = o.equipmentId ? doc(db, "equipment", o.equipmentId) : null;
+  const eqSnap = eqRef ? await tx.get(eqRef) : null;          // last read before any write
+  const t = iso.trialRun || { status: "energised", legacy: true, permitId: null, consents: [],
+                              reason: "Started by the earlier trial-run flow", requestedAt: null };
+  tx.update(isoRef, {
+    status: "active", trialRun: null,
+    trialRunLog: arrayUnion({ ...t, status: "closed", outcome: "completed",
+      reIsolatedBy: o.actor, reIsolatedAt: o.at })
+  });
+  // Only reset the equipment if it still points at THIS certificate.
+  if (eqRef && eqSnap && eqSnap.exists() && (eqSnap.data().activeIsolationId || null) === o.isoId)
+    tx.update(eqRef, { isolationStatus: "isolated", updatedAt: o.at });
+  for (const cp of crew) {
+    const trs = cp.trialRuns || [];
+    if (!trs.some((x) => x && x.status === "open")) continue;
+    tx.update(doc(db, "permits", cp.id), { updatedAt: o.at,
+      trialRuns: trs.map((x) => x && x.status === "open" ? { ...x, reIsolatedAt: o.at, status: "closed" } : x) });
+  }
+}
+
+// Wrappers the UI calls. lifecycleTx keeps every one of these off the offline
+// queue — energising equipment must never be a write that "goes through later".
+const trialRequest    = (o) => lifecycleTx("trial run request",   (tx) => txTrialRequest(tx, { ...o, actor: actorStamp(), at: nowISO() }));
+const trialAnswer     = (o) => lifecycleTx("trial run answer",    (tx) => txTrialAnswer(tx, { ...o, actor: actorStamp(), at: nowISO() }));
+const trialApprove    = (o) => lifecycleTx("trial run approval",  (tx) => txTrialApprove(tx, { ...o, actor: actorStamp(), at: nowISO() }));
+const trialCancel     = (o) => lifecycleTx("trial run cancellation", (tx) => txTrialCancel(tx, { ...o, actor: actorStamp(), at: nowISO() }));
+const trialEnergise   = (o) => lifecycleTx("trial run de-isolation", (tx) => txTrialEnergise(tx, { ...o, actor: actorStamp(), at: nowISO() }));
+const trialReIsolate  = (o) => lifecycleTx("re-isolation",        (tx) => txTrialReIsolate(tx, { ...o, actor: actorStamp(), at: nowISO() }));
+
+// Superseded by the six above; still wired to the Admin-only buttons until the
+// UI piece replaces them, so a trial started today can still be re-isolated.
 async function trialRun(p, equip) {
   const isoRef = p.isolationRef ? doc(db, "isolations", p.isolationRef) : null;
   const iso = isoRef ? (await getDoc(isoRef)).data() : null;
