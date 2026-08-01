@@ -49,11 +49,14 @@ const M = new Function(`
   ${grabLine("function personHTML(name, meta)")}
   ${grab("function trialStage(iso)")}
   ${grab("function isTrialEnergised(iso)")}
+  ${grab("function trialConsentTargets(iso, permits, requestingPermitId)")}
+  ${grab("function trialConsentState(iso, permits)")}
   ${grab("function trialChip(iso)")}
+  ${grab("function trialLiveHTML(iso, permits)")}
   ${grab("function trialHistoryHTML(iso, permit)")}
-  return { trialChip, trialHistoryHTML };
+  return { trialChip, trialLiveHTML, trialHistoryHTML };
 `)();
-const { trialChip, trialHistoryHTML } = M;
+const { trialChip, trialLiveHTML, trialHistoryHTML } = M;
 
 let pass = 0, fail = 0;
 function check(name, cond) { cond ? pass++ : fail++; console.log(`${cond ? "  PASS" : "  FAIL"}  ${name}`); }
@@ -85,6 +88,46 @@ console.log("\nThe chip says exactly which of the three states the lockout is in
     trialChip({ id: "C1", status: "trialRun" }).includes("ENERGISED"));
   check("the chip is never a permit status",
     !trialChip(cert(trial("energised"))).includes("badge-st st-"));
+}
+
+console.log("\nOn the certificate, the Isolator is told the state of the LOCKS:");
+{
+  const crew = [
+    { id: "pA", permitNo: "PTW-A", status: "active", isolationRef: "C1", requester: { uid: "u-A" } },
+    { id: "pB", permitNo: "PTW-B", status: "active", isolationRef: "C1", requester: { uid: "u-B" } },
+    { id: "pC", permitNo: "PTW-C", status: "active", isolationRef: "C1", requester: { uid: "u-C" } }
+  ];
+  const answered = [{ permitId: "pA", decision: "requested" }, { permitId: "pB", permitNo: "PTW-B", decision: "consent" }];
+
+  check("no trial → no card", trialLiveHTML(cert(null), crew) === "");
+
+  const waiting = trialLiveHTML(cert(trial("requested", { permitId: "pA", consents: answered })), crew);
+  // The decision an Isolator is about to make rests on this list, so it says
+  // both halves — who has cleared and who has not — rather than a count.
+  check("the crews that cleared are named", waiting.includes("PTW-B"));
+  check("the crews still to clear are named", waiting.includes("PTW-C"));
+  check("a pending trial says the locks are still ON", waiting.includes("ON — equipment still isolated"));
+  check("and that it is not authorised yet", waiting.includes("Not yet authorised"));
+
+  const ready = trialLiveHTML(cert(trial("approved", {
+    permitId: "pA", consents: [...answered, { permitId: "pC", permitNo: "PTW-C", decision: "consent" }],
+    issuerApproval: { ...person("Sara"), at: AT } })), crew);
+  check("every crew cleared is stated plainly", ready.includes("None — every crew has cleared"));
+  check("the authorising Issuer is named", ready.includes("Sara"));
+  // The distinction the Isolator must not misread: authorised is not live.
+  check("an AUTHORISED trial still says the locks are ON", ready.includes("ON — equipment still isolated"));
+  check("and never says energised", !ready.includes("ENERGISED"));
+
+  const live = trialLiveHTML(cert(trial("energised", {
+    permitId: "pA", consents: answered, issuerApproval: { ...person("Sara"), at: AT },
+    deisolatedBy: person("Imran"), deisolatedAt: AT }), { status: "trialRun" }), crew);
+  check("an energised trial says the locks are OUT", live.includes("OUT — equipment ENERGISED"));
+  check("and names who took them out", live.includes("Imran"));
+
+  // A certificate energised by the earlier flow has no sub-document, so there
+  // is no live card to draw — the banner and chip carry that state instead.
+  check("a legacy energised certificate draws no card",
+    trialLiveHTML({ id: "C1", status: "trialRun", trialRun: null }, crew) === "");
 }
 
 console.log("\nThe log shows every trial this lockout has seen:");

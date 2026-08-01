@@ -1451,6 +1451,19 @@ function trialConsentState(iso, permits) {
   return { required, given, refused, outstanding };
 }
 
+// Why hand-back cannot proceed on this certificate, or null if it may. Hand-back
+// is the point of no return — the locks come off for good — so a trial run at
+// ANY stage holds it, not only an energised one: taking the locks off while a
+// crew is waiting to energise would leave a live request pointing at a dead
+// certificate, and that crew would still be reading "trial run authorised".
+// `verb` names the action for the message ("de-isolating", "releasing").
+function handbackHold(iso, verb) {
+  if (!iso) return null;
+  if (isTrialEnergised(iso)) return "The equipment is energised for a trial run — re-isolate before " + verb + ".";
+  if (iso.trialRun) return "A trial run is in progress on this certificate — finish or cancel it before " + verb + ".";
+  return null;
+}
+
 // The single authority on "may this certificate be energised right now". The
 // Isolator's transaction recomputes this from permits it reads itself — never
 // from the loaded page — so a permit approved onto the certificate after the
@@ -2223,6 +2236,32 @@ function makePermitNo(type) {
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
   return `NRCC-${type.abbr}-${ymd}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+}
+
+// The trial run in flight, shown on the certificate — where an Isolator has to
+// decide whether the equipment may be energised. It states plainly which crews
+// have cleared and which have not, because that list is the whole basis of the
+// decision, and prints the state of the locks rather than a stage name.
+function trialLiveHTML(iso, permits) {
+  const t = iso && iso.trialRun;
+  if (!t) return "";
+  const c = trialConsentState(iso, permits || []);
+  const line = (k, v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  const names = (arr) => arr.map((p) => `<span class="mono">${esc(p.permitNo || p.id)}</span>`).join(", ") || "—";
+  const live = isTrialEnergised(iso);
+  return `<div class="card"><h3>Trial run ${live ? "— IN PROGRESS" : "requested"}</h3>
+    ${line("Locks", live
+      ? `<b style="color:var(--red)">OUT — equipment ENERGISED</b>`
+      : `<b>ON — equipment still isolated</b>`)}
+    ${line("Requested by", `${personHTML(t.requestedBy?.name, t.requestedBy)}${t.permitNo ? ` on <span class="mono">${esc(t.permitNo)}</span>` : ""} · ${fmt(t.requestedAt)}`)}
+    ${t.reason ? line("Reason", esc(t.reason)) : ""}
+    ${line("Crews cleared", names(c.given))}
+    ${line("Still to clear", c.outstanding.length ? `<b>${names(c.outstanding)}</b>` : "None — every crew has cleared")}
+    ${line("Issuer authorisation", t.issuerApproval
+      ? `${personHTML(t.issuerApproval.name, t.issuerApproval)} · ${fmt(t.issuerApproval.at)}`
+      : "<b>Not yet authorised</b>")}
+    ${t.deisolatedBy ? line("Locks removed by", `${personHTML(t.deisolatedBy.name, t.deisolatedBy)} · ${fmt(t.deisolatedAt)}`) : ""}
+  </div>`;
 }
 
 // Every trial run this lockout has seen, newest last: the completed/refused/
@@ -3724,23 +3763,51 @@ async function viewIsolationDetail(m) {
   // De-isolation is the Isolator's physical job — the Issuer does NOT de-isolate
   // (Admin is kept only as a system superuser fallback).
   const readyForDeiso = isoReadyForDeiso(iso, permits);
-  const canRemove = (iso.status === "removalPending" || readyForDeiso) && (isIso || isAdmin || iso.removalAssignedTo?.uid === me);
+  // A trial run in flight freezes hand-back. Energised is obvious — the locks
+  // are out. A merely requested or authorised one matters too: taking the locks
+  // off for good while a crew is waiting to energise leaves a live request
+  // pointing at a dead certificate, and the crew watching this page would have
+  // no idea their trial had been overtaken.
+  const trialAt = trialStage(iso);
+  const energised = isTrialEnergised(iso);
+  const trialC = trialConsentState(iso, attached);
+  const trialHolds = !!iso.trialRun || energised;
+  const canRemove = (iso.status === "removalPending" || readyForDeiso) && !trialHolds
+    && (isIso || isAdmin || iso.removalAssignedTo?.uid === me);
   // An active certificate with no open permits is orphaned — let an
   // Issuer/Admin release it directly to return the equipment to service.
   const openAttached = attached.filter((p) => ["draft", "submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
-  const canRelease = canI && iso.status === "active" && openAttached.length === 0;
+  const canRelease = canI && iso.status === "active" && openAttached.length === 0 && !trialHolds;
+  // The Isolator's two steps, offered where Isolators actually work. Requesting
+  // and clearing stay on the crews' own permits — those are the crew's word
+  // about their own people, and this page does not know which crew you are.
+  const canEnergise = trialAt === "approved" && (isIso || isAdmin);
+  const canReIsolate = energised && (isIso || isAdmin);
+  const canAuthorise = trialAt === "requested" && canI
+    && !trialC.outstanding.length && !trialC.refused.length;
+  const canCancelTrial = ["requested", "approved"].includes(trialAt)
+    && (canI || iso.trialRun?.requestedBy?.uid === me);
 
   let actions = "";
   if (canConfirm) actions += `<button class="btn btn-success" id="conf">Confirm isolation applied</button>`;
   if (canRemove) actions += `<button class="btn btn-success" id="rem">Confirm de-isolation complete</button>`;
   if (canRelease) actions += `<button class="btn btn-danger" id="release">Release isolation (return to service)</button>`;
+  if (canAuthorise) actions += `<button class="btn btn-danger" id="itrialOk">Authorise trial run</button>`;
+  if (canEnergise) actions += `<button class="btn btn-danger" id="itrialGo">De-isolate for trial run</button>`;
+  if (canReIsolate) actions += `<button class="btn btn-success" id="itrialBack">Re-isolate after trial run</button>`;
+  if (canCancelTrial) actions += `<button class="btn btn-ghost" id="itrialCancel">Cancel trial run</button>`;
   actions += `<button class="btn btn-ghost no-print" id="ipdf">${ICON.pdf} Print / PDF</button>`;
 
   const kv = (k, v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`;
   m.innerHTML = `
     <div class="page-head"><div><div class="kick">Isolation Certificate</div>
-      <h2 style="display:flex;align-items:center;gap:.6rem"><span class="mono" style="font-size:1.1rem">${esc(iso.isoNo || iso.id)}</span> ${badge(iso.status)}</h2></div>
+      <h2 style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap"><span class="mono" style="font-size:1.1rem">${esc(iso.isoNo || iso.id)}</span> ${badge(iso.status)}${trialChip(iso)}</h2></div>
       <div class="actions">${actions}</div></div>
+    ${energised ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — ${esc(iso.equipmentTag || "the equipment")} is ENERGISED.</b>
+      The locks are OUT. ${isIso || isAdmin ? "Re-isolate as soon as the trial is finished." : "An Isolator must re-isolate before any work resumes."}
+      ${iso.trialRun?.deisolatedBy ? `<div style="margin-top:.35rem">Removed by ${personHTML(iso.trialRun.deisolatedBy.name, iso.trialRun.deisolatedBy)} · ${fmt(iso.trialRun.deisolatedAt)}.</div>` : ""}</div>` : ""}
+    ${trialHolds && !energised ? `<div class="warn-box"><b>A trial run is ${trialAt === "approved" ? "authorised" : "requested"} on this certificate.</b>
+      Hand-back is held until it is finished or called off — <b>the locks are still ON</b>.</div>` : ""}
     ${iso.status === "assigned" ? `<div class="warn-box">Awaiting confirmation by <b>${personHTML(iso.assignedTo?.name, iso.assignedTo)}</b>. Work must not start until the isolation is confirmed.</div>` : ""}
     ${readyForDeiso ? `<div class="warn-box"><b>Ready for de-isolation.</b> All permits on this certificate have been confirmed work-complete, so <b>${esc(iso.equipmentTag)}</b> can now be de-isolated. <b>Locks are still ON</b> — an Isolator must confirm de-isolation before the Issuer can close the permit(s).</div>` : ""}
     ${iso.status === "removalPending" ? `<div class="warn-box">De-isolation assigned to <b>${iso.removalAssignedTo ? personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) : "(unassigned — any Isolator can action)"}</b>. Locks are still ON.</div>` : ""}
@@ -3761,10 +3828,62 @@ async function viewIsolationDetail(m) {
     <div class="card"><h3>Isolation points</h3>
       <table class="tbl"><thead><tr><th>Point</th><th>Method</th><th>Lock / tag</th></tr></thead><tbody>
         ${(iso.points || []).map((i) => `<tr><td>${esc(i.point)}</td><td>${esc(i.method || "—")}</td><td>${esc(i.lockTag || "—")}</td></tr>`).join("") || `<tr><td colspan="3" class="empty">No points listed</td></tr>`}
-      </tbody></table></div>`;
+      </tbody></table></div>
+    ${trialLiveHTML(iso, attached)}
+    ${trialHistoryHTML(iso, null)}`;
 
   $$("[data-pl]").forEach((d) => d.onclick = () => go("detail", { id: d.dataset.pl }));
   $("#ipdf").onclick = () => printIsolation(iso, equip, attached);
+
+  /* ---- trial run, from the certificate ---- */
+  // Requesting and clearing are deliberately NOT here. Those are a crew's word
+  // about their own people, and they belong on that crew's own permit.
+  const itag = esc(iso.equipmentTag || "the equipment");
+  const iTrialArgs = { isoId: id, knownIds: attached.map((p) => p.id) };
+  const runITrial = async (fn, args, okMsg, errMsg) => {
+    try { await fn({ ...iTrialArgs, ...args }); } catch (e) { return toast(e.message || errMsg, "err"); }
+    closeModal(); toast(okMsg, "ok"); go("isodetail", { id });
+  };
+
+  if (canAuthorise) $("#itrialOk").onclick = () => confirmBoxHTML("Authorise trial run",
+    `<div class="danger-box">Authorising permits an Isolator to <b>remove the locks and energise ${itag}</b>.</div>
+     <div class="info-box">Requested by ${personHTML(iso.trialRun.requestedBy?.name, iso.trialRun.requestedBy)}${iso.trialRun.reason ? ` — ${esc(iso.trialRun.reason)}` : ""}.
+       All ${trialC.given.length} other crew(s) on this certificate have cleared.</div>
+     <p>The equipment stays isolated until an Isolator acts.</p>`,
+    "Authorise trial run",
+    () => runITrial(trialApprove, {}, "Trial run authorised — an Isolator must now de-isolate", "Could not authorise the trial run"), true);
+
+  if (canEnergise) $("#itrialGo").onclick = () => {
+    const working = attached.filter((p) => ["active", "extended"].includes(p.status));
+    modal({ title: "De-isolate for trial run", wide: true, body: `
+      <div class="danger-box">This removes the locks and <b>ENERGISES ${itag}</b>. Every crew must be clear before you proceed.</div>
+      <div class="info-box">Authorised by ${personHTML(iso.trialRun.issuerApproval?.name, iso.trialRun.issuerApproval)} · ${fmt(iso.trialRun.issuerApproval?.at)}${iso.trialRun.reason ? ` — ${esc(iso.trialRun.reason)}` : ""}.
+        ${working.length ? `<div style="margin-top:.35rem"><b>${working.length} live permit(s)</b> on this certificate: ${working.map((p) => `<span class="mono">${esc(p.permitNo)}</span>`).join(", ")}.</div>` : ""}</div>
+      <label class="checkline"><input type="checkbox" id="ig1"> I have verified every crew is physically clear of the equipment</label>
+      <label class="checkline"><input type="checkbox" id="ig2"> All crews on this equipment have been notified</label>
+      <label class="checkline"><input type="checkbox" id="ig3"> I am removing the locks and tags for the trial run</label>`,
+      footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Remove locks & energise</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => {
+      if (!($("#ig1").checked && $("#ig2").checked && $("#ig3").checked)) return toast("Confirm all three checks", "err");
+      runITrial(trialEnergise, {}, "Trial run started — equipment ENERGISED", "Could not energise the equipment");
+    };
+  };
+
+  if (canReIsolate) $("#itrialBack").onclick = () => confirmBoxHTML("Re-isolate after trial run",
+    `<div class="danger-box"><b>${itag} is ENERGISED.</b></div>
+     <p>Confirm the locks and tags are back on and the equipment is safe. Work may then resume on every permit attached to this certificate.</p>`,
+    "Confirm re-isolated", () => runITrial(trialReIsolate, {}, "Re-isolated — work may resume", "Could not re-isolate"));
+
+  if (canCancelTrial) $("#itrialCancel").onclick = () => {
+    modal({ title: "Cancel trial run", body: `
+      <div class="info-box">The request is withdrawn and kept in the log. Nothing has been energised.</div>
+      <label class="lbl">Reason (optional)</label><input id="iCx" placeholder="e.g. no longer needed">`,
+      footer: `<button class="btn btn-ghost" data-c>Keep it</button><button class="btn btn-danger" data-ok>Cancel trial run</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => runITrial(trialCancel, { reason: $("#iCx").value.trim() },
+      "Trial run cancelled", "Could not cancel the trial run");
+  };
 
   if (canConfirm) $("#conf").onclick = () => {
     modal({ title: "Confirm isolation applied", wide: true, body: `
@@ -3812,7 +3931,8 @@ async function viewIsolationDetail(m) {
         if (!iSnap.exists()) gate("This certificate no longer exists.");
         const cur = iSnap.data();
         if (cur.status === "removed") gate("This certificate has already been de-isolated.");
-        if (cur.status === "trialRun") gate("The equipment is energised for a trial run — re-isolate before de-isolating.");
+        const deisoHold = handbackHold(cur, "de-isolating");
+        if (deisoHold) gate(deisoHold);
         // Only reset the equipment if THIS certificate is still its current one —
         // never mark it Available out from under a newer certificate. Re-read it
         // inside the transaction so the check cannot be beaten by a stale page.
@@ -3834,6 +3954,8 @@ async function viewIsolationDetail(m) {
         if (!iSnap.exists()) gate("This certificate no longer exists.");
         const cur = iSnap.data();
         if (cur.status !== "active") gate(`This certificate is now ${STATUS_LABEL[cur.status] || cur.status} — it was not released.`);
+        const relHold = handbackHold(cur, "releasing");
+        if (relHold) gate(relHold);
         // "No open permits" is what makes releasing safe. A permit may have been
         // approved onto this certificate while the dialog was open, so re-check
         // every attachment server-side rather than trusting the loaded page.

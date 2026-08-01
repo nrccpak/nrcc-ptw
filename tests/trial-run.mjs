@@ -47,17 +47,18 @@ const M = new Function(`
   ${grab("function trialConsentTargets(iso, permits, requestingPermitId)")}
   ${grab("function trialConsentState(iso, permits)")}
   ${grab("function trialReadyToEnergise(iso, permits)")}
+  ${grab("function handbackHold(iso, verb)")}
   ${grab("function isoIndex(isolations)")}
   ${grab("function permitStage(p, isolations)")}
   ${grab("function permitsByIso(permits)")}
   ${grab("function isoReadyForDeiso(iso, permits, byIso)")}
   ${grab("function equipmentBlock(eqId, permits, isolations, excludeId)")}
   return { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
-           trialReadyToEnergise, permitStage, isoReadyForDeiso, equipmentBlock };
+           trialReadyToEnergise, handbackHold, permitStage, isoReadyForDeiso, equipmentBlock };
 `)();
 
 const { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
-        trialReadyToEnergise, permitStage, isoReadyForDeiso, equipmentBlock } = M;
+        trialReadyToEnergise, handbackHold, permitStage, isoReadyForDeiso, equipmentBlock } = M;
 
 let pass = 0, fail = 0;
 function check(name, cond) { cond ? pass++ : fail++; console.log(`${cond ? "  PASS" : "  FAIL"}  ${name}`); }
@@ -213,6 +214,31 @@ console.log("\nEnergising takes approval AND a clear answer from every crew:");
     trialReadyToEnergise(cert(trial("energised", all)), permits) === false);
   check("no trial → not ready", trialReadyToEnergise(cert(), permits) === false);
   check("no certificate → not ready", trialReadyToEnergise(null, permits) === false);
+}
+
+console.log("\nHand-back is held by a trial run at ANY stage, not just an energised one:");
+{
+  // Hand-back is the point of no return — the locks come off for good. Taking
+  // them off while a crew is waiting to energise would leave a live request
+  // pointing at a dead certificate, with that crew still reading "authorised".
+  check("a quiet certificate is free to hand back", handbackHold(cert(), "de-isolating") === null);
+  check("a requested trial holds it", !!handbackHold(cert(trial("requested")), "de-isolating"));
+  check("an authorised trial holds it too", !!handbackHold(cert(trial("approved")), "de-isolating"));
+  check("an energised one obviously holds it", !!handbackHold(cert(trial("energised")), "de-isolating"));
+  // The state the earlier flow leaves behind: status alone, no sub-document.
+  check("a legacy energised certificate holds it",
+    !!handbackHold({ id: "C1", status: "trialRun" }, "de-isolating"));
+  // An energised certificate gets the message that says what to DO about it.
+  check("energised says re-isolate first",
+    handbackHold(cert(trial("energised")), "de-isolating").includes("re-isolate before de-isolating"));
+  check("a pending one says finish or cancel it",
+    handbackHold(cert(trial("requested")), "de-isolating").includes("finish or cancel"));
+  check("the verb follows the action being blocked",
+    handbackHold(cert(trial("requested")), "releasing").includes("before releasing"));
+  check("no certificate, nothing to hold", handbackHold(null, "de-isolating") === null);
+  // A finished trial must not hold the lockout forever.
+  check("history alone does not hold hand-back",
+    handbackHold({ id: "C1", status: "active", trialRun: null, trialRunLog: [trial("closed")] }, "de-isolating") === null);
 }
 
 console.log("\nThe late-attach hole — a crew approved after the consents were gathered:");
