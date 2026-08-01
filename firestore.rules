@@ -75,12 +75,19 @@ service cloud.firestore {
     // The caller personally owns a permit that is live and attached to THIS
     // certificate — i.e. they are one of the crews this lockout is holding.
     // This is what stops any signed-in user from speaking for a crew.
+    // Split in two so the permit is fetched ONCE rather than once per clause.
+    // A rules evaluation is capped at ten document accesses, and each of the
+    // three write shapes below may reach this check; the callers also put it
+    // last so the cheap field comparisons short-circuit first.
+    function crewPermitOk(isoId, p) {
+      return p.requester.uid == request.auth.uid
+        && p.isolationRef == isoId
+        && p.status in ['active', 'extended'];
+    }
     function ownsCrewPermit(isoId, permitId) {
       return permitId is string
         && exists(/databases/$(database)/documents/permits/$(permitId))
-        && get(/databases/$(database)/documents/permits/$(permitId)).data.requester.uid == request.auth.uid
-        && get(/databases/$(database)/documents/permits/$(permitId)).data.isolationRef == isoId
-        && get(/databases/$(database)/documents/permits/$(permitId)).data.status in ['active', 'extended'];
+        && crewPermitOk(isoId, get(/databases/$(database)/documents/permits/$(permitId)).data);
     }
 
     // Raising the request: no trial in flight, it starts unauthorised, and the

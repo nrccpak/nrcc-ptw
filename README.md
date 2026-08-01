@@ -64,9 +64,14 @@ isolated equipment directly, which no amount of reading the client could reveal.
 ```
 npm install --no-save @firebase/rules-unit-testing firebase-tools
 node_modules/.bin/firebase setup:emulators:firestore
-node_modules/.bin/firebase emulators:exec --only firestore \
-  --project nrcc-rules-test "node tests/rules-trial-run.mjs"
+node_modules/.bin/firebase emulators:exec --only firestore --project nrcc-rules-test \
+  "node tests/rules-trial-run.mjs && node tests/rules-trial-run-flow.mjs"
 ```
+
+`rules-trial-run.mjs` asks what the rules permit. `rules-trial-run-flow.mjs`
+drives the app's own transaction code through the emulator with those rules
+enforced, which is what proves the two halves actually fit — including the case
+of a modified client that lies about the signer's role.
 
 Add a check whenever you change a safety rule — the point of these files is that
 the next person can change the code without having to rediscover why it is the
