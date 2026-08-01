@@ -193,6 +193,10 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
 .stage-inProgress{background:var(--bg-2);border:1px solid var(--line);color:var(--ink-2)}
 .stage-awaitingDeisolation{background:var(--amber-soft);color:#8a5d00}
 .stage-awaitingClosure{background:var(--steel-soft);color:var(--steel)}
+/* Trial run, shown beside the badge on every permit sharing the certificate.
+   Energised is the loudest thing on the page — the equipment is live. */
+.stage-trialRun{background:var(--red);color:#fff}
+.stage-trialPending{background:var(--amber-soft);color:#8a5d00}
 .chip{display:inline-flex;align-items:center;gap:.35rem;background:var(--bg-2);border:1px solid var(--line);
   border-radius:20px;padding:.25rem .65rem;font-size:.78rem;font-weight:600;color:var(--ink-2)}
 .chip-ok{background:var(--green-soft);border-color:#BFE3C9;color:#15784f}

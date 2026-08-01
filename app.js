@@ -167,6 +167,17 @@ function permitStage(p, isolations) {
 function stageChip(stage) {
   return stage ? ` <span class="badge-st stage-${stage}">${STAGE_LABEL[stage]}</span>` : "";
 }
+// A trial run is shown as a chip ALONGSIDE the permit's status and stage, never
+// as a status or a permitStage() value: `["active","extended"]` and the three
+// stage names are load-bearing in the cycle, hand-back and dashboard logic (and
+// in their tests), and a permit in a trial run is still an active permit.
+function trialChip(iso) {
+  if (isTrialEnergised(iso)) return ` <span class="badge-st stage-trialRun">TRIAL RUN — ENERGISED</span>`;
+  const st = trialStage(iso);
+  if (st === "requested") return ` <span class="badge-st stage-trialPending">Trial run requested</span>`;
+  if (st === "approved") return ` <span class="badge-st stage-trialPending">Trial run authorised</span>`;
+  return "";
+}
 // Cycle-based equipment availability. Joining a still-working shared isolation
 // is allowed (several crews under one lockout), but once the hand-back has
 // begun the equipment is blocked for NEW permits until the Issuer closes every
@@ -2214,6 +2225,46 @@ function makePermitNo(type) {
   return `NRCC-${type.abbr}-${ymd}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
 
+// Every trial run this lockout has seen, newest last: the completed/refused/
+// cancelled ones from the certificate, plus the one in flight. `permit` supplies
+// the legacy fallback — trials started by the first version of this feature were
+// recorded on the permit, and those records must not disappear from the audit
+// trail just because the state moved to the certificate.
+function trialHistoryHTML(iso, permit) {
+  const rows = [...(iso?.trialRunLog || [])];
+  if (iso?.trialRun) rows.push(iso.trialRun);
+  const legacy = (permit?.trialRuns || []).map((t) => ({
+    legacy: true, requestedAt: t.authorisedAt || t.requestedAt, permitNo: permit.permitNo,
+    requestedBy: { name: t.authorisedBy, ...(t.authorisedByMeta || {}) },
+    reIsolatedAt: t.reIsolatedAt, status: t.status,
+    outcome: t.reIsolatedAt ? "completed" : null
+  }));
+  const all = [...legacy, ...rows];
+  if (!all.length) return "";
+  const OUTCOME = { completed: `<span class="chip chip-ok">✔ Completed</span>`,
+    refused: `<span class="chip">Refused by a crew</span>`,
+    cancelled: `<span class="chip">Cancelled</span>`,
+    abandoned: `<span class="chip">Abandoned</span>` };
+  return `<div class="card"><h3>Trial run log</h3>
+    ${all.map((t) => {
+      const answers = (t.consents || []).filter((c) => c && c.decision !== "requested");
+      return `<div class="kv"><div class="k">${fmt(t.requestedAt)}</div><div class="v">
+        ${t.permitNo ? `<span class="mono">${esc(t.permitNo)}</span> · ` : ""}
+        Requested by ${personHTML(t.requestedBy?.name, t.requestedBy)}
+        ${OUTCOME[t.outcome] || `<span class="chip chip-prog">● ${esc(STATUS_LABEL[t.status] || t.status || "open")}</span>`}
+        ${t.reason ? `<div>${esc(t.reason)}</div>` : ""}
+        ${answers.length ? `<div>Crews: ${answers.map((c) => `<span class="mono">${esc(c.permitNo || c.permitId || "")}</span> ${c.decision === "refuse" ? "refused" : "cleared"}`).join(" · ")}</div>` : ""}
+        ${t.issuerApproval ? `<div>Authorised by ${personHTML(t.issuerApproval.name, t.issuerApproval)} · ${fmt(t.issuerApproval.at)}</div>` : ""}
+        ${t.deisolatedBy ? `<div>Locks removed by ${personHTML(t.deisolatedBy.name, t.deisolatedBy)} · ${fmt(t.deisolatedAt)}</div>` : ""}
+        ${t.reIsolatedBy ? `<div>Re-isolated by ${personHTML(t.reIsolatedBy.name, t.reIsolatedBy)} · ${fmt(t.reIsolatedAt)}</div>`
+          : t.reIsolatedAt ? `<div>Re-isolated ${fmt(t.reIsolatedAt)}</div>`
+          : t.outcome ? "" : `<div><b>OPEN — equipment energised</b></div>`}
+        ${t.closedBy ? `<div>Closed by ${personHTML(t.closedBy.name, t.closedBy)} · ${fmt(t.closedAt)}${t.closeReason ? " — " + esc(t.closeReason) : ""}</div>` : ""}
+        ${t.legacy ? `<div class="help">Recorded by the earlier trial-run flow.</div>` : ""}
+      </div></div>`;
+    }).join("")}</div>`;
+}
+
 /* -------------------- 5d. Permit Detail -------------------- */
 async function viewPermitDetail(m) {
   m.innerHTML = `<div id="pd">Loading…</div>`;
@@ -2235,9 +2286,18 @@ async function viewPermitDetail(m) {
   ]);
   const equip = eqSnap && eqSnap.exists() ? { id: eqSnap.id, ...eqSnap.data() } : null;
   const isoDoc = isoSnap && isoSnap.exists() ? { id: isoSnap.id, ...isoSnap.data() } : null;
-  // Equipment temporarily energised for a trial run — surface a persistent
-  // "Re-isolate now" action (the post-trial prompt is easy to dismiss or miss).
-  const inTrial = (equip && equip.isolationStatus === "trialRun") || (isoDoc && isoDoc.status === "trialRun");
+  // Trial-run state comes off the CERTIFICATE, so every crew sharing the
+  // lockout sees the same thing on their own permit — not only the crew that
+  // asked for it.
+  const trialAt = trialStage(isoDoc);
+  const energised = isTrialEnergised(isoDoc);
+  const onCert = (sharedPermits || []).filter((x) => x.isolationRef === p.isolationRef);
+  const trialC = trialConsentState(isoDoc, onCert);
+  const iAmAsked = trialAt === "requested" && isOwner && trialC.outstanding.some((x) => x.id === p.id);
+  const iAsked = isoDoc?.trialRun?.requestedBy?.uid === State.profile.id;
+  const trialClear = !trialC.outstanding.length && !trialC.refused.length;
+  // Every permit the transaction should re-read: the crews this page can see.
+  const crewIds = onCert.map((x) => x.id);
 
   // Hand-back order: requester confirms work complete → Isolator de-isolates →
   // Issuer closes. The equipment is de-isolated when there is no certificate or
@@ -2284,20 +2344,43 @@ async function viewPermitDetail(m) {
     if (!(p.workCompletion && deisolated)) actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
     if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
   }
-  // Trial-run actions (Start trial run / Re-isolate now) are Admin-only;
-  // Issuers no longer see either action.
-  if (["active", "extended"].includes(p.status) && State.profile.role === "admin" && p.isolationRef && !inTrial) actions += `<button class="btn btn-danger" id="trial">Start trial run</button>`;
-  if (["active", "extended"].includes(p.status) && State.profile.role === "admin" && p.isolationRef && inTrial) actions += `<button class="btn btn-success" id="reiso">Re-isolate now</button>`;
+  // Trial run. Each role sees only its own step: the crew asks, the other crews
+  // clear, the Issuer authorises, the Isolator takes the locks out and puts
+  // them back. Nobody is offered someone else's step.
+  const permitLive = ["active", "extended"].includes(p.status);
+  if (permitLive && p.isolationRef && isOwner && !trialAt && !energised)
+    actions += `<button class="btn btn-danger" id="trialReq">Request trial run</button>`;
+  if (iAmAsked)
+    actions += `<button class="btn btn-success" id="trialYes">My crew is clear</button><button class="btn btn-danger" id="trialNo">Refuse</button>`;
+  if (trialAt === "requested" && isIssuer && trialClear)
+    actions += `<button class="btn btn-danger" id="trialOk">Authorise trial run</button>`;
+  if (["requested", "approved"].includes(trialAt) && (iAsked || isIssuer))
+    actions += `<button class="btn btn-ghost" id="trialCancel">Cancel trial run</button>`;
+  if (trialAt === "approved" && isIsoOrAdmin)
+    actions += `<button class="btn btn-danger" id="trialGo">De-isolate for trial run</button>`;
+  if (energised && isIsoOrAdmin)
+    actions += `<button class="btn btn-success" id="reiso">Re-isolate now</button>`;
   actions += `<button class="btn btn-ghost no-print" id="pdf">${ICON.pdf} Print / PDF</button>`;
 
   $("#pd").innerHTML = `
     <div class="page-head"><div><div class="kick">Permit · ${esc(p.typeName)}</div>
-      <h2 style="display:flex;align-items:center;gap:.6rem"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}</h2></div>
+      <h2 style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}${trialChip(isoDoc)}</h2></div>
       <div class="actions">${actions}</div></div>
 
     ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
     ${isOverdue(p) ? `<div class="danger-box"><b>Permit overdue.</b> The planned end (${fmt(permitEnd(p))}) has passed. ${isIssuer ? "Extend the validity or close the permit." : "Ask the Issuer to extend or close this permit."}</div>` : ""}
-    ${equip && equip.isolationStatus === "trialRun" ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — equipment ${esc(equip.tag)} is ENERGISED.</b></div>` : ""}
+    ${energised ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — ${esc(p.equipmentTag || equip?.tag || "the equipment")} is ENERGISED.</b>
+      Do not work on it and keep clear. ${isIsoOrAdmin ? "Re-isolate as soon as the trial is finished." : "An Isolator must re-isolate before any work resumes."}
+      ${isoDoc?.trialRun?.deisolatedBy ? `<div style="margin-top:.35rem">Locks removed by ${personHTML(isoDoc.trialRun.deisolatedBy.name, isoDoc.trialRun.deisolatedBy)} · ${fmt(isoDoc.trialRun.deisolatedAt)}${isoDoc.trialRun.permitNo ? ` for <span class="mono">${esc(isoDoc.trialRun.permitNo)}</span>` : ""}.</div>` : ""}</div>` : ""}
+    ${trialAt === "requested" ? `<div class="warn-box"><b>Trial run requested</b> by ${personHTML(isoDoc.trialRun.requestedBy?.name, isoDoc.trialRun.requestedBy)}${isoDoc.trialRun.permitNo ? ` on <span class="mono">${esc(isoDoc.trialRun.permitNo)}</span>` : ""} · ${fmt(isoDoc.trialRun.requestedAt)}.
+      ${isoDoc.trialRun.reason ? `<div style="margin-top:.35rem">${esc(isoDoc.trialRun.reason)}</div>` : ""}
+      <div style="margin-top:.35rem">${trialC.outstanding.length
+        ? `Waiting on <b>${trialC.outstanding.length} crew(s)</b> to clear: ${trialC.outstanding.map((x) => `<span class="mono">${esc(x.permitNo || x.id)}</span>`).join(", ")}.`
+        : `<b>All crews have cleared.</b> ${isIssuer ? "Authorise the trial run when you are satisfied." : "Awaiting the Issuer's authorisation."}`}</div>
+      ${iAmAsked ? `<div style="margin-top:.35rem"><b>Your crew has not answered.</b> Confirm your people are clear of ${esc(p.equipmentTag || "the equipment")}, or refuse.</div>` : ""}
+      <div style="margin-top:.35rem">The equipment is <b>still isolated</b> — the locks do not come out until an Isolator removes them.</div></div>` : ""}
+    ${trialAt === "approved" ? `<div class="warn-box"><b>Trial run authorised</b> by ${personHTML(isoDoc.trialRun.issuerApproval?.name, isoDoc.trialRun.issuerApproval)} · ${fmt(isoDoc.trialRun.issuerApproval?.at)}.
+      <b>The equipment is still isolated.</b> An Isolator must remove the locks before it is energised${isIsoOrAdmin ? " — use <b>De-isolate for trial run</b> when every crew is confirmed clear." : "."}</div>` : ""}
     ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
     ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed."}</div>` : ""}
     ${awaitingDeiso ? `<div class="warn-box"><b>Work complete — awaiting de-isolation.</b> Confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)} · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} <b>Locks are still on.</b> ${deisoReady ? `An Isolator must de-isolate <span class="mono">${esc(p.equipmentTag || "")}</span> on certificate <a href="#" data-isolink3 class="mono">${esc(p.isoNo || p.isolationRef)}</a> before this permit can be closed.` : `<b>This is expected, not a fault.</b> ${esc(p.equipmentTag || "")} is on a <b>shared isolation</b> with ${siblings.length} other permit(s)${siblingsWorking ? ` — <b>${siblingsWorking} still in progress</b>` : ""}. The locks stay ON until every crew confirms work complete. See <b>Other permits on this isolation</b> below.`}</div>` : ""}
@@ -2346,9 +2429,7 @@ async function viewPermitDetail(m) {
           <td>${workChip(s)}</td></tr>`).join("")}
       </tbody></table></div>` : ""}
 
-    ${p.trialRuns?.length ? `<div class="card"><h3>Trial run log</h3>
-      ${p.trialRuns.map((t) => `<div class="kv"><div class="k">${fmt(t.authorisedAt || t.requestedAt)}</div>
-        <div class="v">Authorised by ${personHTML(t.authorisedBy, t.authorisedByMeta)} · ${t.reIsolatedAt ? "Re-isolated " + fmt(t.reIsolatedAt) : "OPEN"}</div></div>`).join("")}</div>` : ""}
+    ${trialHistoryHTML(isoDoc, p)}
   `;
 
   // bind actions
@@ -2448,8 +2529,106 @@ async function viewPermitDetail(m) {
   });
   $("#workdone") && ($("#workdone").onclick = () => confirmWorkComplete(p, equip));
   $("#close") && ($("#close").onclick = () => closePermit(p, equip));
-  $("#trial") && ($("#trial").onclick = () => trialRun(p, equip));
-  $("#reiso") && ($("#reiso").onclick = () => offerReisolate(p, equip));
+  /* ---- trial run ---- */
+  const tag = esc(p.equipmentTag || equip?.tag || "the equipment");
+  const trialArgs = { isoId: p.isolationRef, permitId: p.id, knownIds: crewIds };
+  // Every one of these re-checks its preconditions server-side; the dialog only
+  // collects what the signer is attesting to.
+  const runTrial = async (fn, args, okMsg, errMsg) => {
+    try { await fn({ ...trialArgs, ...args }); } catch (e) { return toast(e.message || errMsg, "err"); }
+    closeModal(); toast(okMsg, "ok"); go("detail", { id: p.id });
+  };
+
+  $("#trialReq") && ($("#trialReq").onclick = () => {
+    modal({ title: "Request a trial run", wide: true, body: `
+      <div class="warn-box">A trial run temporarily <b>energises ${tag}</b> to prove your repair. It does not remove the lockout — an Isolator takes the locks out and puts them back.</div>
+      <div class="info-box">Every other crew still working under this certificate must clear the trial, then the Issuer must authorise it.</div>
+      <label class="lbl">Why is the trial needed?</label>
+      <textarea id="trReason" rows="3" placeholder="e.g. run the pump to prove the mechanical seal"></textarea>
+      <label class="checkline"><input type="checkbox" id="trMine"> My own crew is clear of ${tag}</label>`,
+      footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Request trial run</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => {
+      const reason = $("#trReason").value.trim();
+      if (!reason) return toast("Give a reason for the trial run", "err");
+      if (!$("#trMine").checked) return toast("Confirm your own crew is clear", "err");
+      runTrial(trialRequest, { reason }, "Trial run requested — waiting on the other crews", "Could not request the trial run");
+    };
+  });
+
+  $("#trialYes") && ($("#trialYes").onclick = () => {
+    modal({ title: "Clear the trial run", wide: true, body: `
+      <div class="danger-box"><b>${tag} will be ENERGISED</b> if every crew clears and the Issuer authorises. Confirm your people are clear before you answer.</div>
+      <label class="checkline"><input type="checkbox" id="trC1"> All of my crew are clear of the equipment</label>
+      <label class="checkline"><input type="checkbox" id="trC2"> My crew has been told a trial run is coming</label>
+      <label class="lbl">Remarks (optional)</label><input id="trRem" placeholder="Anything the Issuer should know">`,
+      footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-success" data-ok>My crew is clear</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => {
+      if (!($("#trC1").checked && $("#trC2").checked)) return toast("Confirm both checks", "err");
+      runTrial(trialAnswer, { decision: "consent", remarks: $("#trRem").value.trim() },
+        "Recorded — your crew is clear", "Could not record your answer");
+    };
+  });
+
+  $("#trialNo") && ($("#trialNo").onclick = () => {
+    modal({ title: "Refuse the trial run", body: `
+      <div class="info-box">Refusing ends this request. The crew can raise a new one once your work allows it.</div>
+      <label class="lbl">Why can your crew not clear?</label>
+      <textarea id="trWhy" rows="3" placeholder="e.g. my fitters are inside the guard"></textarea>`,
+      footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Refuse trial run</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => {
+      const remarks = $("#trWhy").value.trim();
+      if (!remarks) return toast("Give a reason", "err");
+      runTrial(trialAnswer, { decision: "refuse", remarks }, "Trial run refused", "Could not record your refusal");
+    };
+  });
+
+  $("#trialOk") && ($("#trialOk").onclick = () => {
+    const cleared = trialC.given.map((x) => `<span class="mono">${esc(x.permitNo || x.id)}</span>`).join(", ");
+    confirmBoxHTML("Authorise trial run",
+      `<div class="danger-box">Authorising permits an Isolator to <b>remove the locks and energise ${tag}</b>.</div>
+       <div class="info-box">Requested by ${personHTML(isoDoc.trialRun.requestedBy?.name, isoDoc.trialRun.requestedBy)}${isoDoc.trialRun.reason ? ` — ${esc(isoDoc.trialRun.reason)}` : ""}.
+       ${cleared ? `Crews cleared: ${cleared}.` : "No other crew is working under this certificate."}</div>
+       <p>The equipment stays isolated until an Isolator acts.</p>`,
+      "Authorise trial run",
+      () => runTrial(trialApprove, {}, "Trial run authorised — an Isolator must now de-isolate", "Could not authorise the trial run"), true);
+  });
+
+  $("#trialCancel") && ($("#trialCancel").onclick = () => {
+    modal({ title: "Cancel trial run", body: `
+      <div class="info-box">The request is withdrawn and kept in the log. Nothing has been energised.</div>
+      <label class="lbl">Reason (optional)</label><input id="trCx" placeholder="e.g. no longer needed">`,
+      footer: `<button class="btn btn-ghost" data-c>Keep it</button><button class="btn btn-danger" data-ok>Cancel trial run</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => runTrial(trialCancel, { reason: $("#trCx").value.trim() },
+      "Trial run cancelled", "Could not cancel the trial run");
+  });
+
+  // The Isolator's step. This is the one that actually energises the plant, so
+  // the three attestations sit here — with the person taking the locks out.
+  $("#trialGo") && ($("#trialGo").onclick = () => {
+    const others = onCert.filter((x) => x.id !== isoDoc?.trialRun?.permitId && ["active", "extended"].includes(x.status));
+    modal({ title: "De-isolate for trial run", wide: true, body: `
+      <div class="danger-box">This removes the locks and <b>ENERGISES ${tag}</b>. Every crew must be clear before you proceed.</div>
+      <div class="info-box">Authorised by ${personHTML(isoDoc.trialRun.issuerApproval?.name, isoDoc.trialRun.issuerApproval)} · ${fmt(isoDoc.trialRun.issuerApproval?.at)}${isoDoc.trialRun.reason ? ` — ${esc(isoDoc.trialRun.reason)}` : ""}.
+        ${others.length ? `<div style="margin-top:.35rem"><b>${others.length} other permit(s)</b> on this certificate: ${others.map((x) => `<span class="mono">${esc(x.permitNo)}</span>`).join(", ")}.</div>` : ""}</div>
+      <label class="checkline"><input type="checkbox" id="tg1"> I have verified every crew is physically clear of the equipment</label>
+      <label class="checkline"><input type="checkbox" id="tg2"> All crews on this equipment have been notified</label>
+      <label class="checkline"><input type="checkbox" id="tg3"> I am removing the locks and tags for the trial run</label>`,
+      footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Remove locks & energise</button>` });
+    $("[data-c]").onclick = closeModal;
+    $("[data-ok]").onclick = () => {
+      if (!($("#tg1").checked && $("#tg2").checked && $("#tg3").checked)) return toast("Confirm all three checks", "err");
+      runTrial(trialEnergise, {}, "Trial run started — equipment ENERGISED", "Could not energise the equipment");
+    };
+  });
+
+  $("#reiso") && ($("#reiso").onclick = () => confirmBoxHTML("Re-isolate after trial run",
+    `<div class="danger-box"><b>${tag} is ENERGISED.</b></div>
+     <p>Confirm the locks and tags are back on and the equipment is safe. Work may then resume, and the permit(s) can complete as normal.</p>`,
+    "Confirm re-isolated", () => runTrial(trialReIsolate, {}, "Re-isolated — work may resume", "Could not re-isolate")));
 }
 
 /* -------------------- 6. Permit + isolation logic -------------------- */
@@ -2973,77 +3152,6 @@ const trialApprove    = (o) => lifecycleTx("trial run approval",  (tx) => txTria
 const trialCancel     = (o) => lifecycleTx("trial run cancellation", (tx) => txTrialCancel(tx, { ...o, actor: actorStamp(), at: nowISO() }));
 const trialEnergise   = (o) => lifecycleTx("trial run de-isolation", (tx) => txTrialEnergise(tx, { ...o, actor: actorStamp(), at: nowISO() }));
 const trialReIsolate  = (o) => lifecycleTx("re-isolation",        (tx) => txTrialReIsolate(tx, { ...o, actor: actorStamp(), at: nowISO() }));
-
-// Superseded by the six above; still wired to the Admin-only buttons until the
-// UI piece replaces them, so a trial started today can still be re-isolated.
-async function trialRun(p, equip) {
-  const isoRef = p.isolationRef ? doc(db, "isolations", p.isolationRef) : null;
-  const iso = isoRef ? (await getDoc(isoRef)).data() : null;
-  const others = (iso?.attachedPermitIds || []).filter((x) => x !== p.id);
-  modal({ title: "Start trial run", wide: true, body: `
-    <div class="danger-box">A trial run temporarily <b>energises ${esc(equip?.tag)}</b>. All crews must be clear before you proceed.</div>
-    ${others.length ? `<div class="warn-box">${others.length} other permit(s) share this isolation. Confirm those crews are clear too.</div>` : ""}
-    <label class="checkline"><input type="checkbox" id="clr1"> All personnel are clear of the equipment</label>
-    <label class="checkline"><input type="checkbox" id="clr2"> All crews on this equipment have been notified</label>
-    <label class="checkline"><input type="checkbox" id="clr3"> I authorise temporary de-isolation for the trial run</label>`,
-    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>De-isolate & start trial</button>` });
-  $("[data-c]").onclick = closeModal;
-  $("[data-ok]").onclick = async () => {
-    if (!($("#clr1").checked && $("#clr2").checked && $("#clr3").checked)) return toast("Confirm all three checks", "err");
-    const tr = { requestedBy: State.profile.name, requestedAt: nowISO(), authorisedBy: State.profile.name, authorisedByMeta: myMeta(), authorisedAt: nowISO(), reIsolatedAt: null, status: "open" };
-    try {
-      // Energising equipment that crews may be working on is the highest-stakes
-      // write in the app — it must never be queued optimistically, and the
-      // certificate must still be the confirmed-active one we showed the dialog
-      // for (not already de-isolated, not already in another trial).
-      await lifecycleTx("trial run", async (tx) => {
-        const pRef = doc(db, "permits", p.id);
-        const pSnap = await tx.get(pRef);
-        if (!pSnap.exists()) gate("This permit no longer exists.");
-        if (!["active", "extended"].includes(pSnap.data().status))
-          gate(`This permit is now ${STATUS_LABEL[pSnap.data().status] || pSnap.data().status} — the trial run was not started.`);
-        if (isoRef) {
-          const iSnap = await tx.get(isoRef);
-          if (!iSnap.exists()) gate("The isolation certificate no longer exists.");
-          const st = iSnap.data().status;
-          if (st === "trialRun") gate("A trial run is already in progress on this certificate.");
-          if (st !== "active") gate(`The isolation is now ${STATUS_LABEL[st] || st} — the trial run was not started.`);
-        }
-        tx.update(pRef, { trialRuns: arrayUnion(tr), updatedAt: nowISO() });
-        if (isoRef) tx.update(isoRef, { status: "trialRun" });
-        if (equip) tx.update(doc(db, "equipment", equip.id), { isolationStatus: "trialRun", updatedAt: nowISO() });
-      });
-    } catch (e) { return toast(e.message || "Could not start the trial run", "err"); }
-    closeModal(); toast("Trial run started — equipment energised", "");
-    // offer re-isolate immediately
-    setTimeout(() => offerReisolate(p, equip), 400);
-    go("detail", { id: p.id });
-  };
-}
-function offerReisolate(p, equip) {
-  confirmBoxHTML("Trial run in progress", `<div class="danger-box"><b>${esc(equip?.tag)} is ENERGISED.</b></div>
-    <p>When the trial is complete, re-isolate to resume work, or close the permit if the job is done.</p>`,
-    "Re-isolate now", async () => {
-      await lifecycleTx("re-isolation", async (tx) => {
-        // Read the trial-run list inside the transaction: closing out the wrong
-        // entry (or one already closed by someone else) would leave the audit
-        // trail claiming the equipment is still energised, or vice versa.
-        const pRef = doc(db, "permits", p.id);
-        const snap = await tx.get(pRef);
-        if (!snap.exists()) gate("This permit no longer exists.");
-        const pp = snap.data();
-        const isoRef = p.isolationRef ? doc(db, "isolations", p.isolationRef) : null;
-        const iSnap = isoRef ? await tx.get(isoRef) : null;
-        if (iSnap && iSnap.exists() && iSnap.data().status !== "trialRun")
-          gate("This certificate is no longer in a trial run — nothing to re-isolate.");
-        const trs = (pp.trialRuns || []).map((t, i, a) => i === a.length - 1 ? { ...t, reIsolatedAt: nowISO(), status: "closed" } : t);
-        tx.update(pRef, { trialRuns: trs, updatedAt: nowISO() });
-        if (isoRef) tx.update(isoRef, { status: "active" });
-        if (equip) tx.update(doc(db, "equipment", equip.id), { isolationStatus: "isolated", updatedAt: nowISO() });
-      });
-      closeModal(); toast("Re-isolated — work may resume", "ok"); go("detail", { id: p.id });
-    });
-}
 
 // HTML-body confirm variant
 function confirmBoxHTML(title, bodyHtml, okLabel, onOk, danger = false) {
