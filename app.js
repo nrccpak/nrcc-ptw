@@ -1406,7 +1406,10 @@ function isTrialEnergised(iso) {
 // (Excluded crews are not left in the dark — the certificate still carries the
 // trial, so they see the energised state on their own permit.)
 function trialConsentTargets(iso, permits, requestingPermitId) {
-  if (!iso) return [];
+  // Without an id there is nothing to match against, and `p.isolationRef ===
+  // undefined` would quietly collect every permit attached to NO certificate
+  // and present them as this lockout's crew.
+  if (!iso || !iso.id) return [];
   return (permits || []).filter((p) =>
     p.isolationRef === iso.id &&
     p.id !== requestingPermitId &&
@@ -1445,6 +1448,10 @@ function trialReadyToEnergise(iso, permits) {
   const t = iso && iso.trialRun;
   if (!t || t.status !== "approved") return false;
   if (!t.issuerApproval) return false;
+  // No id means the crew list could not be resolved, and an empty crew list
+  // would then read as "nobody is working here". Silence from a failed lookup
+  // is not consent.
+  if (!iso.id) return false;
   // Locks must still be on and staying on: an assigned, removalPending or
   // removed certificate is not a lockout anyone may lift for a trial.
   if (iso.status !== "active") return false;
@@ -2859,7 +2866,12 @@ async function txTrialCancel(tx, o) {
   const iso = { id: o.isoId, ...iSnap.data() };
   const stage = trialStage(iso);
   if (stage === "energised") gate("The equipment is energised — it must be re-isolated, not cancelled.");
-  if (!["requested", "approved"].includes(stage)) gate("There is no trial run request to cancel.");
+  // Deliberately keyed on the record EXISTING rather than on a recognised
+  // stage. A trialRun object this build does not understand — written by a
+  // newer version while this client ran from the service-worker cache, or by a
+  // partial write — must still be clearable, or the certificate deadlocks:
+  // every other step refuses it and no trial run can ever run here again.
+  if (!iso.trialRun) gate("There is no trial run request to cancel.");
   if (iso.trialRun.requestedBy?.uid !== o.actor.uid && !["issuer", "admin"].includes(o.actor.role))
     gate("Only the crew that asked, or an Issuer, may cancel a trial run request.");
   tx.update(isoRef, {
@@ -2887,8 +2899,14 @@ async function txTrialEnergise(tx, o) {
       ? "The Issuer has not authorised this trial run yet — the equipment was not energised."
       : "There is no authorised trial run on this certificate.");
   const crew = await txReadCrew(tx, o.isoId, iso, o.knownIds);
-  const eqRef = o.equipmentId ? doc(db, "equipment", o.equipmentId) : null;
+  // The certificate names the equipment it locks out, so trust that over
+  // anything the caller passed, and refuse when it cannot be resolved at all.
+  // Energising without writing the equipment record would flip the certificate
+  // live while the asset register still read "Isolated".
+  const eqId = iso.equipmentRef || o.equipmentId || null;
+  const eqRef = eqId ? doc(db, "equipment", eqId) : null;
   const eqSnap = eqRef ? await tx.get(eqRef) : null;          // last read before any write
+  if (!eqRef) gate("This certificate does not name the equipment it isolates — the equipment was not energised.");
   if (!trialReadyToEnergise(iso, crew)) {
     const st = trialConsentState(iso, crew);
     if (st.refused.length) gate("A crew has refused this trial run — the equipment was not energised.");
@@ -2918,13 +2936,22 @@ async function txTrialReIsolate(tx, o) {
     gate("Only an Isolator may re-apply the locks after a trial run.");
   if (!isTrialEnergised(iso)) gate("This certificate is not in a trial run — there is nothing to re-isolate.");
   const crew = await txReadCrew(tx, o.isoId, iso, o.knownIds);
-  const eqRef = o.equipmentId ? doc(db, "equipment", o.equipmentId) : null;
+  // Same authority as energising — but no gate if it cannot be resolved.
+  // Getting the certificate back to active is what unblocks hand-back, and
+  // refusing that would strand the lockout; an equipment row left reading
+  // "Trial Run" is a false alarm, which is the safe direction to fail.
+  const eqId = iso.equipmentRef || o.equipmentId || null;
+  const eqRef = eqId ? doc(db, "equipment", eqId) : null;
   const eqSnap = eqRef ? await tx.get(eqRef) : null;          // last read before any write
   const t = iso.trialRun || { status: "energised", legacy: true, permitId: null, consents: [],
                               reason: "Started by the earlier trial-run flow", requestedAt: null };
   tx.update(isoRef, {
     status: "active", trialRun: null,
-    trialRunLog: arrayUnion({ ...t, status: "closed", outcome: "completed",
+    // Only a trial that actually reached ENERGISED completed. A certificate
+    // carrying trialRun status over a request that never got there is an
+    // inconsistent state — log it for what it is rather than claiming a run.
+    trialRunLog: arrayUnion({ ...t, status: "closed",
+      outcome: (!iso.trialRun || trialStage(iso) === "energised") ? "completed" : "abandoned",
       reIsolatedBy: o.actor, reIsolatedAt: o.at })
   });
   // Only reset the equipment if it still points at THIS certificate.

@@ -263,6 +263,12 @@ console.log("\nOnly the Isolator energises, and only against a live re-check:");
   moved.equipment.EQ1.activeIsolationId = "C9";
   await check("equipment now under a different certificate refuses",
     run("txTrialEnergise", moved, { actor: ISOLATOR }), "gate");
+
+  // The lockout itself moved on while the trial sat authorised: hand-back
+  // started, or the locks are already off. Neither is a lockout to lift.
+  for (const st of ["removalPending", "removed", "assigned"])
+    await check(`a certificate that went to ${st} refuses`,
+      run("txTrialEnergise", store(trial("approved", all), { status: st }), { actor: ISOLATOR }), "gate");
 }
 console.log("\nThe late-attach hole, closed inside the transaction:");
 {
@@ -323,6 +329,77 @@ console.log("\nA trial left running by the FIRST version is still recoverable:")
   is("the stranded permit entry is closed, not left claiming ENERGISED",
     pa.trialRuns[0].status === "closed" && pa.trialRuns[0].reIsolatedAt === NOW);
   is("permits with no stranded entry are left alone", wrote(tx, "permits", "B") === null);
+}
+
+/* ============ A record this build does not understand ============ */
+console.log("\nAn unrecognised trial-run record must not deadlock the certificate:");
+{
+  // How this arises: a newer build writes a stage this one has never heard of
+  // while the client is running from the service-worker cache. Every step
+  // below refuses it — so unless CANCEL stays open, no trial run can ever run
+  // on this certificate again and nothing in the app can clear the record.
+  const junk = () => store({ status: "somethingNewer", permitId: "A", requestedBy: REQ_A, consents: [] });
+  await check("a new request still refuses", run("txTrialRequest", junk(), { permitId: "A", actor: REQ_A }), "gate");
+  await check("answering still refuses", run("txTrialAnswer", junk(), { permitId: "B", decision: "consent", actor: REQ_B }), "gate");
+  await check("authorising still refuses", run("txTrialApprove", junk(), { actor: ISSUER }), "gate");
+  await check("energising still refuses", run("txTrialEnergise", junk(), { actor: ISOLATOR }), "gate");
+  await check("re-isolating still refuses", run("txTrialReIsolate", junk(), { actor: ISOLATOR }), "gate");
+
+  const tx = await check("THE WAY OUT: an Issuer can always cancel the record",
+    run("txTrialCancel", junk(), { actor: ISSUER, reason: "unrecognised record" }), "ok");
+  is("the stuck record is cleared", wrote(tx, "isolations", "C1").trialRun === null);
+  is("and kept in the log", unioned(wrote(tx, "isolations", "C1").trialRunLog).outcome === "cancelled");
+  await check("the crew that asked can clear it too", run("txTrialCancel", junk(), { actor: REQ_A }), "ok");
+  await check("an Admin can clear it", run("txTrialCancel", junk(), { actor: ADMIN }), "ok");
+  await check("an unrelated crew still cannot", run("txTrialCancel", junk(), { actor: REQ_B }), "gate");
+  // Still no paper exit from a physical state.
+  await check("an ENERGISED record is still not cancellable",
+    run("txTrialCancel", store(trial("energised")), { actor: ADMIN }), "gate");
+}
+
+/* ============ The equipment comes from the certificate ============ */
+console.log("\nThe certificate names the equipment it locks out — not the caller:");
+{
+  const all = [says("B", "consent"), says("C", "consent")];
+  // The certificate is the authority: a caller that names the wrong asset, or
+  // none at all, must not be able to energise the wrong record — or worse,
+  // flip the certificate live while the asset register still reads Isolated.
+  const s = store(trial("approved", all), { equipmentRef: "EQ1" });
+  const tx = await check("the caller may omit the equipment entirely",
+    run("txTrialEnergise", s, { actor: ISOLATOR, equipmentId: null }), "ok");
+  is("the certificate's own equipment is written", wrote(tx, "equipment", "EQ1").isolationStatus === "trialRun");
+
+  const wrongCaller = store(trial("approved", all), { equipmentRef: "EQ1" });
+  const tx2 = await check("a caller naming another asset does not redirect the write",
+    run("txTrialEnergise", wrongCaller, { actor: ISOLATOR, equipmentId: "EQ9" }), "ok");
+  is("the write still lands on the certificate's equipment",
+    wrote(tx2, "equipment", "EQ1") !== null && wrote(tx2, "equipment", "EQ9") === null);
+
+  // Nothing to write means the register would silently disagree with reality.
+  const nameless = store(trial("approved", all));
+  delete nameless.isolations.C1.equipmentRef;
+  await check("a certificate naming no equipment refuses to energise",
+    run("txTrialEnergise", nameless, { actor: ISOLATOR, equipmentId: null }), "gate");
+
+  // Re-isolation fails the other way on purpose: getting the certificate back
+  // to active is what unblocks hand-back, and a stale "Trial Run" row is a
+  // false alarm rather than a hidden hazard.
+  const namelessBack = store(trial("energised", all), { status: "trialRun" });
+  delete namelessBack.isolations.C1.equipmentRef;
+  const tx3 = await check("...but re-isolation proceeds anyway",
+    run("txTrialReIsolate", namelessBack, { actor: ISOLATOR, equipmentId: null }), "ok");
+  is("the certificate is returned to active", wrote(tx3, "isolations", "C1").status === "active");
+}
+
+console.log("\nThe log says what actually happened:");
+{
+  // Certificate carrying trialRun status over a request that never reached
+  // ENERGISED. Recording that as a completed trial would put a run in the
+  // audit trail that never took place.
+  const odd = store(trial("requested"), { status: "trialRun" });
+  const tx = await check("an inconsistent state re-isolates", run("txTrialReIsolate", odd, { actor: ISOLATOR }), "ok");
+  is("it is logged as abandoned, not completed",
+    unioned(wrote(tx, "isolations", "C1").trialRunLog).outcome === "abandoned");
 }
 
 /* ===================== crew reading ===================== */
