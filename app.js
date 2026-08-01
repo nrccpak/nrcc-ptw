@@ -1398,15 +1398,20 @@ function isTrialEnergised(iso) {
 }
 
 // The crews that must clear before the equipment may be energised: every OTHER
-// permit still live on the certificate. A crew that has already confirmed work
-// complete is still required — their locks are on and their people may still
-// be on site. Permits waiting on isolation are not: no crew is on the tools.
+// permit on the certificate whose crew is still on the tools. Confirming work
+// complete is the requester's own declaration that the job is finished and the
+// equipment is safe to return to service, so those crews are not asked again —
+// waiting on them would delay the trial without learning anything new. Permits
+// still waiting on isolation are not asked either: that crew never started.
+// (Excluded crews are not left in the dark — the certificate still carries the
+// trial, so they see the energised state on their own permit.)
 function trialConsentTargets(iso, permits, requestingPermitId) {
   if (!iso) return [];
   return (permits || []).filter((p) =>
     p.isolationRef === iso.id &&
     p.id !== requestingPermitId &&
-    ["active", "extended"].includes(p.status));
+    ["active", "extended"].includes(p.status) &&
+    !p.workCompletion);
 }
 
 // Who still has to answer. Derived from the LIVE permit list rather than from

@@ -9,9 +9,10 @@
        permit while the original permit's log still said ENERGISED)
      - "approved" does not mean energised; only the Isolator pulling the locks
        does, and the two must never be confused by a caller
-     - consent is required from every crew still live on the certificate,
-       INCLUDING one that has already signed off work-complete — their locks
-       are on and their people may still be on site
+     - consent is required from every crew still ON THE TOOLS under the
+       certificate, and only those: a crew that has confirmed work complete has
+       already declared the equipment safe to return to service, so asking them
+       again only delays the trial
      - readiness is recomputed from the live permit list, so a permit approved
        onto the certificate AFTER the consents were gathered puts the trial
        back to not-ready rather than slipping through
@@ -124,11 +125,16 @@ console.log("\nEvery crew still live on the lockout must clear — and only thos
     ids(trialConsentTargets(cert(), [permit("A"), permit("B", { status: "extended" })], "A")) === "B");
 }
 {
-  // The one that is easy to get wrong: a crew that has signed off is off the
-  // tools, but their locks are still on and their people may still be there.
-  const permits = [permit("A"), permit("B", { workCompletion: { timestamp: AT } })];
-  check("a work-complete crew is STILL required",
-    ids(trialConsentTargets(cert(), permits, "A")) === "B");
+  // Confirming work complete is the requester's own declaration that the job
+  // is finished and the equipment is safe to return to service. Asking that
+  // crew to clear again delays the trial without learning anything new — they
+  // have already said it. Their locks stay on regardless; the trial does not
+  // touch the lockout, only the energisation.
+  const permits = [permit("A"), permit("B", { workCompletion: { timestamp: AT } }), permit("C")];
+  check("a work-complete crew is not asked again",
+    ids(trialConsentTargets(cert(), permits, "A")) === "C");
+  check("a work-complete crew never blocks readiness",
+    trialReadyToEnergise(cert(trial("approved", [says("C", "consent")])), permits) === true);
 }
 {
   const permits = [
