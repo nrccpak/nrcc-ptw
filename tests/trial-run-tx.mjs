@@ -72,7 +72,10 @@ const mkTx = (s) => {
 };
 const wrote = (tx, coll, id) =>
   tx.writes.filter((w) => w.coll === coll && w.id === id).reduce((a, w) => ({ ...a, ...w.data }), null);
-const unioned = (v) => (v && v.__arrayUnion ? v.__arrayUnion[0] : undefined);
+// Consents and the log are written as explicit arrays, appended at the end, so
+// that security rules can inspect what changed — an array transform is opaque
+// to them. `last` is therefore the entry this write added.
+const last = (v) => (Array.isArray(v) ? v[v.length - 1] : undefined);
 
 const AT = "2026-08-01T09:00:00.000Z";
 const NOW = "2026-08-01T11:30:00.000Z";
@@ -155,9 +158,15 @@ console.log("\nEvery other crew on the tools answers for itself:");
   const tx = await check("a crew clears the trial",
     run("txTrialAnswer", store(trial("requested")), { permitId: "B", decision: "consent", actor: REQ_B }), "ok");
   const w = wrote(tx, "isolations", "C1");
-  is("consent is appended, never a rewritten array", !!w["trialRun.consents"].__arrayUnion);
+  // Appended at the END and leaving every earlier answer byte-identical is not
+  // a style choice: the security rule for this write requires exactly that, so
+  // that it can tell which entry is new and whose permit it speaks for.
+  is("the earlier answers are preserved untouched",
+    JSON.stringify(w["trialRun.consents"].slice(0, -1)) ===
+    JSON.stringify(store(trial("requested")).isolations.C1.trialRun.consents));
+  is("the new answer is appended at the end", w["trialRun.consents"].length === 2);
   is("the entry names the crew and the decision",
-    unioned(w["trialRun.consents"]).permitId === "B" && unioned(w["trialRun.consents"]).decision === "consent");
+    last(w["trialRun.consents"]).permitId === "B" && last(w["trialRun.consents"]).decision === "consent");
 }
 {
   await check("a crew cannot answer for another crew",
@@ -187,9 +196,9 @@ console.log("\nOne refusal ends it — nobody overrules a crew:");
     run("txTrialAnswer", store(trial("requested", [says("B", "consent")])), { permitId: "C", decision: "refuse", actor: REQ_C }), "ok");
   const w = wrote(tx, "isolations", "C1");
   is("the request is cleared from the certificate", w.trialRun === null);
-  is("it is kept in the log as refused", unioned(w.trialRunLog).outcome === "refused");
+  is("it is kept in the log as refused", last(w.trialRunLog).outcome === "refused");
   is("the log keeps who cleared and who refused",
-    unioned(w.trialRunLog).consents.map((c) => c.decision).join(",") === "requested,consent,refuse");
+    last(w.trialRunLog).consents.map((c) => c.decision).join(",") === "requested,consent,refuse");
 }
 
 /* ===================== 3. Issuer authorisation ===================== */
@@ -225,7 +234,7 @@ console.log("\nCalled off before the locks came out:");
     run("txTrialCancel", store(trial("requested")), { actor: REQ_A, reason: "not needed" }), "ok");
   const w = wrote(tx, "isolations", "C1");
   is("the request is cleared", w.trialRun === null);
-  is("it is kept in the log as cancelled", unioned(w.trialRunLog).outcome === "cancelled");
+  is("it is kept in the log as cancelled", last(w.trialRunLog).outcome === "cancelled");
 
   await check("an Issuer may cancel an authorised request",
     run("txTrialCancel", store(trial("approved")), { actor: ISSUER }), "ok");
@@ -302,8 +311,8 @@ console.log("\nLocks back on, work resumes:");
   const w = wrote(tx, "isolations", "C1"), e = wrote(tx, "equipment", "EQ1");
   is("the certificate returns to active", w.status === "active");
   is("the sub-document is cleared", w.trialRun === null);
-  is("the completed trial is kept in the log", unioned(w.trialRunLog).outcome === "completed");
-  is("the log records who put the locks back", unioned(w.trialRunLog).reIsolatedBy.uid === "u-iso");
+  is("the completed trial is kept in the log", last(w.trialRunLog).outcome === "completed");
+  is("the log records who put the locks back", last(w.trialRunLog).reIsolatedBy.uid === "u-iso");
   is("the equipment is isolated again", e.isolationStatus === "isolated");
 
   await check("an Issuer may not re-apply the locks",
@@ -325,7 +334,7 @@ console.log("\nA trial left running by the FIRST version is still recoverable:")
     run("txTrialReIsolate", s, { actor: ISOLATOR }), "ok");
   const w = wrote(tx, "isolations", "C1"), pa = wrote(tx, "permits", "A");
   is("the certificate returns to active", w.status === "active");
-  is("the legacy trial is recorded in the log", unioned(w.trialRunLog).legacy === true);
+  is("the legacy trial is recorded in the log", last(w.trialRunLog).legacy === true);
   is("the stranded permit entry is closed, not left claiming ENERGISED",
     pa.trialRuns[0].status === "closed" && pa.trialRuns[0].reIsolatedAt === NOW);
   is("permits with no stranded entry are left alone", wrote(tx, "permits", "B") === null);
@@ -348,7 +357,7 @@ console.log("\nAn unrecognised trial-run record must not deadlock the certificat
   const tx = await check("THE WAY OUT: an Issuer can always cancel the record",
     run("txTrialCancel", junk(), { actor: ISSUER, reason: "unrecognised record" }), "ok");
   is("the stuck record is cleared", wrote(tx, "isolations", "C1").trialRun === null);
-  is("and kept in the log", unioned(wrote(tx, "isolations", "C1").trialRunLog).outcome === "cancelled");
+  is("and kept in the log", last(wrote(tx, "isolations", "C1").trialRunLog).outcome === "cancelled");
   await check("the crew that asked can clear it too", run("txTrialCancel", junk(), { actor: REQ_A }), "ok");
   await check("an Admin can clear it", run("txTrialCancel", junk(), { actor: ADMIN }), "ok");
   await check("an unrelated crew still cannot", run("txTrialCancel", junk(), { actor: REQ_B }), "gate");
@@ -399,7 +408,7 @@ console.log("\nThe log says what actually happened:");
   const odd = store(trial("requested"), { status: "trialRun" });
   const tx = await check("an inconsistent state re-isolates", run("txTrialReIsolate", odd, { actor: ISOLATOR }), "ok");
   is("it is logged as abandoned, not completed",
-    unioned(wrote(tx, "isolations", "C1").trialRunLog).outcome === "abandoned");
+    last(wrote(tx, "isolations", "C1").trialRunLog).outcome === "abandoned");
 }
 
 /* ===================== crew reading ===================== */
