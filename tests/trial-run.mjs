@@ -151,6 +151,17 @@ console.log("\nEvery crew still live on the lockout must clear — and only thos
   check("crews on another lockout are not asked",
     ids(trialConsentTargets(cert(), permits, "A")) === "");
 }
+{
+  // A certificate object with no id matches `p.isolationRef === undefined`,
+  // which would collect every permit attached to NO certificate and present
+  // them as this lockout's crew — and then hold the trial waiting on them.
+  const loose = [permit("A"), permit("N1", { isolationRef: undefined }), permit("N2", { isolationRef: null })];
+  const noId = { status: "active", trialRun: null };
+  check("an id-less certificate has no crew at all",
+    ids(trialConsentTargets(noId, loose, "A")) === "");
+  check("...and cannot be judged ready to energise",
+    trialReadyToEnergise({ ...noId, trialRun: trial("approved") }, loose) === false);
+}
 
 console.log("\nOutstanding is derived from the live permits, not the stored list:");
 {
