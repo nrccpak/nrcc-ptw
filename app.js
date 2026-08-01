@@ -1358,6 +1358,100 @@ function isoReadyForDeiso(iso, permits, byIso) {
     (["active", "extended"].includes(p.status) && !!p.workCompletion));
 }
 
+/* -------------------- Trial run --------------------
+   A trial run temporarily energises isolated equipment so the crew can prove a
+   repair. Its state lives on the ISOLATION CERTIFICATE, not on the permit: the
+   certificate is the thing whose locks come off and go back on, and one
+   certificate may carry several crews. Holding the record on one permit — as
+   the first version did — means a shared lockout can be re-isolated from a
+   sibling permit, leaving the original permit's log claiming the equipment is
+   still live.
+
+     iso.trialRun     the one in flight (null when there is none)
+     iso.trialRunLog  the completed / refused / cancelled ones, for audit
+
+   The certificate STATUS deliberately stays "active" through request, consent
+   and approval, and only flips to "trialRun" when the Isolator actually pulls
+   the locks. Every existing gate in the app keys off `status === "active"`
+   (attachment, release, de-isolation readiness, the equipment cycle), so
+   keeping the flip at the physical moment means none of them need to change
+   and none of them can be fooled by a trial that was only ever requested.
+
+   Pure so they can be tested (tests/trial-run.mjs) — they read nothing and
+   write nothing; the caller supplies the certificate and the permit list. */
+
+// The request/consent/approval phase, or null when no trial is in flight.
+// Anything unrecognised reads as null: an unknown value must never be treated
+// as authority to energise.
+function trialStage(iso) {
+  const st = iso && iso.trialRun && iso.trialRun.status;
+  return ["requested", "approved", "energised"].includes(st) ? st : null;
+}
+
+// Is the equipment live RIGHT NOW? "approved" is deliberately false — approval
+// authorises the Isolator to pull the locks, it does not pull them. A
+// certificate whose own status says trialRun counts as energised whatever the
+// sub-document says: that is the state written by the first version of this
+// feature, and a stale record must never make live equipment look isolated.
+function isTrialEnergised(iso) {
+  return !!iso && (trialStage(iso) === "energised" || iso.status === "trialRun");
+}
+
+// The crews that must clear before the equipment may be energised: every OTHER
+// permit on the certificate whose crew is still on the tools. Confirming work
+// complete is the requester's own declaration that the job is finished and the
+// equipment is safe to return to service, so those crews are not asked again —
+// waiting on them would delay the trial without learning anything new. Permits
+// still waiting on isolation are not asked either: that crew never started.
+// (Excluded crews are not left in the dark — the certificate still carries the
+// trial, so they see the energised state on their own permit.)
+function trialConsentTargets(iso, permits, requestingPermitId) {
+  if (!iso) return [];
+  return (permits || []).filter((p) =>
+    p.isolationRef === iso.id &&
+    p.id !== requestingPermitId &&
+    ["active", "extended"].includes(p.status) &&
+    !p.workCompletion);
+}
+
+// Who still has to answer. Derived from the LIVE permit list rather than from
+// the stored consent array, so a crew attached to the certificate after the
+// consents were collected shows up as outstanding instead of being missed.
+function trialConsentState(iso, permits) {
+  const t = iso && iso.trialRun;
+  if (!t) return { required: [], given: [], refused: [], outstanding: [] };
+  const required = trialConsentTargets(iso, permits, t.permitId);
+  // The requester's own entry records who asked; it is not an answer, and it
+  // can never stand in for another crew's.
+  const answered = new Map();
+  for (const c of t.consents || [])
+    if (c && c.permitId && (c.decision === "consent" || c.decision === "refuse"))
+      answered.set(c.permitId, c.decision);
+  const given = [], refused = [], outstanding = [];
+  for (const p of required) {
+    const d = answered.get(p.id);
+    if (d === "consent") given.push(p);
+    else if (d === "refuse") refused.push(p);
+    else outstanding.push(p);
+  }
+  return { required, given, refused, outstanding };
+}
+
+// The single authority on "may this certificate be energised right now". The
+// Isolator's transaction recomputes this from permits it reads itself — never
+// from the loaded page — so a permit approved onto the certificate after the
+// consents were gathered still blocks the trial.
+function trialReadyToEnergise(iso, permits) {
+  const t = iso && iso.trialRun;
+  if (!t || t.status !== "approved") return false;
+  if (!t.issuerApproval) return false;
+  // Locks must still be on and staying on: an assigned, removalPending or
+  // removed certificate is not a lockout anyone may lift for a trial.
+  if (iso.status !== "active") return false;
+  const c = trialConsentState(iso, permits);
+  return c.refused.length === 0 && c.outstanding.length === 0;
+}
+
 // Pass `known` when the caller already holds the permit list (the dashboard
 // does) — the badge is only a count of submitted permits, and downloading the
 // whole collection a second time to derive it is pure waste.
