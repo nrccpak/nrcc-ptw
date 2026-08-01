@@ -35,6 +35,119 @@ service cloud.firestore {
         && request.resource.data.requester == resource.data.requester;
     }
 
+    // ---- trial run (a sub-document on the isolation certificate) ----
+    // A trial run temporarily energises isolated equipment so a crew can prove
+    // a repair. The record lives on the certificate — that is the thing whose
+    // locks come off and go back on, and one certificate may carry several
+    // crews. See app.js §6 for the six lifecycle writes.
+    //
+    // The steps that ENERGISE (status → trialRun) and re-isolate (status →
+    // active) write the certificate's status, so they fall through to the
+    // Isolator/Admin clause below: no requester and no Issuer can reach them.
+    // What these functions add is the crew-facing half — asking for a trial,
+    // clearing one, refusing one, calling one off — which no existing clause
+    // permitted at all.
+
+    // Only the trial-run sub-document may move. Never status, points, or any
+    // signature field on the certificate itself.
+    function trialFieldsOnly() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['trialRun', 'trialRunLog'])
+        && resource.data.status == 'active'
+        && request.resource.data.status == 'active';
+    }
+    // The history is append-only for EVERY role, Issuers and Admins included:
+    // entries may be added, never removed or rewritten. An incident review has
+    // to be able to trust it.
+    function trialLogAppendOnly() {
+      return request.resource.data.get('trialRunLog', []).hasAll(resource.data.get('trialRunLog', []))
+        && request.resource.data.get('trialRunLog', []).size()
+             <= resource.data.get('trialRunLog', []).size() + 1;
+    }
+    // Exactly one entry was appended to the log this write.
+    function trialLogGrewByOne() {
+      return request.resource.data.get('trialRunLog', []).size()
+               == resource.data.get('trialRunLog', []).size() + 1;
+    }
+    function trialLastLogEntry() {
+      return request.resource.data.trialRunLog[request.resource.data.trialRunLog.size() - 1];
+    }
+    // The caller personally owns a permit that is live and attached to THIS
+    // certificate — i.e. they are one of the crews this lockout is holding.
+    // This is what stops any signed-in user from speaking for a crew.
+    function ownsCrewPermit(isoId, permitId) {
+      return permitId is string
+        && exists(/databases/$(database)/documents/permits/$(permitId))
+        && get(/databases/$(database)/documents/permits/$(permitId)).data.requester.uid == request.auth.uid
+        && get(/databases/$(database)/documents/permits/$(permitId)).data.isolationRef == isoId
+        && get(/databases/$(database)/documents/permits/$(permitId)).data.status in ['active', 'extended'];
+    }
+
+    // Raising the request: no trial in flight, it starts unauthorised, and the
+    // crew named on it must be the caller's own.
+    function trialRequestWrite(isoId) {
+      return resource.data.get('trialRun', null) == null
+        && request.resource.data.get('trialRun', null) != null
+        && request.resource.data.trialRun.status == 'requested'
+        && request.resource.data.trialRun.get('issuerApproval', null) == null
+        && request.resource.data.trialRun.requestedBy.uid == request.auth.uid
+        && request.resource.data.trialRun.consents.size() == 1
+        && request.resource.data.get('trialRunLog', []).size() == resource.data.get('trialRunLog', []).size()
+        && ownsCrewPermit(isoId, request.resource.data.trialRun.permitId);
+    }
+    // Clearing the trial: exactly one answer appended at the end, every earlier
+    // answer preserved, and it speaks for a permit the caller owns. The stage
+    // and the Issuer's signature line cannot move on this path.
+    function trialConsentWrite(isoId) {
+      return resource.data.get('trialRun', null) != null
+        && request.resource.data.get('trialRun', null) != null
+        && resource.data.trialRun.status == 'requested'
+        && request.resource.data.trialRun.status == 'requested'
+        && request.resource.data.trialRun.permitId == resource.data.trialRun.permitId
+        && request.resource.data.trialRun.get('issuerApproval', null) == null
+        && request.resource.data.get('trialRunLog', []).size() == resource.data.get('trialRunLog', []).size()
+        && request.resource.data.trialRun.consents.hasAll(resource.data.trialRun.consents)
+        && request.resource.data.trialRun.consents.size() == resource.data.trialRun.consents.size() + 1
+        && request.resource.data.trialRun.consents[request.resource.data.trialRun.consents.size() - 1].uid == request.auth.uid
+        && ownsCrewPermit(isoId, request.resource.data.trialRun.consents[request.resource.data.trialRun.consents.size() - 1].permitId);
+    }
+    // Ending it before anything was energised — a crew refusing, or the crew
+    // that asked (or an Issuer, via the clause below) calling it off. The
+    // request is cleared and exactly one closed entry is appended.
+    function trialCloseWrite(isoId) {
+      return resource.data.get('trialRun', null) != null
+        && request.resource.data.get('trialRun', null) == null
+        && trialLogGrewByOne()
+        && trialLastLogEntry().closedBy.uid == request.auth.uid
+        && (
+          (trialLastLogEntry().outcome == 'refused'
+            && ownsCrewPermit(isoId, trialLastLogEntry().consents[trialLastLogEntry().consents.size() - 1].permitId))
+          ||
+          (trialLastLogEntry().outcome == 'cancelled'
+            && ownsCrewPermit(isoId, resource.data.trialRun.permitId))
+        );
+    }
+    // The whole crew-facing permission, in one place.
+    function crewTrialWrite(isoId) {
+      return trialFieldsOnly()
+        && (trialRequestWrite(isoId) || trialConsentWrite(isoId) || trialCloseWrite(isoId));
+    }
+    // Transitions that mean a person physically handled locks: applying them
+    // (assigned → active), taking them out for a trial (active → trialRun) and
+    // putting them back (trialRun → active). Reserved for the Isolator, with
+    // Admin as the system superuser. An Issuer creates certificates, assigns
+    // them and authorises trial runs — but must never sign that locks moved.
+    //
+    // The two trial transitions are here because the emulator suite proved
+    // they were not: canIssue() reached every status change that was not
+    // assigned → active, so an Issuer could energise isolated equipment
+    // directly, whatever the UI showed and whatever the transaction checked.
+    function isLockHandlingTransition() {
+      return (resource.data.status == 'assigned' && request.resource.data.status == 'active')
+        || (resource.data.status == 'active' && request.resource.data.status == 'trialRun')
+        || (resource.data.status == 'trialRun' && request.resource.data.status == 'active');
+    }
+
     // ---- users ----
     match /users/{uid} {
       // A person can always read their OWN profile (needed at sign-in to learn
@@ -96,10 +209,14 @@ service cloud.firestore {
       // assigned → active step. An Issuer creates and assigns the certificate
       // but must never sign that the locks are on; that role separation is
       // enforced here, not just hidden in the UI. (Admin kept as superuser.)
-      allow update: if isActive() && (
-        (resource.data.status == 'assigned' && request.resource.data.status == 'active')
+      // The trial-run history is append-only on EVERY path, including the
+      // Issuer's and the Isolator's — see trialLogAppendOnly().
+      allow update: if isActive() && trialLogAppendOnly() && (
+        isLockHandlingTransition()
           ? (isIsolator() || isAdmin())
-          : (canIssue() || isIsolator())
+          // A crew may also reach this document, but only through the
+          // trial-run sub-document and only in the ways crewTrialWrite allows.
+          : (canIssue() || isIsolator() || crewTrialWrite(id))
       );
       allow delete: if isAdmin();
     }
@@ -155,7 +272,17 @@ service cloud.firestore {
          resource.data.isolationRef != null &&
          request.resource.data.status == 'active' &&
          request.resource.data.diff(resource.data).affectedKeys()
-           .hasOnly(['status', 'updatedAt']))
+           .hasOnly(['status', 'updatedAt'])) ||
+        // Isolator closing out a trial run recorded by the earlier flow, which
+        // kept its record on the permit instead of on the certificate. Only
+        // that legacy array moves, and only on a permit attached to a lockout —
+        // it is what stops the log claiming the equipment is still energised
+        // after the locks have gone back on.
+        (isIsolator() &&
+         resource.data.isolationRef != null &&
+         request.resource.data.status == resource.data.status &&
+         request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(['trialRuns', 'updatedAt']))
       );
       allow delete: if isAdmin();
     }

@@ -3003,15 +3003,21 @@ async function txTrialAnswer(tx, o) {
   const entry = { permitId: o.permitId, permitNo: mine.permitNo || null, ...o.actor,
                   decision: o.decision, at: o.at, remarks: o.remarks || "" };
   if (o.decision === "consent") {
-    // arrayUnion, not a rewritten array: two crews clearing at the same moment
-    // must not overwrite one another.
-    tx.update(isoRef, { "trialRun.consents": arrayUnion(entry) });
+    // An explicit array appended at the end, not arrayUnion: security rules
+    // cannot inspect the result of an array transform, and the rule for this
+    // write has to see that exactly one entry was added, that it names a
+    // permit this user owns, and that no earlier answer was altered. The
+    // surrounding transaction is what makes read-modify-write safe here — two
+    // crews clearing at the same moment cannot lose an answer, because the
+    // second transaction re-reads and retries.
+    tx.update(isoRef, { "trialRun.consents": [...(iso.trialRun.consents || []), entry] });
     return;
   }
   tx.update(isoRef, {
     trialRun: null,
-    trialRunLog: arrayUnion({ ...iso.trialRun, consents: [...(iso.trialRun.consents || []), entry],
-      status: "closed", outcome: "refused", closedBy: o.actor, closedAt: o.at })
+    trialRunLog: [...(iso.trialRunLog || []), { ...iso.trialRun,
+      consents: [...(iso.trialRun.consents || []), entry],
+      status: "closed", outcome: "refused", closedBy: o.actor, closedAt: o.at }]
   });
 }
 
@@ -3055,8 +3061,8 @@ async function txTrialCancel(tx, o) {
     gate("Only the crew that asked, or an Issuer, may cancel a trial run request.");
   tx.update(isoRef, {
     trialRun: null,
-    trialRunLog: arrayUnion({ ...iso.trialRun, status: "closed", outcome: "cancelled",
-      closedBy: o.actor, closedAt: o.at, closeReason: o.reason || "" })
+    trialRunLog: [...(iso.trialRunLog || []), { ...iso.trialRun, status: "closed", outcome: "cancelled",
+      closedBy: o.actor, closedAt: o.at, closeReason: o.reason || "" }]
   });
 }
 
@@ -3129,9 +3135,9 @@ async function txTrialReIsolate(tx, o) {
     // Only a trial that actually reached ENERGISED completed. A certificate
     // carrying trialRun status over a request that never got there is an
     // inconsistent state — log it for what it is rather than claiming a run.
-    trialRunLog: arrayUnion({ ...t, status: "closed",
+    trialRunLog: [...(iso.trialRunLog || []), { ...t, status: "closed",
       outcome: (!iso.trialRun || trialStage(iso) === "energised") ? "completed" : "abandoned",
-      reIsolatedBy: o.actor, reIsolatedAt: o.at })
+      reIsolatedBy: o.actor, reIsolatedAt: o.at }]
   });
   // Only reset the equipment if it still points at THIS certificate.
   if (eqRef && eqSnap && eqSnap.exists() && (eqSnap.data().activeIsolationId || null) === o.isoId)

@@ -41,6 +41,36 @@ Nothing else needs changing to go live.
 | `manifest.webmanifest` | PWA manifest (name, icons, colors). |
 | `icons/` | App icons. |
 | `sample-equipment.csv` | Example CSV for the equipment Import function. |
+| `tests/` | Checks on the safety logic. See below. |
+| `firebase.json` | Emulator + rules config, used only by the rules tests. |
+
+## Tests
+
+Two kinds. Neither needs a Firebase project.
+
+**Logic checks** — no dependencies, no install. They lift the shipped functions
+straight out of `app.js` by signature and run them, so what is asserted is the
+code that ships, not a copy of it.
+
+```
+for f in tests/*.mjs; do node "$f"; done      # skip rules-trial-run.mjs
+```
+
+**Security-rules checks** — run the real `firestore.rules` against the Firestore
+emulator, so they test what the *server* enforces rather than what the app
+chooses to show. Worth the setup: this suite found that an Issuer could energise
+isolated equipment directly, which no amount of reading the client could reveal.
+
+```
+npm install --no-save @firebase/rules-unit-testing firebase-tools
+node_modules/.bin/firebase setup:emulators:firestore
+node_modules/.bin/firebase emulators:exec --only firestore \
+  --project nrcc-rules-test "node tests/rules-trial-run.mjs"
+```
+
+Add a check whenever you change a safety rule — the point of these files is that
+the next person can change the code without having to rediscover why it is the
+way it is.
 
 ## Scaling later (designed for it)
 
