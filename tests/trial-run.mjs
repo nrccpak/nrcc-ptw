@@ -41,13 +41,23 @@ function grab(sig) {
   throw new Error("unbalanced: " + sig);
 }
 
+function grabLine(sig) {
+  const i = src.indexOf(sig);
+  if (i < 0) throw new Error("not found in app.js: " + sig);
+  return src.slice(i, src.indexOf("\n", i));
+}
+
 const M = new Function(`
+  const nowISO = () => new Date().toISOString();
   ${grab("function trialStage(iso)")}
   ${grab("function isTrialEnergised(iso)")}
   ${grab("function trialConsentTargets(iso, permits, requestingPermitId)")}
   ${grab("function trialConsentState(iso, permits)")}
   ${grab("function trialReadyToEnergise(iso, permits)")}
   ${grab("function handbackHold(iso, verb)")}
+  ${grabLine("const TRIAL_LIVE_ALERT_HRS =")}
+  ${grabLine("const TRIAL_MAX_MINUTES =")}
+  ${grab("function trialOverrun(iso, now)")}
   ${grab("function trialTasks(isolations, permits)")}
   ${grab("function trialTasksFor(tasks, role)")}
   ${grab("function isoIndex(isolations)")}
@@ -56,12 +66,12 @@ const M = new Function(`
   ${grab("function isoReadyForDeiso(iso, permits, byIso)")}
   ${grab("function equipmentBlock(eqId, permits, isolations, excludeId)")}
   return { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
-           trialReadyToEnergise, handbackHold, trialTasks, trialTasksFor,
+           trialReadyToEnergise, handbackHold, trialOverrun, trialTasks, trialTasksFor,
            permitStage, isoReadyForDeiso, equipmentBlock };
 `)();
 
 const { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
-        trialReadyToEnergise, handbackHold, trialTasks, trialTasksFor,
+        trialReadyToEnergise, handbackHold, trialOverrun, trialTasks, trialTasksFor,
         permitStage, isoReadyForDeiso, equipmentBlock } = M;
 
 let pass = 0, fail = 0;
@@ -321,6 +331,46 @@ console.log("\nEnergised equipment is everybody's business; the rest is role wor
   const asCrew = trialTasksFor(tasks, "requester");
   // A live machine is a hazard whether or not you are the one who acts on it.
   check("a requester still sees the energised one", asCrew.length === 1 && asCrew[0].kind === "reIsolate");
+}
+
+console.log("\nA trial is judged against the time the crew asked for:");
+{
+  const at = (mins) => new Date(Date.parse(AT) + mins * 60000).toISOString();
+  const live = (over = {}) => cert(trial("energised", [], { deisolatedAt: AT, ...over }), { status: "trialRun" });
+
+  check("nothing to measure before the locks come out",
+    trialOverrun(cert(trial("approved"))) === null);
+  check("nor on a quiet certificate", trialOverrun(cert()) === null);
+  {
+    const o = trialOverrun(live({ expectedMinutes: 10 }), at(4));
+    check("inside the estimate is not an overrun", o.over === false);
+    check("it reports the minutes actually elapsed", o.elapsed === 4);
+    check("and the figure the crew gave", o.expected === 10 && o.stated === true);
+  }
+  check("past the estimate is an overrun",
+    trialOverrun(live({ expectedMinutes: 10 }), at(11)).over === true);
+  check("exactly on the estimate is not yet over",
+    trialOverrun(live({ expectedMinutes: 10 }), at(10)).over === false);
+  {
+    // No figure given — fall back to the site default rather than never alarming.
+    const o = trialOverrun(live(), at(30));
+    check("with no estimate the default stands in", o.expected === 60 && o.stated === false);
+    check("and 30 min is inside it", o.over === false);
+    check("but 90 min is not", trialOverrun(live(), at(90)).over === true);
+  }
+  {
+    // Junk falls back to the default rather than disabling the alarm.
+    for (const bad of [0, -5, "abc", null, undefined])
+      check(`an estimate of ${JSON.stringify(bad)} falls back to the default`,
+        trialOverrun(live({ expectedMinutes: bad }), at(180)).over === true);
+    // And a figure large enough to silence the alarm forever is capped: the
+    // estimate is the crew's own, so without a cap they could set it to a year.
+    const huge = trialOverrun(live({ expectedMinutes: 99999999 }), at(600));
+    check("an absurd estimate is capped at a shift", huge.expected === 480);
+    check("so it still alarms once the shift is up", huge.over === true);
+  }
+  check("an unparseable start time measures nothing",
+    trialOverrun(cert(trial("energised", [], { deisolatedAt: "not a date" }), { status: "trialRun" }), AT) === null);
 }
 
 /* ============ 2. Non-regression: invisible to the rest of the app ============ */

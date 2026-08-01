@@ -113,6 +113,9 @@ service cloud.firestore {
         && request.resource.data.trialRun.permitId == resource.data.trialRun.permitId
         && request.resource.data.trialRun.get('issuerApproval', null) == null
         && request.resource.data.get('trialRunLog', []).size() == resource.data.get('trialRunLog', []).size()
+        // The crew's own estimate of how long it will take is what the overrun
+        // alarm is measured against, so nobody else may quietly stretch it.
+        && request.resource.data.trialRun.get('expectedMinutes', null) == resource.data.trialRun.get('expectedMinutes', null)
         && request.resource.data.trialRun.consents.hasAll(resource.data.trialRun.consents)
         && request.resource.data.trialRun.consents.size() == resource.data.trialRun.consents.size() + 1
         && request.resource.data.trialRun.consents[request.resource.data.trialRun.consents.size() - 1].uid == request.auth.uid
@@ -156,6 +159,8 @@ service cloud.firestore {
         && request.resource.data.trialRun.issuerApproval == resource.data.trialRun.issuerApproval
         && request.resource.data.trialRun.deisolatedBy == resource.data.trialRun.deisolatedBy
         && request.resource.data.trialRun.deisolatedAt == resource.data.trialRun.deisolatedAt
+        // Signing off must not also rewrite the estimate it is being judged against.
+        && request.resource.data.trialRun.get('expectedMinutes', null) == resource.data.trialRun.get('expectedMinutes', null)
         && ownsCrewPermit(isoId, resource.data.trialRun.permitId);
     }
     // The whole crew-facing permission, in one place.

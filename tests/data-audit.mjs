@@ -152,5 +152,55 @@ console.log("\nOutput shape:");
   check("missing collections do not throw", auditData([], [], undefined).length === 0);
 }
 
+console.log("\nTrial-run drift — the app telling two stories about one machine:");
+{
+  const eq = (id, over = {}) => ({ id, tag: "P-" + id, isolationStatus: "isolated", activeIsolationId: "C1", ...over });
+  const iso = (id, over = {}) => ({ id, isoNo: "ISO-" + id, status: "active", equipmentRef: "EQ1", equipmentTag: "P-EQ1", ...over });
+  const ids = (f, id) => (f.find((x) => x.id === id)?.items || []).map((i) => i.label).sort().join(",");
+
+  // Energising moves three records at once. Half-applied, the register and the
+  // certificate disagree about whether a machine is live.
+  {
+    const f = auditData([], [iso("C1")], [eq("EQ1", { isolationStatus: "trialRun" })]);
+    check("equipment energised with no trial on its certificate is critical",
+      ids(f, "trialEqNotCert") === "P-EQ1" &&
+      f.find((x) => x.id === "trialEqNotCert").severity === "critical");
+  }
+  {
+    const f = auditData([], [iso("C1", { status: "trialRun" })], [eq("EQ1", { isolationStatus: "trialRun" })]);
+    check("a properly energised pair is not a finding",
+      !f.some((x) => x.id === "trialEqNotCert" || x.id === "trialCertNotEq"));
+  }
+  {
+    // The dangerous direction: the register says safe, the certificate says live.
+    const f = auditData([], [iso("C1", { status: "trialRun" })], [eq("EQ1")]);
+    check("a certificate in a trial whose equipment reads isolated is critical",
+      ids(f, "trialCertNotEq") === "ISO-C1" &&
+      f.find((x) => x.id === "trialCertNotEq").severity === "critical");
+  }
+  {
+    // A request left on a removed certificate can never be actioned.
+    const f = auditData([], [iso("C1", { status: "removed", trialRun: { status: "requested" } })], [eq("EQ1")]);
+    check("a trial on a dead certificate is flagged", ids(f, "trialOnDeadCert") === "ISO-C1");
+    const ok = auditData([], [iso("C1", { trialRun: { status: "requested" } })], [eq("EQ1")]);
+    check("a trial on a live certificate is not", !ok.some((x) => x.id === "trialOnDeadCert"));
+  }
+  {
+    // The earlier flow's residue: a permit log still claiming ENERGISED.
+    const p = { id: "p1", permitNo: "PTW-1", status: "active", isolationRef: "C1",
+                trialRuns: [{ status: "open" }] };
+    const f = auditData([p], [iso("C1")], [eq("EQ1")]);
+    check("a stranded permit-side trial log is flagged", ids(f, "trialStranded") === "PTW-1");
+    const live = auditData([p], [iso("C1", { status: "trialRun" })], [eq("EQ1", { isolationStatus: "trialRun" })]);
+    check("but not while that certificate really is energised",
+      !live.some((x) => x.id === "trialStranded"));
+  }
+  {
+    const f = auditData([], [iso("C1")], [eq("EQ1")]);
+    check("a quiet plant reports no trial-run drift at all",
+      !f.some((x) => x.id.startsWith("trial")));
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail ? 1 : 0);

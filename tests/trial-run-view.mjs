@@ -42,6 +42,7 @@ const STATUS_LABEL_SRC = src.slice(src.indexOf("const STATUS_LABEL ="),
   src.indexOf(";", src.indexOf('removed: "Removed"')) + 1);
 
 const M = new Function(`
+  const nowISO = () => new Date().toISOString();
   ${grabLine("const esc = (s) =>")}
   ${grab("function fmt(iso)")}
   ${STATUS_LABEL_SRC}
@@ -51,12 +52,17 @@ const M = new Function(`
   ${grab("function isTrialEnergised(iso)")}
   ${grab("function trialConsentTargets(iso, permits, requestingPermitId)")}
   ${grab("function trialConsentState(iso, permits)")}
+  ${grabLine("const TRIAL_LIVE_ALERT_HRS =")}
+  ${grabLine("const TRIAL_MAX_MINUTES =")}
+  ${grab("function trialOverrun(iso, now)")}
   ${grab("function trialChip(iso)")}
   ${grab("function trialLiveHTML(iso, permits)")}
+  ${grab("function trialRecords(iso, permit)")}
   ${grab("function trialHistoryHTML(iso, permit)")}
-  return { trialChip, trialLiveHTML, trialHistoryHTML };
+  ${grab("function trialPrintHTML(iso, permit)")}
+  return { trialChip, trialLiveHTML, trialHistoryHTML, trialPrintHTML };
 `)();
-const { trialChip, trialLiveHTML, trialHistoryHTML } = M;
+const { trialChip, trialLiveHTML, trialHistoryHTML, trialPrintHTML } = M;
 
 let pass = 0, fail = 0;
 function check(name, cond) { cond ? pass++ : fail++; console.log(`${cond ? "  PASS" : "  FAIL"}  ${name}`); }
@@ -230,6 +236,41 @@ console.log("\nFree text typed by users is escaped, not executed:");
   const nastyClose = trialHistoryHTML(cert(null, { trialRunLog: [trial("closed",
     { outcome: "cancelled", closedBy: { name: "x" }, closeReason: nasty })] }), {});
   check("a cancellation reason cannot inject markup", !nastyClose.includes("<img"));
+}
+
+console.log("\nThe printed record answers what an investigation asks:");
+{
+  const full = trialPrintHTML(cert(null, { trialRunLog: [trial("closed", {
+    outcome: "completed", issuerApproval: { ...person("Sara"), at: AT },
+    deisolatedBy: person("Imran"), deisolatedAt: AT,
+    completedBy: person("Amir"), completedAt: AT,
+    reIsolatedBy: person("Imran"), reIsolatedAt: AT })] }), null);
+  // The two questions: who authorised the machine being made live, and who
+  // put the locks back.
+  check("who authorised it is on the print", full.includes("Sara"));
+  check("who took the locks out and put them back is on the print", full.includes("Imran"));
+  check("the crew's sign-off is on the print", full.includes("crew confirmed finished"));
+  check("the outcome is on the print", full.includes("COMPLETED"));
+
+  // The one an investigation must not have to infer.
+  const open = trialPrintHTML(cert(trial("energised", { deisolatedBy: person("Imran"), deisolatedAt: AT })), null);
+  check("a trial never re-isolated says so in capitals", open.includes("NOT RE-ISOLATED"));
+
+  const cutShort = trialPrintHTML(cert(null, { trialRunLog: [trial("closed", {
+    outcome: "completed", deisolatedBy: person("Imran"), deisolatedAt: AT,
+    reIsolatedBy: person("Imran"), reIsolatedAt: AT })] }), null);
+  check("a trial cut short is marked on the print", cutShort.includes("cut short"));
+
+  check("nothing to print when there were no trials", trialPrintHTML(cert(null), null) === "");
+  // Screen and print read the same records, so a signed print can never show a
+  // different history from the screen it was printed from.
+  const legacy = { permitNo: "PTW-A", trialRuns: [{ authorisedBy: "Admin", authorisedAt: AT, reIsolatedAt: AT, status: "closed" }] };
+  check("legacy records reach the print too", trialPrintHTML(cert(null), legacy).includes("Admin"));
+  check("and are marked as such", trialPrintHTML(cert(null), legacy).includes("earlier flow"));
+
+  const nasty = `<img src=x onerror="alert(1)">`;
+  check("free text is escaped on the print too",
+    !trialPrintHTML(cert(trial("energised", { reason: nasty })), null).includes("<img"));
 }
 
 console.log(`\n${pass} passed, ${fail} failed\n`);
