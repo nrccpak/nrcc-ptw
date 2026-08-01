@@ -2238,6 +2238,42 @@ function makePermitNo(type) {
   return `NRCC-${type.abbr}-${ymd}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
 
+// The Isolator's re-isolation dialog, shared by the permit and the certificate.
+//
+// Re-isolating is never blocked. Putting locks back on is the safe direction and
+// must not wait for anyone else's signature — an Isolator may need to do it
+// because they saw something wrong, because the crew walked off, or because of
+// something happening elsewhere on the plant.
+//
+// But doing it before the crew has said the trial is finished cuts their test
+// short, so it is a deliberate act rather than a quiet one: the dialog says what
+// it will interrupt and asks for an explicit tick. The record then shows which
+// of the two it was — see trialHistoryHTML.
+function reIsolateDialog(tagText, trial, onOk) {
+  const t = trial || {};
+  const live = `<div class="danger-box"><b>${esc(tagText)} is ENERGISED.</b></div>`;
+  if (t.completedBy) {
+    return confirmBoxHTML("Re-isolate after trial run",
+      `${live}<div class="ok-box"><b>The crew has confirmed the trial is finished</b> — ${personHTML(t.completedBy.name, t.completedBy)} · ${fmt(t.completedAt)}.${t.completionRemarks ? " " + esc(t.completionRemarks) : ""}</div>
+       <p>Confirm the locks and tags are back on and the equipment is safe. Work may then resume on every permit attached to this certificate.</p>`,
+      "Confirm re-isolated", onOk);
+  }
+  modal({ title: "Re-isolate — the crew has not signed off", wide: true, body: `
+    ${live}
+    <div class="warn-box"><b>${esc(t.requestedBy?.name || "The crew")} has not confirmed the trial is finished.</b>
+      They may still be running it. Re-isolating now stops the trial${t.permitNo ? ` on <span class="mono">${esc(t.permitNo)}</span>` : ""} — they would have to raise a new one to try again.
+      ${t.reason ? `<div style="margin-top:.35rem">Trial reason: ${esc(t.reason)}</div>` : ""}</div>
+    <p>Go ahead if the equipment needs to be made safe. Otherwise, check with the crew first.</p>
+    <label class="checkline"><input type="checkbox" id="riEarly"> I am re-isolating before the crew has signed off</label>
+    <label class="checkline"><input type="checkbox" id="riOn"> The locks and tags are back on and the equipment is safe</label>`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-success" data-ok>Re-isolate anyway</button>` });
+  $("[data-c]").onclick = closeModal;
+  $("[data-ok]").onclick = () => {
+    if (!($("#riEarly").checked && $("#riOn").checked)) return toast("Confirm both checks", "err");
+    onOk();
+  };
+}
+
 // The trial run in flight, shown on the certificate — where an Isolator has to
 // decide whether the equipment may be energised. It states plainly which crews
 // have cleared and which have not, because that list is the whole basis of the
@@ -2298,6 +2334,9 @@ function trialHistoryHTML(iso, permit) {
         ${answers.length ? `<div>Crews: ${answers.map((c) => `<span class="mono">${esc(c.permitNo || c.permitId || "")}</span> ${c.decision === "refuse" ? "refused" : "cleared"}`).join(" · ")}</div>` : ""}
         ${t.issuerApproval ? `<div>Authorised by ${personHTML(t.issuerApproval.name, t.issuerApproval)} · ${fmt(t.issuerApproval.at)}</div>` : ""}
         ${t.deisolatedBy ? `<div>Locks removed by ${personHTML(t.deisolatedBy.name, t.deisolatedBy)} · ${fmt(t.deisolatedAt)}</div>` : ""}
+        ${t.completedBy ? `<div>Crew confirmed finished by ${personHTML(t.completedBy.name, t.completedBy)} · ${fmt(t.completedAt)}${t.completionRemarks ? " — " + esc(t.completionRemarks) : ""}</div>`
+          : t.outcome === "completed" && !t.legacy && t.reIsolatedBy
+            ? `<div><b>Re-isolated before the crew confirmed the trial was finished.</b></div>` : ""}
         ${t.reIsolatedBy ? `<div>Re-isolated by ${personHTML(t.reIsolatedBy.name, t.reIsolatedBy)} · ${fmt(t.reIsolatedAt)}</div>`
           : t.reIsolatedAt ? `<div>Re-isolated ${fmt(t.reIsolatedAt)}</div>`
           : t.outcome ? "" : `<div><b>OPEN — equipment energised</b></div>`}
@@ -2688,10 +2727,8 @@ async function viewPermitDetail(m) {
     };
   });
 
-  $("#reiso") && ($("#reiso").onclick = () => confirmBoxHTML("Re-isolate after trial run",
-    `<div class="danger-box"><b>${tag} is ENERGISED.</b></div>
-     <p>Confirm the locks and tags are back on and the equipment is safe. Work may then resume, and the permit(s) can complete as normal.</p>`,
-    "Confirm re-isolated", () => runTrial(trialReIsolate, {}, "Re-isolated — work may resume", "Could not re-isolate")));
+  $("#reiso") && ($("#reiso").onclick = () => reIsolateDialog(p.equipmentTag || equip?.tag || "The equipment",
+    isoDoc?.trialRun, () => runTrial(trialReIsolate, {}, "Re-isolated — work may resume", "Could not re-isolate")));
 }
 
 /* -------------------- 6. Permit + isolation logic -------------------- */
@@ -3922,10 +3959,8 @@ async function viewIsolationDetail(m) {
     };
   };
 
-  if (canReIsolate) $("#itrialBack").onclick = () => confirmBoxHTML("Re-isolate after trial run",
-    `<div class="danger-box"><b>${itag} is ENERGISED.</b></div>
-     <p>Confirm the locks and tags are back on and the equipment is safe. Work may then resume on every permit attached to this certificate.</p>`,
-    "Confirm re-isolated", () => runITrial(trialReIsolate, {}, "Re-isolated — work may resume", "Could not re-isolate"));
+  if (canReIsolate) $("#itrialBack").onclick = () => reIsolateDialog(iso.equipmentTag || "The equipment",
+    iso.trialRun, () => runITrial(trialReIsolate, {}, "Re-isolated — work may resume", "Could not re-isolate"));
 
   if (canCancelTrial) $("#itrialCancel").onclick = () => {
     modal({ title: "Cancel trial run", body: `

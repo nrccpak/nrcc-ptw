@@ -169,6 +169,31 @@ console.log("\nThe log shows every trial this lockout has seen:");
     abandoned.includes("Abandoned") && !abandoned.includes("✔ Completed"));
 }
 
+console.log("\nThe log says whether the crew got to finish the trial:");
+{
+  const signedOff = trialHistoryHTML(cert(null, { trialRunLog: [trial("closed", {
+    outcome: "completed", deisolatedBy: person("Imran"), deisolatedAt: AT,
+    completedBy: person("Amir"), completedAt: AT, completionRemarks: "seal holding",
+    reIsolatedBy: person("Imran"), reIsolatedAt: AT })] }), {});
+  check("a trial the crew signed off names who signed it", signedOff.includes("Crew confirmed finished by"));
+  check("and keeps their result", signedOff.includes("seal holding"));
+  check("it is not flagged as cut short", !signedOff.includes("before the crew confirmed"));
+
+  // Re-isolating early is allowed — an Isolator must always be able to make
+  // equipment safe — but the record has to show the trial was cut short, or a
+  // crew asking why their test stopped has nothing to point at.
+  const cutShort = trialHistoryHTML(cert(null, { trialRunLog: [trial("closed", {
+    outcome: "completed", deisolatedBy: person("Imran"), deisolatedAt: AT,
+    reIsolatedBy: person("Imran"), reIsolatedAt: AT })] }), {});
+  check("a trial cut short says so", cutShort.includes("Re-isolated before the crew confirmed"));
+  check("it is still recorded as completed", cutShort.includes("✔ Completed"));
+
+  // Legacy records had no sign-off step at all, so the flag would be a lie.
+  const legacy = trialHistoryHTML(cert(null), { permitNo: "PTW-A",
+    trialRuns: [{ authorisedBy: "Admin", authorisedAt: AT, reIsolatedAt: AT, status: "closed" }] });
+  check("an old record is never flagged as cut short", !legacy.includes("before the crew confirmed"));
+}
+
 console.log("\nTrials recorded by the earlier flow are still in the audit trail:");
 {
   const legacyDone = trialHistoryHTML(cert(null), { permitNo: "PTW-A",
