@@ -348,6 +348,46 @@ function auditData(permits, isolations, equipment) {
     isolations.filter((i) => AUDIT_LIVE_CERT.includes(i.status) && i.equipmentRef && !eqById.has(i.equipmentRef))
       .map((i) => ({ label: i.isoNo || i.id, note: `missing equipment ${i.equipmentTag || i.equipmentRef}`, view: "isodetail", id: i.id })));
 
+  // Trial-run drift. Energising moves THREE records at once — the certificate's
+  // status, its trial sub-document, and the equipment's status — so a
+  // half-applied state means the app is telling two different stories about
+  // whether a machine is live. Written without the trial helpers on purpose:
+  // this function is lifted whole into tests/data-audit.mjs.
+  add("trialEqNotCert", "critical",
+    "Equipment marked energised for a trial its certificate does not have",
+    "The equipment register reads ENERGISED but no certificate says a trial run is in progress, so nothing in the app will ever re-isolate it and the machine stays out of service. An Isolator should confirm the real state on site and correct it.",
+    equipment.filter((e) => {
+      if (e.isolationStatus !== "trialRun") return false;
+      const cert = e.activeIsolationId ? isoById.get(e.activeIsolationId) : null;
+      return !cert || (cert.status !== "trialRun" && !cert.trialRun);
+    }).map((e) => ({ label: e.tag || e.id,
+      note: e.activeIsolationId ? `certificate ${isoById.get(e.activeIsolationId)?.isoNo || e.activeIsolationId} is not in a trial run` : "no current certificate",
+      view: "equipment" })));
+
+  // The dangerous direction of the same drift: the certificate says the locks
+  // are out, the register says isolated.
+  add("trialCertNotEq", "critical",
+    "Certificate in a trial run whose equipment does not say so",
+    "The certificate records that the locks are out, but the equipment register reads isolated. Anyone judging the machine from the register alone — including this app's own availability checks — would treat a live machine as safe.",
+    isolations.filter((i) => i.status === "trialRun" &&
+      !(i.equipmentRef && eqById.get(i.equipmentRef)?.isolationStatus === "trialRun"))
+      .map((i) => ({ label: i.isoNo || i.id,
+        note: `${i.equipmentTag || i.equipmentRef || "equipment"} reads ${eqById.get(i.equipmentRef)?.isolationStatus || "unknown"}`,
+        view: "isodetail", id: i.id })));
+
+  add("trialOnDeadCert", "warning",
+    "Trial run recorded on a certificate that is no longer live",
+    "Energising requires an active certificate, so this request can never be actioned — it sits waiting on people who have nothing to act on. Cancel it from the certificate.",
+    isolations.filter((i) => i.trialRun && !["active", "trialRun"].includes(i.status))
+      .map((i) => ({ label: i.isoNo || i.id, note: `certificate is ${i.status}`, view: "isodetail", id: i.id })));
+
+  add("trialStranded", "warning",
+    "Permit whose trial-run log was left open by the earlier flow",
+    "The permit's own log still reads ENERGISED while its certificate is not in a trial run — the record disagrees with reality. Re-isolating from the certificate closes these out.",
+    permits.filter((p) => (p.trialRuns || []).some((t) => t && t.status === "open") &&
+      isoById.get(p.isolationRef)?.status !== "trialRun")
+      .map((p) => ({ label: p.permitNo || p.id, note: "log still reads ENERGISED", view: "detail", id: p.id })));
+
   return findings;
 }
 
@@ -1473,6 +1513,27 @@ function trialConsentState(iso, permits) {
 // alarm rather than a queue. A trial run proves a repair — it is minutes of
 // work. An hour means it was forgotten, or something went wrong.
 const TRIAL_LIVE_ALERT_HRS = 1;
+// A trial run longer than a shift is not a trial run. The estimate is the
+// crew's own, and it is what the overrun alarm is measured against, so it is
+// capped — otherwise a large enough figure silences the alarm entirely.
+const TRIAL_MAX_MINUTES = 480;
+
+// How long a trial has been live against how long the crew said it would take.
+// A fixed threshold treats a two-minute seal check and a half-hour commissioning
+// run the same; asking the crew up front lets the alarm mean something. When
+// they gave no figure, TRIAL_LIVE_ALERT_HRS stands in.
+// `now` is passed rather than read so this is testable.
+function trialOverrun(iso, now) {
+  const t = iso && iso.trialRun;
+  if (!t || !t.deisolatedAt) return null;
+  const started = Date.parse(t.deisolatedAt);
+  const at = Date.parse(now || nowISO());
+  if (!isFinite(started) || !isFinite(at)) return null;
+  const asked = Number(t.expectedMinutes);
+  const expected = asked > 0 ? Math.min(Math.round(asked), TRIAL_MAX_MINUTES) : TRIAL_LIVE_ALERT_HRS * 60;
+  const elapsed = Math.floor((at - started) / 60000);
+  return { expected, elapsed, stated: asked > 0, over: elapsed > expected };
+}
 
 const TRIAL_TASK = {
   reIsolate: { label: "ENERGISED — re-isolate", who: "Isolator", tone: "alert" },
@@ -1767,7 +1828,10 @@ async function viewDashboard(m) {
     const oldest = queueState(trialLive, (t) => t.since, TRIAL_LIVE_ALERT_HRS);
     html += `<div class="danger-box" id="trialBanner" style="cursor:pointer">
       <b>⚠ ${trialLive.length} item(s) of equipment ENERGISED for a trial run</b> — ${esc(trialLive.map((t) => t.iso.equipmentTag || t.iso.isoNo || t.iso.id).join(", "))}.
-      ${oldest.oldest ? `Live for ${ageText(oldest.oldest)}. ` : ""}${trialLive.some((t) => t.done) ? "The crew has confirmed the trial is finished. " : ""}An Isolator must re-isolate before work resumes.</div>`;
+      ${oldest.oldest ? `Live for ${ageText(oldest.oldest)}. ` : ""}${(() => {
+        const over = trialLive.map((t) => trialOverrun(t.iso)).filter((o) => o && o.over && o.stated);
+        return over.length ? `<b>${over.length} past the ${over[0].expected} min the crew asked for.</b> ` : "";
+      })()}${trialLive.some((t) => t.done) ? "The crew has confirmed the trial is finished. " : ""}An Isolator must re-isolate before work resumes.</div>`;
   }
   // The crews' own half: their permit page shows this too, but only if they
   // open it, and a trial run waits on every crew at once.
@@ -1800,7 +1864,8 @@ async function viewDashboard(m) {
         <td><span class="mono">${esc(t.iso.isoNo || t.iso.id)}</span></td><td>${esc(t.iso.equipmentTag || "—")}</td>
         <td><span class="badge-st ${t.kind === "reIsolate" ? "stage-trialRun" : "stage-trialPending"}">${esc(d.label)}</span>${t.done ? ` <span class="chip chip-ok">✔ crew finished</span>` : ""}</td>
         <td>${esc(d.who)}${t.outstanding ? ` (${t.outstanding})` : ""}</td>
-        <td>${esc(ageText(t.since) || "—")}</td></tr>`; }).join("")}
+        <td>${esc(ageText(t.since) || "—")}${(() => { const o = trialOverrun(t.iso); return o && o.over && o.stated
+          ? ` <span class="chip" style="background:var(--red-soft);color:#9b2c2c">over ${o.expected} min</span>` : ""; })()}</td></tr>`; }).join("")}
       </tbody></table></div>`;
   }
 
@@ -2396,6 +2461,10 @@ function trialLiveHTML(iso, permits) {
       ? `<b style="color:var(--red)">OUT — equipment ENERGISED</b>`
       : `<b>ON — equipment still isolated</b>`)}
     ${line("Requested by", `${personHTML(t.requestedBy?.name, t.requestedBy)}${t.permitNo ? ` on <span class="mono">${esc(t.permitNo)}</span>` : ""} · ${fmt(t.requestedAt)}`)}
+    ${(() => { const o = trialOverrun(iso); if (!live && !t.expectedMinutes) return "";
+      if (!live) return line("Expected to take", `${esc(String(t.expectedMinutes))} min`);
+      if (!o) return "";
+      return line("Running for", `${o.elapsed} min${o.stated ? ` of the ${o.expected} min asked for` : ""}${o.over ? ` — <b style="color:var(--red)">OVERRUN</b>` : ""}`); })()}
     ${t.reason ? line("Reason", esc(t.reason)) : ""}
     ${line("Crews cleared", names(c.given))}
     ${line("Still to clear", c.outstanding.length ? `<b>${names(c.outstanding)}</b>` : "None — every crew has cleared")}
@@ -2414,16 +2483,24 @@ function trialLiveHTML(iso, permits) {
 // the legacy fallback — trials started by the first version of this feature were
 // recorded on the permit, and those records must not disappear from the audit
 // trail just because the state moved to the certificate.
-function trialHistoryHTML(iso, permit) {
-  const rows = [...(iso?.trialRunLog || [])];
-  if (iso?.trialRun) rows.push(iso.trialRun);
+// Every trial run this lockout has seen, oldest first: the legacy per-permit
+// records, then the certificate's closed log, then the one in flight. Shared by
+// the on-screen log and the printed one so a signed print can never show a
+// different history from the screen it was printed from.
+function trialRecords(iso, permit) {
   const legacy = (permit?.trialRuns || []).map((t) => ({
     legacy: true, requestedAt: t.authorisedAt || t.requestedAt, permitNo: permit.permitNo,
     requestedBy: { name: t.authorisedBy, ...(t.authorisedByMeta || {}) },
     reIsolatedAt: t.reIsolatedAt, status: t.status,
     outcome: t.reIsolatedAt ? "completed" : null
   }));
-  const all = [...legacy, ...rows];
+  const rows = [...(iso?.trialRunLog || [])];
+  if (iso?.trialRun) rows.push(iso.trialRun);
+  return [...legacy, ...rows];
+}
+
+function trialHistoryHTML(iso, permit) {
+  const all = trialRecords(iso, permit);
   if (!all.length) return "";
   const OUTCOME = { completed: `<span class="chip chip-ok">✔ Completed</span>`,
     refused: `<span class="chip">Refused by a crew</span>`,
@@ -2627,7 +2704,7 @@ async function viewPermitDetail(m) {
   `;
 
   // bind actions
-  $("#pdf") && ($("#pdf").onclick = () => printPermit(p, equip));
+  $("#pdf") && ($("#pdf").onclick = () => printPermit(p, equip, isoDoc));
   $$("[data-isolink],[data-isolink2],[data-isolink3],[data-isolink4]").forEach((a) => a.onclick = (e) => { e.preventDefault(); go("isodetail", { id: p.isolationRef }); });
   $$("tr.row[data-sib]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.sib }));
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
@@ -2739,6 +2816,9 @@ async function viewPermitDetail(m) {
       <div class="info-box">Every other crew still working under this certificate must clear the trial, then the Issuer must authorise it.</div>
       <label class="lbl">Why is the trial needed?</label>
       <textarea id="trReason" rows="3" placeholder="e.g. run the pump to prove the mechanical seal"></textarea>
+      <label class="lbl">How long will it take, in minutes?</label>
+      <input id="trMins" type="number" min="1" max="480" placeholder="e.g. 10">
+      <div class="help">Everyone can then see when the equipment has been live longer than you expected.</div>
       <label class="checkline"><input type="checkbox" id="trMine"> My own crew is clear of ${tag}</label>`,
       footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Request trial run</button>` });
     $("[data-c]").onclick = closeModal;
@@ -2746,7 +2826,8 @@ async function viewPermitDetail(m) {
       const reason = $("#trReason").value.trim();
       if (!reason) return toast("Give a reason for the trial run", "err");
       if (!$("#trMine").checked) return toast("Confirm your own crew is clear", "err");
-      runTrial(trialRequest, { reason }, "Trial run requested — waiting on the other crews", "Could not request the trial run");
+      runTrial(trialRequest, { reason, expectedMinutes: $("#trMins").value },
+        "Trial run requested — waiting on the other crews", "Could not request the trial run");
     };
   });
 
@@ -3176,7 +3257,8 @@ async function txTrialRequest(tx, o) {
   tx.update(isoRef, {
     trialRun: {
       status: "requested", permitId: o.permitId, permitNo: p.permitNo || null,
-      reason: o.reason || "", requestedBy: o.actor, requestedAt: o.at,
+      reason: o.reason || "", expectedMinutes: Number(o.expectedMinutes) > 0 ? Math.min(Math.round(Number(o.expectedMinutes)), TRIAL_MAX_MINUTES) : null,
+      requestedBy: o.actor, requestedAt: o.at,
       // The requester's own entry records who asked. trialConsentState never
       // counts it as an answer — it can only ever speak for this one crew.
       consents: [{ permitId: o.permitId, permitNo: p.permitNo || null, ...o.actor,
@@ -3821,7 +3903,7 @@ async function viewAdmin(m) {
 }
 
 /* -------------------- 7. Print / PDF -------------------- */
-function printPermit(p, equip) {
+function printPermit(p, equip, iso) {
   const row = (k, v) => `<tr><td style="padding:4px 10px;color:#555;width:170px">${k}</td><td style="padding:4px 10px;font-weight:600">${v}</td></tr>`;
   const html = `
     <div style="font-family:Arial,sans-serif;color:#15293B;max-width:760px;margin:0 auto;padding:20px">
@@ -3851,6 +3933,7 @@ function printPermit(p, equip) {
       ${p.isolationPoints?.length ? `<div style="margin-top:10px;font-weight:800;color:#2A6F97;font-size:13px">ISOLATION REGISTER</div>
         <table style="width:100%;border-collapse:collapse;border:1px solid #ccc"><tr style="background:#f2f5f8"><th style="text-align:left;padding:5px">Point</th><th style="text-align:left;padding:5px">Method</th><th style="text-align:left;padding:5px">Lock/Tag</th></tr>
         ${p.isolationPoints.map((i) => `<tr><td style="padding:5px;border-top:1px solid #eee">${esc(i.point)}</td><td style="padding:5px;border-top:1px solid #eee">${esc(i.method || "")}</td><td style="padding:5px;border-top:1px solid #eee">${esc(i.lockTag || "")}</td></tr>`).join("")}</table>` : ""}
+      ${trialPrintHTML(iso, p)}
       ${p.gasTest ? `<div style="margin-top:10px;font-weight:800;color:#2A6F97;font-size:13px">GAS TEST</div><div>O₂ ${esc(p.gasTest.o2 || "—")} · LEL ${esc(p.gasTest.lel || "—")} · H₂S ${esc(p.gasTest.h2s || "—")} · CO ${esc(p.gasTest.co || "—")} ${p.gasTest.by ? "· by " + esc(p.gasTest.by) : ""}</div>` : ""}
       <div style="margin-top:34px;display:flex;justify-content:space-between">
         <div style="border-top:1px solid #333;width:42%;padding-top:5px;font-size:12px">Requester signature</div>
@@ -4167,6 +4250,38 @@ async function viewIsolationDetail(m) {
     }, true);
 }
 
+// Trial runs on the printed record. A printed certificate is read as evidence,
+// so this answers the two questions an investigation asks: who authorised the
+// equipment being energised, and who put the locks back.
+function trialPrintHTML(iso, permit) {
+  const all = trialRecords(iso, permit);
+  if (!all.length) return "";
+  const cell = (v) => `<td style="padding:5px;border-top:1px solid #eee">${v}</td>`;
+  return `<div style="margin-top:12px;font-weight:800;color:#2A6F97;font-size:13px">TRIAL RUNS</div>
+    <table style="width:100%;border-collapse:collapse;border:1px solid #ccc">
+      <tr style="background:#f2f5f8"><th style="text-align:left;padding:5px">Requested</th>
+        <th style="text-align:left;padding:5px">Authorised by</th>
+        <th style="text-align:left;padding:5px">Locks out</th>
+        <th style="text-align:left;padding:5px">Locks back</th>
+        <th style="text-align:left;padding:5px">Outcome</th></tr>
+      ${all.map((t) => `<tr>
+        ${cell(fmt(t.requestedAt) + (t.permitNo ? "<br>" + esc(t.permitNo) : "") + (t.reason ? "<br>" + esc(t.reason) : ""))}
+        ${cell(t.issuerApproval ? personHTML(t.issuerApproval.name, t.issuerApproval) + "<br>" + fmt(t.issuerApproval.at)
+              // The earlier flow had no separate authorisation step — the one
+              // person who started the trial authorised it, and is recorded as
+              // its requester. Dropping them would leave the print with nobody
+              // named against an energisation that did happen.
+              : t.legacy && t.requestedBy?.name ? personHTML(t.requestedBy.name, t.requestedBy) : "—")}
+        ${cell(t.deisolatedBy ? personHTML(t.deisolatedBy.name, t.deisolatedBy) + "<br>" + fmt(t.deisolatedAt) : "—")}
+        ${cell(t.reIsolatedBy ? personHTML(t.reIsolatedBy.name, t.reIsolatedBy) + "<br>" + fmt(t.reIsolatedAt)
+              : t.reIsolatedAt ? fmt(t.reIsolatedAt) : "<b>NOT RE-ISOLATED</b>")}
+        ${cell((t.outcome ? esc(t.outcome.toUpperCase()) : "OPEN") +
+               (t.completedBy ? "<br>crew confirmed finished" : t.outcome === "completed" && !t.legacy && t.reIsolatedBy ? "<br>cut short" : "") +
+               (t.legacy ? "<br>earlier flow" : ""))}
+      </tr>`).join("")}
+    </table>`;
+}
+
 function printIsolation(iso, equip, attached) {
   const row = (k, v) => `<tr><td style="padding:4px 10px;color:#555;width:190px">${k}</td><td style="padding:4px 10px;font-weight:600">${v}</td></tr>`;
   const html = `
@@ -4190,6 +4305,7 @@ function printIsolation(iso, equip, attached) {
       ${(iso.points || []).map((i) => `<tr><td style="padding:5px;border-top:1px solid #eee">${esc(i.point)}</td><td style="padding:5px;border-top:1px solid #eee">${esc(i.method || "")}</td><td style="padding:5px;border-top:1px solid #eee">${esc(i.lockTag || "")}</td></tr>`).join("") || `<tr><td colspan="3" style="padding:6px">No points listed</td></tr>`}</table>
       <div style="margin-top:12px;font-weight:800;color:#2A6F97;font-size:13px">ATTACHED PERMITS</div>
       <div>${(attached || []).map((p) => esc(p.permitNo) + " (" + esc(p.status) + ")").join(" · ") || "—"}</div>
+      ${trialPrintHTML(iso, null)}
       <div style="margin-top:40px;display:flex;justify-content:space-between;gap:14px">
         <div style="border-top:1px solid #333;width:31%;padding-top:5px;font-size:12px">Assigned by (Issuer)</div>
         <div style="border-top:1px solid #333;width:31%;padding-top:5px;font-size:12px">Isolated by</div>
