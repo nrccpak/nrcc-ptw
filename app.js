@@ -1211,6 +1211,19 @@ const Notify = {
       if (named ? named === me : isIsolator)
         out.push({ sig: `i:${i.id}:removalPending:${i.removalAssignedAt || ""}`, text: `De-isolation of ${no} assigned to you — remove locks on ${tag}.`, ...to });
     }
+    // E10-13 — trial run. Only what the certificate alone can answer: whether
+    // a crew's consent is outstanding needs the permit list, and that half is
+    // carried by the dashboard banner and the crew's own permit instead.
+    const tr = i.trialRun;
+    if (tr && tr.status === "requested" && (role === "issuer" || role === "admin"))
+      out.push({ sig: `i:${i.id}:trialReq:${tr.requestedAt || ""}`, text: `Trial run requested on ${tag} (${no}) — crews are clearing it.`, ...to });
+    if (tr && tr.status === "approved" && isIsolator)
+      out.push({ sig: `i:${i.id}:trialOk:${tr.issuerApproval?.at || ""}`, text: `Trial run authorised on ${tag} (${no}) — de-isolate when every crew is clear.`, ...to });
+    // The two that matter most: the plant is live.
+    if (isTrialEnergised(i) && isIsolator)
+      out.push({ sig: `i:${i.id}:trialLive:${tr?.deisolatedAt || ""}`, kind: "overdue", text: `TRIAL RUN in progress — ${tag} is ENERGISED. Re-isolate when it is finished.`, ...to });
+    if (tr && tr.completedBy && isIsolator)
+      out.push({ sig: `i:${i.id}:trialDone:${tr.completedAt || ""}`, kind: "overdue", text: `The crew has finished the trial run on ${tag} (${no}) — re-apply the locks.`, ...to });
     // E9 — de-isolation confirmed (locks removed) → Issuer(s) can now close the
     // permit(s). This is the moment closing stops being blocked.
     const ids = i.attachedPermitIds || [];
@@ -1451,6 +1464,58 @@ function trialConsentState(iso, permits) {
   return { required, given, refused, outstanding };
 }
 
+/* ---- Trial runs as work, so they cannot be forgotten ----
+   Everything above makes a trial run correct. None of it makes anyone LOOK.
+   A trial that is started and forgotten leaves equipment energised, and until
+   these queues existed the only way to find out was to open that one permit. */
+
+// How long equipment may sit energised before the dashboard treats it as an
+// alarm rather than a queue. A trial run proves a repair — it is minutes of
+// work. An hour means it was forgotten, or something went wrong.
+const TRIAL_LIVE_ALERT_HRS = 1;
+
+const TRIAL_TASK = {
+  reIsolate: { label: "ENERGISED — re-isolate", who: "Isolator", tone: "alert" },
+  energise:  { label: "Authorised — de-isolate for the trial", who: "Isolator", tone: "warn" },
+  authorise: { label: "All crews cleared — authorise", who: "Issuer", tone: "warn" },
+  consent:   { label: "Waiting on crews to clear", who: "Crews", tone: "calm" }
+};
+
+// Every certificate whose trial run is waiting on somebody, worst first. `since`
+// is when it landed on that person's desk, so the age shown beside it is the
+// time THEY have had it, not the age of the trial.
+function trialTasks(isolations, permits) {
+  const byIso = permitsByIso(permits || []);
+  const out = [];
+  for (const i of isolations || []) {
+    const t = i.trialRun;
+    // Energised first and unconditionally — including a certificate energised
+    // by the earlier flow, which has no sub-document to read a stage from.
+    if (isTrialEnergised(i)) {
+      out.push({ iso: i, kind: "reIsolate", done: !!t?.completedBy,
+                 since: t?.deisolatedAt || t?.requestedAt || i.updatedAt || null });
+      continue;
+    }
+    const st = trialStage(i);
+    if (!st) continue;
+    if (st === "approved") { out.push({ iso: i, kind: "energise", since: t.issuerApproval?.at || t.requestedAt }); continue; }
+    const c = trialConsentState(i, byIso.get(i.id) || []);
+    out.push({ iso: i, kind: c.outstanding.length ? "consent" : "authorise",
+               outstanding: c.outstanding.length, since: t.requestedAt });
+  }
+  const order = { reIsolate: 0, energise: 1, authorise: 2, consent: 3 };
+  return out.sort((a, b) => order[a.kind] - order[b.kind] ||
+    String(a.since || "").localeCompare(String(b.since || "")));
+}
+
+// Which of those a given role should be shown. Energised equipment is
+// everybody's business — a live machine is a hazard whether or not you are the
+// one who has to act on it. The rest is offered to the roles that can act.
+function trialTasksFor(tasks, role) {
+  const runs = ["issuer", "admin", "isolator"].includes(role);
+  return (tasks || []).filter((t) => t.kind === "reIsolate" || runs);
+}
+
 // Why hand-back cannot proceed on this certificate, or null if it may. Hand-back
 // is the point of no return — the locks come off for good — so a trial run at
 // ANY stage holds it, not only an energised one: taking the locks off while a
@@ -1593,7 +1658,11 @@ async function viewDashboard(m) {
   const mine = permits.filter((p) => p.requester?.uid === State.profile.id);
   const active = permits.filter((p) => ["active", "extended"].includes(p.status));
   const pending = permits.filter((p) => p.status === "submitted");
-  const isolated = equip.filter((e) => e.isolationStatus === "isolated" || e.isolationStatus === "trialRun");
+  // Energised-for-trial equipment used to be counted inside "Equipment
+  // isolated", which made a live machine indistinguishable from a locked-out
+  // one on the only screen everybody looks at. They are opposite states.
+  const isolated = equip.filter((e) => e.isolationStatus === "isolated");
+  const energisedEq = equip.filter((e) => e.isolationStatus === "trialRun");
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
   const overdue = (isIssuer ? permits : mine).filter(isOverdue);
   const isoMap = isoIndex(isoAll);
@@ -1684,8 +1753,30 @@ async function viewDashboard(m) {
   let html = `<div class="cols stat-grid" style="margin-bottom:1.2rem">
     ${queueTiles}
     ${stat(active.length, "Active permits", ICON.list, { view: "permits", params: { status: "activeAll" } })}
-    ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolatedAny" } })}
+    ${stat(isolated.length, "Equipment isolated", ICON.lock, { view: "equipment", params: { status: "isolated" } })}
+    ${energisedEq.length ? stat(energisedEq.length, "Energised for trial", ICON.unlock, { view: "equipment", params: { status: "trialRun" } },
+        queueState(trialTasks(isoAll, permits).filter((t) => t.kind === "reIsolate"), (t) => t.since, TRIAL_LIVE_ALERT_HRS)) : ""}
     ${stat(mine.length, "My permits", ICON.cube, { view: "permits", params: { mine: true } })}</div>`;
+
+  // A live trial is the loudest thing this app can be looking at, so it goes
+  // above the overdue banner and is shown to every role, not only the one that
+  // has to act. Someone who knows the plant may be the one to notice.
+  const trialAll = trialTasks(isoAll, permits);
+  const trialLive = trialAll.filter((t) => t.kind === "reIsolate");
+  if (trialLive.length) {
+    const oldest = queueState(trialLive, (t) => t.since, TRIAL_LIVE_ALERT_HRS);
+    html += `<div class="danger-box" id="trialBanner" style="cursor:pointer">
+      <b>⚠ ${trialLive.length} item(s) of equipment ENERGISED for a trial run</b> — ${esc(trialLive.map((t) => t.iso.equipmentTag || t.iso.isoNo || t.iso.id).join(", "))}.
+      ${oldest.oldest ? `Live for ${ageText(oldest.oldest)}. ` : ""}${trialLive.some((t) => t.done) ? "The crew has confirmed the trial is finished. " : ""}An Isolator must re-isolate before work resumes.</div>`;
+  }
+  // The crews' own half: their permit page shows this too, but only if they
+  // open it, and a trial run waits on every crew at once.
+  const myConsent = trialAll.filter((t) => t.kind === "consent" &&
+    trialConsentState(t.iso, permits.filter((p) => p.isolationRef === t.iso.id)).outstanding
+      .some((p) => p.requester?.uid === me));
+  if (myConsent.length) html += `<div class="warn-box" id="trialConsentBanner" style="cursor:pointer">
+    <b>${myConsent.length} trial run(s) are waiting on your crew to clear.</b> Open the permit and confirm your people are clear of the equipment, or refuse.</div>`;
+
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
 
   const tasks = isoAll.filter((i) =>
@@ -1698,6 +1789,18 @@ async function viewDashboard(m) {
       ${tasks.map((i) => { const deiso = i.status === "removalPending" || readyForDeiso.has(i.id); return `<tr class="row" data-iid="${i.id}">
         <td><span class="mono">${esc(i.isoNo || i.id)}</span></td><td>${esc(i.equipmentTag)}</td>
         <td>${badge(deiso ? "removalPending" : i.status)}</td><td>${esc((deiso ? i.removalAssignedTo?.name : i.assignedTo?.name) || "—")}</td></tr>`; }).join("")}
+      </tbody></table></div>`;
+  }
+
+  const myTrials = trialTasksFor(trialAll, State.profile.role);
+  if (myTrials.length) {
+    html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Trial runs</h3></div>
+      <table class="tbl"><thead><tr><th>Certificate</th><th>Equipment</th><th>Stage</th><th>Waiting on</th><th>For</th></tr></thead><tbody>
+      ${myTrials.map((t) => { const d = TRIAL_TASK[t.kind]; return `<tr class="row" data-tiid="${t.iso.id}">
+        <td><span class="mono">${esc(t.iso.isoNo || t.iso.id)}</span></td><td>${esc(t.iso.equipmentTag || "—")}</td>
+        <td><span class="badge-st ${t.kind === "reIsolate" ? "stage-trialRun" : "stage-trialPending"}">${esc(d.label)}</span>${t.done ? ` <span class="chip chip-ok">✔ crew finished</span>` : ""}</td>
+        <td>${esc(d.who)}${t.outstanding ? ` (${t.outstanding})` : ""}</td>
+        <td>${esc(ageText(t.since) || "—")}</td></tr>`; }).join("")}
       </tbody></table></div>`;
   }
 
@@ -1744,6 +1847,9 @@ async function viewDashboard(m) {
     t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nav(); } };
   });
   const ob = $("#overdueBanner"); if (ob) ob.onclick = () => go("permits", { status: "overdue" });
+  const tb = $("#trialBanner"); if (tb) tb.onclick = () => go("equipment", { status: "trialRun" });
+  const cb = $("#trialConsentBanner"); if (cb) cb.onclick = () => go("permits", { mine: true, status: "activeAll" });
+  $$("tr.row[data-tiid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.tiid }));
   $$("tr.row[data-iid]").forEach((r) => r.onclick = () => go("isodetail", { id: r.dataset.iid }));
   };
   await paint();

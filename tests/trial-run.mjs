@@ -48,17 +48,21 @@ const M = new Function(`
   ${grab("function trialConsentState(iso, permits)")}
   ${grab("function trialReadyToEnergise(iso, permits)")}
   ${grab("function handbackHold(iso, verb)")}
+  ${grab("function trialTasks(isolations, permits)")}
+  ${grab("function trialTasksFor(tasks, role)")}
   ${grab("function isoIndex(isolations)")}
   ${grab("function permitStage(p, isolations)")}
   ${grab("function permitsByIso(permits)")}
   ${grab("function isoReadyForDeiso(iso, permits, byIso)")}
   ${grab("function equipmentBlock(eqId, permits, isolations, excludeId)")}
   return { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
-           trialReadyToEnergise, handbackHold, permitStage, isoReadyForDeiso, equipmentBlock };
+           trialReadyToEnergise, handbackHold, trialTasks, trialTasksFor,
+           permitStage, isoReadyForDeiso, equipmentBlock };
 `)();
 
 const { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
-        trialReadyToEnergise, handbackHold, permitStage, isoReadyForDeiso, equipmentBlock } = M;
+        trialReadyToEnergise, handbackHold, trialTasks, trialTasksFor,
+        permitStage, isoReadyForDeiso, equipmentBlock } = M;
 
 let pass = 0, fail = 0;
 function check(name, cond) { cond ? pass++ : fail++; console.log(`${cond ? "  PASS" : "  FAIL"}  ${name}`); }
@@ -253,6 +257,70 @@ console.log("\nThe late-attach hole — a crew approved after the consents were 
   const after = [...before, permit("D")];
   check("a newly attached crew puts it back to NOT ready", trialReadyToEnergise(c, after) === false);
   check("the new crew is named as outstanding", ids(trialConsentState(c, after).outstanding) === "D");
+}
+
+console.log("\nA trial run becomes work on somebody's desk, worst first:");
+{
+  const permits = [permit("A"), permit("B")];
+  const at = (h) => new Date(Date.parse(AT) + h * 3600000).toISOString();
+  const c = (id, trialRun, over = {}) => ({ ...cert(trialRun, over), id });
+
+  check("a quiet certificate is not work", trialTasks([c("C1", null)], permits).length === 0);
+  {
+    const t = trialTasks([c("C1", trial("requested"))], permits)[0];
+    check("a request with crews still to clear waits on the crews", t.kind === "consent");
+    // Two permits on the lockout, but the crew that asked is not asked again.
+    check("and says how many are outstanding", t.outstanding === 1);
+  }
+  {
+    const all = trial("requested", [says("B", "consent")]);
+    const t = trialTasks([c("C1", all)], [permit("A"), permit("B")])[0];
+    check("once every crew has cleared it waits on the Issuer", t.kind === "authorise");
+  }
+  {
+    const t = trialTasks([c("C1", trial("approved"))], permits)[0];
+    check("an authorised trial waits on the Isolator", t.kind === "energise");
+    check("its clock starts at the authorisation, not the request",
+      t.since === trial("approved").issuerApproval.at);
+  }
+  {
+    const t = trialTasks([c("C1", trial("energised", [], { deisolatedAt: at(3) }), { status: "trialRun" })], permits)[0];
+    check("an energised trial waits on the Isolator", t.kind === "reIsolate");
+    check("its clock starts when the locks came out", t.since === at(3));
+    check("the crew has not signed off", t.done === false);
+  }
+  {
+    const t = trialTasks([c("C1", trial("energised", [], { completedBy: { uid: "u-A" } }), { status: "trialRun" })], permits)[0];
+    check("a crew sign-off is carried through to the queue", t.done === true);
+  }
+  // The state the earlier flow leaves: energised with nothing to read a stage
+  // from. It must still appear as work, or it is invisible forever.
+  {
+    const t = trialTasks([{ id: "C1", status: "trialRun", trialRun: null, updatedAt: at(2) }], permits)[0];
+    check("a legacy energised certificate is still work", t && t.kind === "reIsolate");
+  }
+  {
+    // Live equipment outranks everything, whatever order the certificates
+    // arrive in — the queue is read top-down by someone in a hurry.
+    const list = [c("C1", trial("requested")), c("C2", trial("approved")),
+                  c("C3", trial("energised"), { status: "trialRun" })];
+    const kinds = trialTasks(list, permits).map((t) => t.kind);
+    check("energised sorts first", kinds[0] === "reIsolate");
+    check("then authorised, then waiting on crews", kinds.join(",") === "reIsolate,energise,consent");
+  }
+}
+
+console.log("\nEnergised equipment is everybody's business; the rest is role work:");
+{
+  const permits = [permit("A"), permit("B")];
+  const c = (id, trialRun, over = {}) => ({ ...cert(trialRun, over), id });
+  const tasks = trialTasks([c("C1", trial("requested")), c("C2", trial("approved")),
+                            c("C3", trial("energised"), { status: "trialRun" })], permits);
+  for (const role of ["issuer", "admin", "isolator"])
+    check(`${role} sees all three`, trialTasksFor(tasks, role).length === 3);
+  const asCrew = trialTasksFor(tasks, "requester");
+  // A live machine is a hazard whether or not you are the one who acts on it.
+  check("a requester still sees the energised one", asCrew.length === 1 && asCrew[0].kind === "reIsolate");
 }
 
 /* ============ 2. Non-regression: invisible to the rest of the app ============ */
