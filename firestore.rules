@@ -134,10 +134,35 @@ service cloud.firestore {
             && ownsCrewPermit(isoId, resource.data.trialRun.permitId))
         );
     }
+    // The crew saying the trial has served its purpose, so the Isolator knows to
+    // re-apply the locks. This is the ONE crew write that happens while the
+    // equipment is energised, so it is scoped separately and tightly: the
+    // certificate stays in trialRun, the trial stays energised, and nothing
+    // about how it got there may move. It records a request, not a state change
+    // — only the Isolator's write ends the trial.
+    function trialDoneWrite(isoId) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['trialRun'])
+        && resource.data.status == 'trialRun'
+        && request.resource.data.status == 'trialRun'
+        && resource.data.get('trialRun', null) != null
+        && resource.data.trialRun.status == 'energised'
+        && request.resource.data.trialRun.status == 'energised'
+        && resource.data.trialRun.get('completedBy', null) == null
+        && request.resource.data.trialRun.completedBy.uid == request.auth.uid
+        // Everything that records how the equipment came to be live is frozen.
+        && request.resource.data.trialRun.permitId == resource.data.trialRun.permitId
+        && request.resource.data.trialRun.requestedBy == resource.data.trialRun.requestedBy
+        && request.resource.data.trialRun.consents == resource.data.trialRun.consents
+        && request.resource.data.trialRun.issuerApproval == resource.data.trialRun.issuerApproval
+        && request.resource.data.trialRun.deisolatedBy == resource.data.trialRun.deisolatedBy
+        && request.resource.data.trialRun.deisolatedAt == resource.data.trialRun.deisolatedAt
+        && ownsCrewPermit(isoId, resource.data.trialRun.permitId);
+    }
     // The whole crew-facing permission, in one place.
     function crewTrialWrite(isoId) {
-      return trialFieldsOnly()
-        && (trialRequestWrite(isoId) || trialConsentWrite(isoId) || trialCloseWrite(isoId));
+      return (trialFieldsOnly()
+                && (trialRequestWrite(isoId) || trialConsentWrite(isoId) || trialCloseWrite(isoId)))
+        || trialDoneWrite(isoId);
     }
     // Transitions that mean a person physically handled locks: applying them
     // (assigned → active), taking them out for a trial (active → trialRun) and
