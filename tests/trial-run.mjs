@@ -64,7 +64,16 @@ const M = new Function(`
   ${grab("function permitStage(p, isolations)")}
   ${grab("function permitsByIso(permits)")}
   ${grab("function isoReadyForDeiso(iso, permits, byIso)")}
-  ${grab("function equipmentBlock(eqId, permits, isolations, excludeId)")}
+  // equipmentBlock now consults the auto-rejection derivation, so its whole
+  // dependency chain comes along. Passing no policy (the default) leaves it off,
+  // which is what pins the pre-existing behaviour these cases describe.
+  ${grab("function permitEnd(p)")}
+  ${grab("function autoRejectFrom(p)")}
+  ${grab("function autoRejectDue(p, pol)")}
+  ${grab("function autoRejectSafe(p, isolations)")}
+  ${grab("function autoRejectState(p, isolations, pol, now = Date.now())")}
+  ${grabLine("function isAutoRejected(p, isolations, pol)")}
+  ${grab("function equipmentBlock(eqId, permits, isolations, excludeId, pol = null)")}
   return { trialStage, isTrialEnergised, trialConsentTargets, trialConsentState,
            trialReadyToEnergise, handbackHold, trialOverrun, trialTasks, trialTasksFor,
            permitStage, isoReadyForDeiso, equipmentBlock };

@@ -45,12 +45,28 @@ function grab(sig) {
   throw new Error("unbalanced: " + sig);
 }
 
+// One-liners, where grab() would stop at the first closing brace of the body.
+function grabLine(sig) {
+  const i = src.indexOf(sig);
+  if (i < 0) throw new Error("not found in app.js: " + sig);
+  return src.slice(i, src.indexOf("\n", i));
+}
+
 const M = new Function(`
   ${grab("function isoIndex(isolations)")}
   ${grab("function permitStage(p, isolations)")}
   ${grab("function permitsByIso(permits)")}
   ${grab("function isoReadyForDeiso(iso, permits, byIso)")}
-  ${grab("function equipmentBlock(eqId, permits, isolations, excludeId)")}
+  // equipmentBlock now consults the auto-rejection derivation, so its whole
+  // dependency chain comes along. Passing no policy (the default) leaves it off,
+  // which is what pins the pre-existing behaviour these cases describe.
+  ${grab("function permitEnd(p)")}
+  ${grab("function autoRejectFrom(p)")}
+  ${grab("function autoRejectDue(p, pol)")}
+  ${grab("function autoRejectSafe(p, isolations)")}
+  ${grab("function autoRejectState(p, isolations, pol, now = Date.now())")}
+  ${grabLine("function isAutoRejected(p, isolations, pol)")}
+  ${grab("function equipmentBlock(eqId, permits, isolations, excludeId, pol = null)")}
   ${grab("function computeCycleState(cycle)")}
   ${grab("function buildCycle(equip, permits, isolations)")}
   return { equipmentBlock, computeCycleState, buildCycle };

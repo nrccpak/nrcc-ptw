@@ -38,6 +38,16 @@ const DEFAULT_JOB_TITLES = [
   "PPM Inspector", "Quality Supervisor", "Lab Technician", "Safety Officer", "Officer"
 ];
 
+// Auto-rejection policy (see "Auto-rejection" in section 2 for the whole story).
+//   submittedHours          waiting for an Issuer's decision
+//   awaitingIsolationHours  approved, waiting for an Isolator to apply the locks
+//   reinstateHours          how long an Issuer may put an auto-rejected permit back
+// The two waits differ because they cost different things: an approved permit is
+// already holding a certificate, so it gets the shorter rope. Both are generous
+// enough to survive a weekend — a threshold that fires on ordinary permits
+// teaches everyone to ignore it, and then it protects nothing.
+const AUTO_REJECT_DEFAULT = { enabled: true, submittedHours: 72, awaitingIsolationHours: 48, reinstateHours: 24 };
+
 const DEFAULT_CONFIG = {
   permitTypes: [
     { code: "general", name: "General / Cold Work", abbr: "GEN", requiresIsolation: false, requiresGasTest: false,
@@ -57,7 +67,11 @@ const DEFAULT_CONFIG = {
     { name: "Quality Control", subUnits: [] }
   ],
   ppeList: ["Helmet", "Safety shoes", "Gloves", "Eye protection", "Ear protection", "Face shield", "Respirator", "Full body harness", "FR coverall", "Insulating gloves"],
-  jobTitles: [...DEFAULT_JOB_TITLES]
+  jobTitles: [...DEFAULT_JOB_TITLES],
+  // How long a permit may wait for a decision before it auto-rejects. Stored in
+  // config/app like everything else here so the safety officer can tune it from
+  // the Admin screen — see AUTO_REJECT_DEFAULT for what each number means.
+  autoReject: { ...AUTO_REJECT_DEFAULT }
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -91,6 +105,119 @@ function isOverdue(p) {
   const d = new Date(end); return !isNaN(d) && d.getTime() < Date.now();
 }
 function overdueChip() { return `<span class="badge-st st-overdue" title="Planned end has passed">Overdue</span>`; }
+
+/* -------------------- Auto-rejection --------------------
+   A permit waiting for a decision is not harmless to leave alone, and the cost is
+   worst for the ones that were already approved. An `awaitingIsolation` permit
+   holds a certificate, and that certificate holds `equipment.activeIsolationId` —
+   which txEquipmentPointer() requires to be EMPTY before any other permit on that
+   tag can be approved. So one approval that no Isolator ever confirmed locks the
+   equipment out of the permit system indefinitely, and nothing here notices,
+   because isOverdue() only speaks for permits that already carry a planned end.
+   (A forgotten `submitted` permit is milder — it does not hard-block, it sits in
+   the Issuer's queue and shows up in every concurrent-work warning on that tag
+   until the warnings stop being read.) Auto-rejection closes both.
+
+   IT IS DELIBERATELY NOT A REJECTION. `rejection` carries a person, their name and
+   a reason; a timeout has none of the three, and writing "Rejected" into a permit's
+   history would record a safety decision that nobody made — precisely the thing an
+   audit is meant to catch. An auto-rejected permit takes the `expired` status,
+   which every terminal-status gate in the app already handles, and is labelled
+   "Auto-rejected" everywhere a human sees it.
+
+   TWO RULES, whichever falls first:
+     1. plannedEnd — the permit's own planned end passes while it is still waiting.
+        A submitted permit must carry a planned end or be explicitly open-ended, so
+        this covers most permits using the requester's own dates rather than any
+        number we invented. Approving a permit whose window has already closed is
+        the thing actually worth preventing.
+     2. idle — a fixed timeout, which exists only for the open-ended permits that
+        rule 1 cannot reach.
+
+   DERIVED, NEVER STORED, exactly like isOverdue: this is a static site with no
+   server, so there is no scheduled job to run the clock, and a stored status would
+   be wrong for however long nobody opened the app. Every gate below reads the
+   derived state, so the feature is correct whether or not anything was written.
+   stampAutoReject() additionally writes the status when an Issuer or Admin looks
+   at such a permit — that is what puts it in the permanent record — but nothing
+   depends on that write having happened. */
+function autoRejectPolicy() { return { ...AUTO_REJECT_DEFAULT, ...(State.config?.autoReject || {}) }; }
+// When the wait began, per state: a submitted permit runs from submission, an
+// approved one from approval. `submittedAt` is stamped on the submit paths so
+// that editing a submitted permit cannot quietly restart its clock; the
+// fallbacks cover permits written before that field existed.
+function autoRejectFrom(p) {
+  return (p?.status === "submitted"
+    ? (p.submittedAt || p.updatedAt || p.createdAt)
+    : (p?.approval?.timestamp || p?.updatedAt || p?.createdAt)) || null;
+}
+// The deadline and which rule set it, or null if this permit is not waiting on
+// anybody (or the policy is switched off). Earliest rule wins.
+function autoRejectDue(p, pol) {
+  if (!p || !pol || pol.enabled === false) return null;
+  if (!["submitted", "awaitingIsolation"].includes(p.status)) return null;
+  const due = [];
+  const end = Date.parse(permitEnd(p) || "");   // open-ended → null → NaN → skipped
+  if (!isNaN(end)) due.push({ at: end, rule: "plannedEnd" });
+  const hours = p.status === "submitted" ? pol.submittedHours : pol.awaitingIsolationHours;
+  const from = Date.parse(autoRejectFrom(p) || "");
+  if (!isNaN(from) && hours > 0) due.push({ at: from + hours * 3600000, rule: "idle" });
+  if (!due.length) return null;                // undatable and open-ended: never accuse it
+  return due.sort((a, b) => a.at - b.at)[0];
+}
+// Automation must never conclude that physical locks should come off. Rejecting an
+// awaitingIsolation permit by hand decides exactly that (see the reject handler):
+// while the certificate is still `assigned` the locks were demonstrably never
+// applied, so it is cancelled and the equipment freed — but at any later status an
+// Isolator has signed that the locks ARE on, and rejection sends the certificate to
+// removalPending, i.e. dispatches somebody to remove them. A timeout may only ever
+// take the first branch, and only when no other crew shares the lockout. Everything
+// else stays exactly where it is and is merely flagged to the Issuer.
+function autoRejectSafe(p, isolations) {
+  if (!p?.isolationRef) return true;
+  const iso = isoIndex(isolations).get(p.isolationRef);
+  if (!iso) return false;                      // unknown lock state: never guess
+  if (iso.status === "removed") return true;
+  if (iso.status !== "assigned") return false;
+  return !(iso.attachedPermitIds || []).some((x) => x !== p.id);
+}
+// The whole derived state of one permit, or null if it is not waiting on a decision:
+//   pending  waiting, deadline still ahead
+//   warn     past the halfway mark — shown so the deadline is never a surprise
+//   lapsed   past it: auto-rejected, and treated as terminal everywhere below
+//   held     past it, but holding a lockout, so it is flagged and NOT acted on
+// `now` is a parameter so the whole thing can be tested without waiting three days.
+function autoRejectState(p, isolations, pol, now = Date.now()) {
+  const due = autoRejectDue(p, pol);
+  if (!due) return null;
+  if (now >= due.at) return { ...due, phase: autoRejectSafe(p, isolations) ? "lapsed" : "held" };
+  const from = Date.parse(autoRejectFrom(p) || "");
+  return { ...due, phase: !isNaN(from) && now >= from + (due.at - from) / 2 ? "warn" : "pending" };
+}
+function isAutoRejected(p, isolations, pol) { return autoRejectState(p, isolations, pol)?.phase === "lapsed"; }
+// Both the stored status and the derived one. Used by the gates that must treat an
+// auto-rejected permit as finished whether or not the write has happened yet.
+function permitDead(p, isolations, pol) {
+  return ["closed", "rejected", "expired"].includes(p?.status) || isAutoRejected(p, isolations, pol);
+}
+const AUTO_REJECT_RULE = {
+  plannedEnd: "its planned end passed while it was still waiting for a decision",
+  idle: "no decision was recorded within the allowed time"
+};
+function hoursText(ms) {
+  const h = Math.round(ms / 3600000);
+  if (h <= 0) return "now";
+  return h < 48 ? `${h} hour${h === 1 ? "" : "s"}` : `${Math.round(h / 24)} days`;
+}
+// Shown beside the status badge. The warn chip is the point of the whole feature
+// being visible rather than silent: nobody should discover a deadline by losing to it.
+function autoRejectChip(st) {
+  if (!st) return "";
+  if (st.phase === "lapsed") return ` <span class="badge-st st-expired" title="${esc(AUTO_REJECT_RULE[st.rule])}">Auto-rejected</span>`;
+  if (st.phase === "held") return ` <span class="badge-st st-overdue" title="Past its auto-reject deadline, but its lockout must be handled by a person">Auto-reject held</span>`;
+  if (st.phase === "warn") return ` <span class="badge-st st-lapsing" title="Auto-rejects ${esc(fmt(new Date(st.at).toISOString()))}">Auto-rejects in ${esc(hoursText(st.at - Date.now()))}</span>`;
+  return "";
+}
 // How long a permit has been live on site: from approval, not from when the
 // draft was raised. A permit that sat unsubmitted in a Requester's drafts for
 // a week has not been live for a week. The fallbacks cover records written
@@ -184,10 +311,16 @@ function trialChip(iso) {
 // permit — i.e. when any live permit is awaiting closure, or the lockout's
 // de-isolation is pending / all its crews have signed off. Overdue alone does
 // not block (the Issuer extends or closes at their discretion — warned only).
-function equipmentBlock(eqId, permits, isolations, excludeId) {
-  const live = permits.filter((p) => p.equipmentRef === eqId && p.id !== excludeId &&
-    ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
+//
+// `pol` is the auto-rejection policy: a permit past its deadline is not part of
+// the live set, so it can neither contribute a block nor be listed as concurrent
+// work. Omitting it (the default) disables auto-rejection for this call, which is
+// how the pure-logic tests pin the pre-existing behaviour.
+function equipmentBlock(eqId, permits, isolations, excludeId, pol = null) {
   const isoMap = isoIndex(isolations);
+  const live = permits.filter((p) => p.equipmentRef === eqId && p.id !== excludeId &&
+    ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status) &&
+    !isAutoRejected(p, isoMap, pol));
   const closing = live.filter((p) => permitStage(p, isoMap) === "awaitingClosure");
   if (closing.length) return { kind: "awaitingClosure", permits: closing };
   const liveIsoIds = new Set(live.map((p) => p.isolationRef).filter(Boolean));
@@ -541,7 +674,10 @@ const TYPE_CLASS = { general: "permit-type-general", hot: "permit-type-hot", lot
 const TYPE_DOT = { general: "var(--steel)", hot: "var(--red)", loto: "var(--amber)", confined: "var(--green)" };
 
 const STATUS_LABEL = { draft: "Draft", submitted: "Submitted", awaitingIsolation: "Awaiting Isolation",
-  active: "Active", extended: "Extended", closed: "Closed", rejected: "Rejected", expired: "Expired",
+  // "expired" is the stored status of an auto-rejected permit. It is never
+  // labelled "Rejected": a rejection is a person's decision with a reason
+  // attached, and a timeout is neither. See the Auto-rejection notes above.
+  active: "Active", extended: "Extended", closed: "Closed", rejected: "Rejected", expired: "Auto-rejected",
   isolated: "Isolated", pending: "Isolation Pending", trialRun: "Trial Run", available: "Available",
   assigned: "Assigned", removalPending: "De-isolation Pending", removed: "Removed" };
 
@@ -1616,7 +1752,12 @@ async function refreshPendingBadge(known) {
   if (!["issuer", "admin"].includes(State.profile.role)) return;
   try {
     const permits = known || await fetchPermits();
-    const pending = permits.filter((p) => p.status === "submitted").length;
+    // Matches the dashboard tile: auto-rejected permits are not owed work. No
+    // certificates are fetched because none are needed — a `submitted` permit
+    // has no isolationRef yet (one is minted at approval), so autoRejectSafe()
+    // resolves without them.
+    const pol = autoRejectPolicy();
+    const pending = permits.filter((p) => p.status === "submitted" && !isAutoRejected(p, [], pol)).length;
     const b = $('.navitem[data-v="dashboard"] [data-badge]');
     if (b) { b.classList.toggle("hidden", pending === 0); b.textContent = pending; }
   } catch {}
@@ -1718,7 +1859,14 @@ async function viewDashboard(m) {
   refreshPendingBadge(permits);   // reuse what we just loaded — no second fetch
   const mine = permits.filter((p) => p.requester?.uid === State.profile.id);
   const active = permits.filter((p) => ["active", "extended"].includes(p.status));
-  const pending = permits.filter((p) => p.status === "submitted");
+  const isoMap = isoIndex(isoAll);
+  // Auto-rejected permits leave the approval queue — that is the whole point of
+  // the feature: a permit nobody decided on within the allowed time is no longer
+  // work anybody owes. They stay findable under the register's "auto-rejected"
+  // filter. A permit whose auto-rejection is HELD (its lockout needs a person)
+  // deliberately stays in the queue, and carries a chip saying so.
+  const arPol = autoRejectPolicy();
+  const pending = permits.filter((p) => p.status === "submitted" && !isAutoRejected(p, isoMap, arPol));
   // Energised-for-trial equipment used to be counted inside "Equipment
   // isolated", which made a live machine indistinguishable from a locked-out
   // one on the only screen everybody looks at. They are opposite states.
@@ -1726,7 +1874,6 @@ async function viewDashboard(m) {
   const energisedEq = equip.filter((e) => e.isolationStatus === "trialRun");
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
   const overdue = (isIssuer ? permits : mine).filter(isOverdue);
-  const isoMap = isoIndex(isoAll);
   // The other half of the Issuer's queue. A permit whose crew has signed off
   // and whose lockout (if any) is already removed needs nothing but closure —
   // but the permit sits in "active" until then, so it used to be reachable
@@ -1977,7 +2124,8 @@ async function viewPermits(m) {
         <option value="stage:awaitingClosure">awaiting closure</option>
         <option value="awaitingRequester">awaiting requester</option>
         ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected"].map((s) => `<option>${s}</option>`).join("")}
-        <option value="overdue">overdue</option></select>
+        <option value="overdue">overdue</option>
+        <option value="autoRejected">auto-rejected</option></select>
       <select id="fDept"><option value="">All departments</option></select>
       <label class="mine-toggle"><input type="checkbox" id="fMine"> My permits</label>
     </div>
@@ -1998,11 +2146,16 @@ async function viewPermits(m) {
   // Index the certificates once for the whole view — draw() runs on every
   // filter change and keystroke, and derives a stage for each row.
   let isoMap = isoIndex(isos);
+  const arPol = autoRejectPolicy();
   const draw = () => {
     const q = $("#q").value.toLowerCase(), ft = $("#fType").value, fs = $("#fStatus").value, fd = $("#fDept").value, fm = $("#fMine").checked;
     const rows = all.filter((p) =>
       (!ft || p.type === ft) &&
       (!fs || (fs === "overdue" ? isOverdue(p)
+        // Both halves of auto-rejection: the ones already stamped `expired` and
+        // the ones only derived so far. Without this an Issuer would have no way
+        // to find a permit that had quietly left their approval queue.
+        : fs === "autoRejected" ? (p.status === "expired" || isAutoRejected(p, isoMap, arPol))
         // Not a stage: it spans a draft (never submitted) and a live permit
         // whose crew has not signed off, which is a status the stages do not
         // reach. Useful to an Issuer too — it answers "who has not signed off?"
@@ -2018,7 +2171,7 @@ async function viewPermits(m) {
         <td><span class="mono">${esc(p.permitNo)}</span></td>
         <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName)}</span></td>
         <td>${esc(p.equipmentTag)}</td><td>${esc(p.requestingDepartment?.department || "—")}</td>
-        <td>${badge(p.status)}${stageChip(permitStage(p, isoMap))}${isOverdue(p) ? " " + overdueChip() : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
+        <td>${badge(p.status)}${stageChip(permitStage(p, isoMap))}${isOverdue(p) ? " " + overdueChip() : ""}${autoRejectChip(autoRejectState(p, isoMap, arPol))}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
       || `<tr><td colspan="7" class="empty">No permits match.</td></tr>`}</tbody></table>`;
     bindPermitRows();
   };
@@ -2044,7 +2197,11 @@ function exportPermitsCsv(rows, isolations = []) {
     ["Status", (p) => {
       const stage = permitStage(p, isolations);
       let s = p.status + (stage ? ` (${STAGE_LABEL[stage].toLowerCase()})` : "");
-      return isOverdue(p) ? s + " (overdue)" : s;
+      if (isOverdue(p)) s += " (overdue)";
+      const ar = autoRejectState(p, isolations, autoRejectPolicy());
+      if (ar?.phase === "lapsed") s += " (auto-rejected)";
+      if (ar?.phase === "held") s += " (auto-reject held)";
+      return s;
     }],
     ["Equipment", (p) => p.equipmentTag],
     ["Line", (p) => p.line], ["Area", (p) => p.area],
@@ -2089,11 +2246,29 @@ async function viewNewPermit(m) {
     editing = { id: editId, ...s.data() };
     if (editing.status !== "draft" || editing.requester?.uid !== State.profile.id) return go("detail", { id: editId });
   }
-  let type = editing ? (cfg.permitTypes.find((t) => t.code === editing.type) || cfg.permitTypes[0]) : cfg.permitTypes[0];
+  // Cloning: an auto-rejected permit is finished and cannot be revived, so the
+  // way back is a NEW one. Copying the description, equipment, checklist and PPE
+  // across removes the only real cost of that — nobody should have to retype a
+  // permit because a deadline passed. Dates and gas readings are deliberately
+  // NOT copied: they are the two things that were stale, and the requester must
+  // enter them afresh.
+  const cloneId = !editId && State.params.cloneId || null;
+  let cloning = null;
+  if (cloneId) {
+    const s = await getDoc(doc(db, "permits", cloneId)).catch(() => null);
+    if (!s || !s.exists()) return go("permits");
+    cloning = { id: cloneId, ...s.data() };
+  }
+  // What the form is filled from — the draft being edited, or the permit being
+  // copied. `editing` stays null when cloning, so the save path creates a new
+  // permit with a new number rather than writing over the old one.
+  const source = editing || cloning;
+  let type = source ? (cfg.permitTypes.find((t) => t.code === source.type) || cfg.permitTypes[0]) : cfg.permitTypes[0];
   let prefilled = false;
   const draw = () => {
     const deptOpts = cfg.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
     m.innerHTML = `<div class="page-head"><div><div class="kick">${editing ? "Edit" : "Create"}</div><h2>${editing ? "Edit Draft Permit" : "New Work Permit"}</h2></div></div>
+    ${cloning ? `<div class="info-box">Copied from <span class="mono">${esc(cloning.permitNo || "")}</span>${cloning.status === "expired" ? ", which was auto-rejected" : ""}. <b>Check the dates${type.requiresGasTest ? " and take a fresh gas test" : ""}</b> — they are not carried over. This will be raised as a new permit with its own number.</div>` : ""}
     <div class="card ${TYPE_CLASS[type.code]}">
       <h3>Permit type</h3><div class="csub">Choose the kind of work — the form adapts to it.</div>
       <div class="cols cols-4">${cfg.permitTypes.map((t) => `
@@ -2206,7 +2381,7 @@ async function viewNewPermit(m) {
       // and it runs on every pick, so it reads the live cached copy rather than
       // paying for two full collections each time an Issuer tries a tag.
       const [permits, isos] = await Promise.all([fetchPermits(), fetchIsolations().catch(() => [])]);
-      const block = equipmentBlock(e.id, permits, isos, editing?.id);
+      const block = equipmentBlock(e.id, permits, isos, editing?.id, autoRejectPolicy());
       if (block) {
         $("#eqId").value = ""; $("#eqChosen").innerHTML = ""; eqSearch.value = ""; eqResults.innerHTML = "";
         $("#simops").innerHTML = blockBox(e.tag, block, isos);
@@ -2221,7 +2396,12 @@ async function viewNewPermit(m) {
       showSimops(e, permits, isos);
     }
     function showSimops(e, permits, isos) {
-      const activeOnEq = permits.filter((p) => p.equipmentRef === e.id && p.id !== editing?.id && ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status));
+      // The same live set equipmentBlock() uses, auto-rejected permits excluded:
+      // listing a permit here that no longer blocks anything would contradict the
+      // tag having just been selectable.
+      const pol = autoRejectPolicy(), isoM = isoIndex(isos);
+      const activeOnEq = permits.filter((p) => p.equipmentRef === e.id && p.id !== editing?.id &&
+        ["submitted", "awaitingIsolation", "active", "extended"].includes(p.status) && !isAutoRejected(p, isoM, pol));
       if (activeOnEq.length) {
         $("#simops").innerHTML = `<div class="warn-box"><b>${activeOnEq.length} live permit(s) already on ${esc(e.tag)}.</b>
           The Issuer will review concurrent work. ${e.isolationStatus === "isolated" ? "This equipment is already isolated; an isolation permit will attach to the existing isolation." : ""}
@@ -2239,24 +2419,30 @@ async function viewNewPermit(m) {
     $("#saveDraft").onclick = () => savePermit("draft");
     $("#submit").onclick = () => savePermit("submitted");
 
-    // Prefill from the draft being edited — only on the first render. A manual
-    // permit-type change after that intentionally resets the type-specific fields.
-    if (editing && !prefilled) {
+    // Prefill from the draft being edited (or the permit being cloned) — only on
+    // the first render. A manual permit-type change after that intentionally
+    // resets the type-specific fields.
+    if (source && !prefilled) {
       prefilled = true;
-      if (editing.requestingDepartment?.department) $("#dept").value = editing.requestingDepartment.department;
+      if (source.requestingDepartment?.department) $("#dept").value = source.requestingDepartment.department;
       fillSub();
-      if (editing.requestingDepartment?.subUnit) $("#subunit").value = editing.requestingDepartment.subUnit;
-      $("#desc").value = editing.workDescription || "";
-      $("#loc").value = editing.location || "";
-      if (editing.validity?.start) $("#vstart").value = String(editing.validity.start).slice(0, 16);
-      if (editing.validity?.openEnded) { $("#vopen").checked = true; syncOpen(); }
-      else if (editing.validity?.plannedEnd) $("#vend").value = String(editing.validity.plannedEnd).slice(0, 16);
-      (editing.checklist || []).forEach((c, i) => { const el = $(`[data-chk="${i}"]`); if (el) el.checked = !!c.checked; });
-      const ppeSet = new Set(editing.ppe || []);
+      if (source.requestingDepartment?.subUnit) $("#subunit").value = source.requestingDepartment.subUnit;
+      $("#desc").value = source.workDescription || "";
+      $("#loc").value = source.location || "";
+      // A clone keeps "valid from = now" and an empty planned end. Carrying the
+      // old dates over is how the replacement for a permit that timed out would
+      // instantly time out again.
+      if (!cloning) {
+        if (source.validity?.start) $("#vstart").value = String(source.validity.start).slice(0, 16);
+        if (source.validity?.openEnded) { $("#vopen").checked = true; syncOpen(); }
+        else if (source.validity?.plannedEnd) $("#vend").value = String(source.validity.plannedEnd).slice(0, 16);
+      }
+      (source.checklist || []).forEach((c, i) => { const el = $(`[data-chk="${i}"]`); if (el) el.checked = !!c.checked; });
+      const ppeSet = new Set(source.ppe || []);
       $$("[data-ppe]").forEach((el) => { el.checked = ppeSet.has(el.value); });
-      if (type.requiresIsolation && (editing.isolationPoints || []).length) {
+      if (type.requiresIsolation && (source.isolationPoints || []).length) {
         $("#isoRows").innerHTML = "";
-        editing.isolationPoints.forEach((pt) => {
+        source.isolationPoints.forEach((pt) => {
           const d = document.createElement("div"); d.className = "iso-row";
           d.innerHTML = `<input placeholder="Isolation point (e.g. MCC-3 breaker)"><input placeholder="Method (rack-out / valve)"><input placeholder="Lock / tag no."><button class="btn btn-ghost btn-sm">✕</button>`;
           const ins = d.querySelectorAll("input");
@@ -2265,15 +2451,18 @@ async function viewNewPermit(m) {
           $("#isoRows").appendChild(d);
         });
       }
-      if (type.requiresGasTest && editing.gasTest) {
-        const g = editing.gasTest;
+      // Gas readings are never cloned. They describe the atmosphere at a moment
+      // that has passed, and copying them forward would let a stale reading be
+      // submitted as a current one — the one thing this form must not allow.
+      if (type.requiresGasTest && source.gasTest && !cloning) {
+        const g = source.gasTest;
         if ($("#g_o2")) $("#g_o2").value = g.o2 || "";
         if ($("#g_lel")) $("#g_lel").value = g.lel || "";
         if ($("#g_h2s")) $("#g_h2s").value = g.h2s || "";
         if ($("#g_co")) $("#g_co").value = g.co || "";
         if ($("#g_by")) $("#g_by").value = g.by || "";
       }
-      const eqExisting = equip.find((x) => x.id === editing.equipmentRef);
+      const eqExisting = equip.find((x) => x.id === source.equipmentRef);
       if (eqExisting) chooseEq(eqExisting);
     }
   };
@@ -2314,7 +2503,7 @@ async function viewNewPermit(m) {
     if (status === "submitted") {
       // Gates a state change → server read, not the cached copy (see approvePermit).
       const [subPermits, subIsos] = await Promise.all([fetchPermits({ fresh: true }), fetchIsolations({ fresh: true }).catch(() => [])]);
-      const block = equipmentBlock(eqId, subPermits, subIsos, editing?.id);
+      const block = equipmentBlock(eqId, subPermits, subIsos, editing?.id, autoRejectPolicy());
       if (block) return toast(`${e.tag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
     }
     // Gas-reading sanity check (advisory, like the hazard checklist): flag
@@ -2356,7 +2545,11 @@ async function viewNewPermit(m) {
               if (!snap.exists()) gate("This permit no longer exists.");
               if (!["draft", "submitted"].includes(snap.data().status))
                 gate(`This permit is now ${STATUS_LABEL[snap.data().status] || snap.data().status} — it can no longer be edited.`);
-              tx.update(ref, fields);
+              // The auto-rejection clock starts when the Issuer first has
+              // something to decide, and is NOT restarted by a later edit —
+              // otherwise a permit could be kept alive indefinitely by touching
+              // it, which is the exact thing the deadline is there to stop.
+              tx.update(ref, { ...fields, submittedAt: snap.data().submittedAt || nowISO() });
             });
           } else await fsWrite(updateDoc(ref, fields));
           toast(status === "draft" ? "Draft updated" : "Permit submitted for approval", "ok");
@@ -2375,6 +2568,9 @@ async function viewNewPermit(m) {
           checklist, ppe, gasTest, isolationPoints,
           approval: null, rejection: null, closure: null, trialRuns: [],
           sync: { createdOffline: !navigator.onLine },
+          // When the Issuer's clock starts. Null on a draft — a draft is waiting
+          // on nobody, so it has no deadline (see autoRejectDue).
+          submittedAt: submitting ? nowISO() : null,
           createdAt: nowISO(), updatedAt: nowISO()
         };
         // addDoc cannot run inside a transaction, so mint the id up front and
@@ -2584,19 +2780,44 @@ async function viewPermitDetail(m) {
   }
   const shared = siblings.length > 0;
   const siblingsWorking = siblings.filter((x) => ["active", "extended"].includes(x.status) && !x.workCompletion).length;
+  // Auto-rejection, derived from this permit's own certificate — the only lockout
+  // that can hold it, and the same one its siblings are under. Worked out once:
+  // workChip below runs per sibling row.
+  const arPol = autoRejectPolicy();
+  const arIsos = isoDoc ? [isoDoc] : [];
   // A compact "is this crew finished?" indicator for the sibling-permit table.
+  // permitDead rather than a status list: a sibling that has auto-rejected but
+  // has not been stamped yet is finished, and showing it as "Not started" would
+  // suggest a crew is still expected on a lockout that is only waiting on itself.
   const workChip = (x) => {
     if (x.status === "closed") return `<span class="chip">Closed</span>`;
-    if (["rejected", "expired"].includes(x.status)) return `<span class="chip">—</span>`;
+    if (permitDead(x, arIsos, arPol)) return `<span class="chip">—</span>`;
     if (["active", "extended"].includes(x.status)) return x.workCompletion
       ? `<span class="chip chip-ok">✔ Work complete</span>`
       : `<span class="chip chip-prog">● In progress</span>`;
     return `<span class="chip">Not started</span>`;
   };
   const kv = (k, v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  // `arDead` is the gate: past the deadline AND safe to act on (see autoRejectSafe).
+  const arState = autoRejectState(p, arIsos, arPol);
+  const arDead = arState?.phase === "lapsed";
+  // Reinstatement is offered while the permit still points at nothing physical:
+  // once it is stamped its certificate has been cancelled, so putting it back
+  // means a fresh approval and a fresh certificate, not a status flip.
+  // Measured from when it was STAMPED, not from the deadline it missed: a permit
+  // that lapsed over a shutdown may not be seen for days, and the window is meant
+  // to cover "an Issuer has just looked at this and it is wrong", not the lapse.
+  const arReinstatable = p.status === "expired" && isIssuer &&
+    (Date.now() - Date.parse(p.autoReject?.stampedAt || p.updatedAt || "")) < (arPol.reinstateHours || 0) * 3600000;
   let actions = "";
-  if (p.status === "submitted" && isIssuer) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
+  // An auto-rejected permit cannot be approved. This is the load-bearing line of
+  // the whole feature: everything else is presentation, but approving a permit
+  // whose window has already closed is the outcome worth preventing.
+  if (p.status === "submitted" && isIssuer && !arDead) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
   if (["submitted", "awaitingIsolation"].includes(p.status) && isIssuer) actions += `<button class="btn btn-danger" id="reject">Reject</button>`;
+  if (arReinstatable) actions += `<button class="btn btn-accent" id="reinstate">Reinstate</button>`;
+  // Anyone who can raise a permit can raise the replacement, without retyping it.
+  if ((arDead || p.status === "expired") && (isOwner || isIssuer)) actions += `<button class="btn btn-ghost" id="clonePermit">Raise a new permit from this</button>`;
   if (["draft"].includes(p.status) && isOwner) actions += `<button class="btn btn-ghost" id="editDraft">Edit</button><button class="btn btn-accent" id="submitNow">Submit for approval</button>`;
   // The requester signs off that the work is finished and the equipment is safe
   // to return to service. The Issuer can only close after de-isolation.
@@ -2633,10 +2854,18 @@ async function viewPermitDetail(m) {
 
   $("#pd").innerHTML = `
     <div class="page-head"><div><div class="kick">Permit · ${esc(p.typeName)}</div>
-      <h2 style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}${trialChip(isoDoc)}</h2></div>
+      <h2 style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}${trialChip(isoDoc)}${autoRejectChip(arState)}</h2></div>
       <div class="actions">${actions}</div></div>
 
     ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
+    ${arDead || p.status === "expired" ? `<div class="danger-box"><b>Auto-rejected.</b> This permit was never approved — ${esc(AUTO_REJECT_RULE[arState?.rule || p.autoReject?.rule] || "it ran out of time")}${arState ? ` (${esc(fmt(new Date(arState.at).toISOString()))})` : p.autoReject?.at ? ` (${esc(fmt(p.autoReject.at))})` : ""}.
+      <div style="margin-top:.35rem">Nobody rejected it — it lapsed on time, so no reason is recorded against anyone. ${p.equipmentTag ? `<b>${esc(p.equipmentTag)}</b> is released for new permits.` : ""}
+      ${isOwner ? "The work has not been authorised. Raise a new permit with current dates and a fresh gas test if it is still needed." : isIssuer ? "Reinstate it if it lapsed in error, or ask the requester to raise a new one." : ""}</div>
+      ${p.autoReject?.reinstatedBy ? `<div style="margin-top:.35rem">Previously reinstated by ${personHTML(p.autoReject.reinstatedBy.name, p.autoReject.reinstatedBy)} · ${fmt(p.autoReject.reinstatedAt)}.</div>` : ""}</div>` : ""}
+    ${arState?.phase === "held" ? `<div class="danger-box"><b>Past its auto-reject deadline — held for a person.</b> This permit passed its deadline (${esc(fmt(new Date(arState.at).toISOString()))}) but it is attached to certificate <span class="mono">${esc(p.isoNo || p.isolationRef || "")}</span>, which is either already applied or shared with another crew.
+      <div style="margin-top:.35rem">Nothing has been decided automatically, because doing so would mean deciding that physical locks should move. ${isIssuer ? "Approve it, or reject it with a reason, or extend the validity." : "It is with the Issuer."}</div></div>` : ""}
+    ${arState?.phase === "warn" ? `<div class="warn-box"><b>Auto-rejects in ${esc(hoursText(arState.at - Date.now()))}</b> — ${esc(fmt(new Date(arState.at).toISOString()))}, because ${arState.rule === "plannedEnd" ? "that is the planned end on the permit itself" : "no decision has been recorded"}.
+      ${isIssuer ? "Approve or reject it before then." : "It is still waiting for a decision — chase the Issuer if the work is due."}</div>` : ""}
     ${isOverdue(p) ? `<div class="danger-box"><b>Permit overdue.</b> The planned end (${fmt(permitEnd(p))}) has passed. ${isIssuer ? "Extend the validity or close the permit." : "Ask the Issuer to extend or close this permit."}</div>` : ""}
     ${energised ? `<div class="danger-box"><b>⚠ TRIAL RUN IN PROGRESS — ${esc(p.equipmentTag || equip?.tag || "the equipment")} is ENERGISED.</b>
       Do not work on it and keep clear. ${isIsoOrAdmin ? "Re-isolate as soon as the trial is finished." : "An Isolator must re-isolate before any work resumes."}
@@ -2709,10 +2938,17 @@ async function viewPermitDetail(m) {
   $$("tr.row[data-sib]").forEach((r) => r.onclick = () => go("detail", { id: r.dataset.sib }));
   $("#godeiso") && ($("#godeiso").onclick = () => go("isodetail", { id: p.isolationRef }));
   $("#editDraft") && ($("#editDraft").onclick = () => go("new", { editId: id }));
+  $("#clonePermit") && ($("#clonePermit").onclick = () => go("new", { cloneId: id }));
+  $("#reinstate") && ($("#reinstate").onclick = () => reinstatePermit(p));
+  // Opportunistic stamp. The derived state above is already authoritative for
+  // every gate, so this only makes the record permanent — and it is deliberately
+  // fire-and-forget: it must never block the page, and a failure (offline, or a
+  // race with somebody approving) simply leaves the derivation in charge.
+  if (arDead && isIssuer && p.status !== "expired") stampAutoReject(p, isoDoc);
   $("#submitNow") && ($("#submitNow").onclick = async () => {
     // Gates a state change → server read, not the cached copy (see approvePermit).
     const [subPermits, subIsos] = await Promise.all([fetchPermits({ fresh: true }), fetchIsolations({ fresh: true }).catch(() => [])]);
-    const block = equipmentBlock(p.equipmentRef, subPermits, subIsos, p.id);
+    const block = equipmentBlock(p.equipmentRef, subPermits, subIsos, p.id, autoRejectPolicy());
     if (block) return toast(`${p.equipmentTag} is not available — ${BLOCK_TEXT[block.kind]}. Earlier permit(s) must be closed first.`, "err");
     try {
       await lifecycleTx("submission", async (tx) => {
@@ -2721,7 +2957,7 @@ async function viewPermitDetail(m) {
         if (!snap.exists()) gate("This permit no longer exists.");
         if (snap.data().status !== "draft")
           gate(`This permit is now ${STATUS_LABEL[snap.data().status] || snap.data().status} — it was not submitted again.`);
-        tx.update(ref, { status: "submitted", updatedAt: nowISO() });
+        tx.update(ref, { status: "submitted", submittedAt: nowISO(), updatedAt: nowISO() });
       });
       toast("Submitted", "ok"); go("detail", { id });
     } catch (e) { toast(e.message || "Could not submit the permit", "err"); }
@@ -2951,6 +3187,112 @@ async function txEquipmentPointer(tx, equipmentId, expected) {
   return { ref, data: snap.data() };
 }
 
+/* Writing an auto-rejection down. Everything that gates on it is derived, so
+   this exists purely so the record still says what happened when somebody reads
+   the permit years later — and so the register can be queried on stored status.
+
+   It runs when an Issuer or Admin OPENS such a permit, because a static site has
+   nowhere else to run it. Restricted to those two roles for two reasons: the
+   rules already grant them full authority over a permit (so no rule has to be
+   loosened for a "system" writer that could then be impersonated), and they are
+   the only people whose device clock deciding this is defensible.
+
+   The whole thing is re-derived inside the transaction from server state. A
+   permit approved thirty seconds ago on another phone must not be stamped by a
+   page that was drawn before that landed. */
+async function stampAutoReject(p, isoDoc) {
+  const pol = autoRejectPolicy();
+  try {
+    // Returns true only when something was actually written. The repaint below
+    // is conditional on it: repainting after a no-op would redraw a page whose
+    // state has not changed, which for a still-lapsed permit means stamping,
+    // repainting, stamping… — a loop.
+    const wrote = await lifecycleTx("auto-rejection", async (tx) => {
+      const pRef = doc(db, "permits", p.id);
+      const pSnap = await tx.get(pRef);
+      if (!pSnap.exists()) return false;
+      const cur = { id: p.id, ...pSnap.data() };
+      if (!["submitted", "awaitingIsolation"].includes(cur.status)) return false;   // decided meanwhile
+      const isoRef = cur.isolationRef ? doc(db, "isolations", cur.isolationRef) : null;
+      const iSnap = isoRef ? await tx.get(isoRef) : null;
+      const iso = iSnap && iSnap.exists() ? { id: cur.isolationRef, ...iSnap.data() } : null;
+      // Re-derived against what the server actually holds, not what the page drew.
+      const st = autoRejectState(cur, iso ? [iso] : [], pol);
+      if (st?.phase !== "lapsed") return false;
+      // Read before any write — a transaction may not read after it has written.
+      const eqRef = cur.equipmentRef ? doc(db, "equipment", cur.equipmentRef) : null;
+      const eqSnap = eqRef && iso ? await tx.get(eqRef) : null;
+      tx.update(pRef, {
+        status: "expired",
+        autoReject: { at: new Date(st.at).toISOString(), rule: st.rule, hours: st.rule === "idle" ? (cur.status === "submitted" ? pol.submittedHours : pol.awaitingIsolationHours) : null,
+          stampedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, stampedAt: nowISO() },
+        updatedAt: nowISO()
+      });
+      // The certificate, if any. autoRejectSafe() has already established that it
+      // is `assigned` and carries no other crew — i.e. the locks were never
+      // applied — so this is the identical branch a manual rejection takes, and
+      // the ONLY branch automation is ever allowed to reach.
+      if (iso && iso.status === "assigned") {
+        tx.update(isoRef, { attachedPermitIds: [], status: "removed", removedAt: nowISO(),
+          removalConfirmedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() },
+          removalNote: "Cancelled — permit auto-rejected before isolation" });
+        if (eqSnap && eqSnap.exists() && eqSnap.data().activeIsolationId === cur.isolationRef)
+          tx.update(eqRef, { isolationStatus: "available", activeIsolationId: null, updatedAt: nowISO() });
+      }
+      return true;
+    });
+    if (wrote && $("#pd")) go("detail", { id: p.id });
+  } catch { /* Derivation stays in charge — offline, or somebody got there first. */ }
+}
+
+// Putting one back. Offered to an Issuer for a short window after the stamp, for
+// the case the deadline was simply wrong (a shutdown slipped, the plant was on
+// holiday). It restarts BOTH clocks honestly — a new planned end and a fresh
+// submission stamp — rather than granting an exemption, so the permit is subject
+// to the same rule again. Any certificate was cancelled by the stamp, so this
+// returns the permit to `submitted`: it must be approved afresh, which is what
+// mints a new certificate.
+function reinstatePermit(p) {
+  const dflt = new Date(Date.now() + 24 * 3600000);
+  dflt.setMinutes(dflt.getMinutes() - dflt.getTimezoneOffset());
+  modal({ title: "Reinstate permit", body: `<div class="info-box">This permit auto-rejected. Reinstating puts it back in the approval queue with a new planned end — it is not an approval, and the same auto-rejection rule applies again.</div>
+    <label class="field"><span>New planned end</span><input type="datetime-local" id="rsEnd" value="${esc(dflt.toISOString().slice(0, 16))}"></label>
+    <label class="checkline"><input type="checkbox" id="rsOpen"> Open-ended (valid while active)</label>
+    <label class="field"><span>Reason</span><textarea id="rsWhy" placeholder="Why is this being put back?"></textarea></label>`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-accent" data-ok>Reinstate</button>` });
+  $("[data-c]").onclick = closeModal;
+  $("#rsOpen").onchange = () => { $("#rsEnd").disabled = $("#rsOpen").checked; };
+  $("[data-ok]").onclick = async () => {
+    const open = $("#rsOpen").checked, end = $("#rsEnd").value;
+    if (!open && !end) return toast("Set a new planned end, or tick open-ended.", "err");
+    if (!open && new Date(end) <= new Date()) return toast("The new planned end must be in the future.", "err");
+    const why = $("#rsWhy").value.trim();
+    try {
+      await lifecycleTx("reinstatement", async (tx) => {
+        const ref = doc(db, "permits", p.id);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) gate("This permit no longer exists.");
+        const cur = snap.data();
+        if (cur.status !== "expired")
+          gate(`This permit is now ${STATUS_LABEL[cur.status] || cur.status} — it was not reinstated.`);
+        tx.update(ref, {
+          status: "submitted",
+          // The stamp cancelled the certificate; a reinstated permit must not
+          // keep pointing at a dead one, or it would look attached to a lockout
+          // that no longer exists.
+          isolationRef: null, isoNo: null,
+          "validity.openEnded": open, "validity.plannedEnd": open ? null : new Date(end).toISOString(), "validity.extendedTo": null,
+          submittedAt: nowISO(),
+          autoReject: { ...(cur.autoReject || {}), reinstatedBy: { uid: State.profile.id, name: State.profile.name, ...myMeta() }, reinstatedAt: nowISO(), reinstateReason: why || null },
+          updatedAt: nowISO()
+        });
+      });
+      closeModal(); toast("Permit reinstated — back in the approval queue", "ok");
+      go("detail", { id: p.id }); refreshPendingBadge();
+    } catch (e) { toast(e.message || "Could not reinstate the permit", "err"); }
+  };
+}
+
 async function approvePermit(p, equip) {
   const type = State.config.permitTypes.find((t) => t.code === p.type);
   const approval = () => ({ issuerUid: State.profile.id, issuerName: State.profile.name, ...myMeta(), timestamp: nowISO() });
@@ -2963,7 +3305,18 @@ async function approvePermit(p, equip) {
   // certificate pointer it cannot be re-checked inside the approval
   // transaction. This read is the only place it is enforced.
   const [allPermits, allIsos] = await Promise.all([fetchPermits({ fresh: true }), fetchIsolations({ fresh: true }).catch(() => [])]);
-  const block = equipmentBlock(p.equipmentRef, allPermits, allIsos, p.id);
+  // AUTO-REJECTION GATE, re-derived against the same fresh read. The Approve
+  // button is already hidden on a lapsed permit, but a page left open on a desk
+  // crosses the deadline without being redrawn, and hiding a button has never
+  // been a control. Checked here so the approval dialog cannot even open.
+  const arNow = autoRejectState({ ...p, ...(allPermits.find((x) => x.id === p.id) || {}) }, allIsos, autoRejectPolicy());
+  if (arNow?.phase === "lapsed") {
+    return confirmBoxHTML("Cannot approve — permit auto-rejected",
+      `<div class="danger-box"><b>${esc(p.permitNo)} was auto-rejected — ${esc(AUTO_REJECT_RULE[arNow.rule])}.</b></div>
+       <p>It cannot be approved. Reinstate it with a new planned end, or ask the requester to raise a new permit with current dates${State.config.permitTypes.find((t) => t.code === p.type)?.requiresGasTest ? " and a fresh gas test" : ""}.</p>`,
+      "OK", async () => closeModal());
+  }
+  const block = equipmentBlock(p.equipmentRef, allPermits, allIsos, p.id, autoRejectPolicy());
   if (block) {
     return confirmBoxHTML("Cannot approve — equipment not available",
       blockBox(p.equipmentTag, block, allIsos) + `<p>Close the earlier permit(s) before approving new work on this equipment.</p>`,
@@ -2972,7 +3325,8 @@ async function approvePermit(p, equip) {
   // Concurrent-work cross-check, shown to the Issuer in every approval dialog
   // (previously only non-isolation permits got it): each live permit with its
   // hand-back stage, overdue flagged. Warning only — the Issuer decides.
-  const others = allPermits.filter((x) => x.id !== p.id && x.equipmentRef === p.equipmentRef && ["submitted", "awaitingIsolation", "active", "extended"].includes(x.status));
+  const others = allPermits.filter((x) => x.id !== p.id && x.equipmentRef === p.equipmentRef &&
+    ["submitted", "awaitingIsolation", "active", "extended"].includes(x.status) && !isAutoRejected(x, allIsos, autoRejectPolicy()));
   const concurrentWarn = others.length ? `<div class="warn-box"><b>${others.length} other live permit(s)</b> already on ${esc(p.equipmentTag)}. Review concurrent work.
     <div class="attached-list" style="margin-top:.5rem">${others.map((x) => `<div class="a"><span class="mono">${esc(x.permitNo)}</span> ${esc(x.typeName)} · ${esc(x.requester?.name || "")} ${badge(x.status)}${stageChip(permitStage(x, allIsos))}${isOverdue(x) ? " " + overdueChip() : ""}</div>`).join("")}</div></div>` : "";
 
@@ -3807,6 +4161,14 @@ async function viewAdmin(m) {
       <textarea id="cPpe" rows="3">${esc((State.config.ppeList || []).join("\n"))}</textarea>
       <div class="section-title">Job Titles (one per line — order is preserved; used in sign-up and user management)</div>
       <textarea id="cTitles" rows="6">${esc(jobTitles().join("\n"))}</textarea>
+      <div class="section-title">Auto-rejection</div>
+      <div class="csub">A permit left undecided past its deadline is auto-rejected: it leaves the approval queue and stops holding its equipment out of service. It is never recorded as a rejection by a person, and a permit whose lockout has already been applied or is shared is never auto-rejected — an Issuer must handle those. A permit's own planned end always applies as well, whichever falls first.</div>
+      <div class="grid-3">
+        <label class="field"><span>Awaiting approval (hours)</span><input type="number" min="1" step="1" id="cArSub" value="${esc(autoRejectPolicy().submittedHours)}"></label>
+        <label class="field"><span>Awaiting isolation (hours)</span><input type="number" min="1" step="1" id="cArIso" value="${esc(autoRejectPolicy().awaitingIsolationHours)}"></label>
+        <label class="field"><span>Reinstatement window (hours)</span><input type="number" min="0" step="1" id="cArRe" value="${esc(autoRejectPolicy().reinstateHours)}"></label>
+      </div>
+      <label class="checkline"><input type="checkbox" id="cArOn" ${autoRejectPolicy().enabled === false ? "" : "checked"}> Auto-rejection enabled</label>
       <div style="margin-top:1rem;text-align:right"><button class="btn btn-accent" id="saveCfg">Save configuration</button></div>
     </div>
     <div class="card"><h3>Data audit</h3>
@@ -3853,9 +4215,18 @@ async function viewAdmin(m) {
     const departments = $("#cDepts").value.split(/\n/).map((s) => s.trim()).filter(Boolean).map((ln) => {
       const [name, subs] = ln.split(":"); return { name: name.trim(), subUnits: (subs || "").split(",").map((x) => x.trim()).filter(Boolean) };
     });
+    // Blank or nonsense hours fall back to the built-in default rather than to
+    // zero — a zero here would auto-reject every permit the moment it was raised.
+    const hrs = (el, dflt) => { const n = parseInt($(el).value, 10); return Number.isFinite(n) && n >= 0 ? n : dflt; };
+    const autoReject = {
+      enabled: $("#cArOn").checked,
+      submittedHours: hrs("#cArSub", AUTO_REJECT_DEFAULT.submittedHours) || AUTO_REJECT_DEFAULT.submittedHours,
+      awaitingIsolationHours: hrs("#cArIso", AUTO_REJECT_DEFAULT.awaitingIsolationHours) || AUTO_REJECT_DEFAULT.awaitingIsolationHours,
+      reinstateHours: hrs("#cArRe", AUTO_REJECT_DEFAULT.reinstateHours)
+    };
     try {
-      await updateDoc(doc(db, "config", "app"), { lines, areas, ppeList, departments, jobTitles: jobTitlesList });
-      State.config = { ...State.config, lines, areas, ppeList, departments, jobTitles: jobTitlesList };
+      await updateDoc(doc(db, "config", "app"), { lines, areas, ppeList, departments, jobTitles: jobTitlesList, autoReject });
+      State.config = { ...State.config, lines, areas, ppeList, departments, jobTitles: jobTitlesList, autoReject };
       toast("Configuration saved", "ok");
     } catch (e) { toast(e.message, "err"); }
   };

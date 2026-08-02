@@ -189,6 +189,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--steel);
 .st-removalPending{background:var(--red-soft);color:#9b2c2c}
 .st-removed{background:#E2E8EF;color:#3c4d5e}
 .st-overdue{background:var(--red-soft);color:#9b2c2c}
+/* Approaching an auto-rejection deadline. Amber, not red: nothing is wrong yet
+   — the whole point of showing it is that the deadline is never a surprise. */
+.st-lapsing{background:var(--amber-soft);color:#8a5d00}
 /* Derived hand-back stage shown beside the Active/Extended badge */
 .stage-inProgress{background:var(--bg-2);border:1px solid var(--line);color:var(--ink-2)}
 .stage-awaitingDeisolation{background:var(--amber-soft);color:#8a5d00}

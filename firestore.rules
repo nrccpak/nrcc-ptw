@@ -275,6 +275,16 @@ service cloud.firestore {
                     && request.resource.data.get('workCompletion', null) == null
                     && request.resource.data.get('isolationRef', null) == null
                     && request.resource.data.get('trialRuns', []).size() == 0;
+      // AUTO-REJECTION deliberately needs no clause of its own. A permit that
+      // passed its deadline is stamped `expired` by the Issuer or Admin whose
+      // app noticed — this is a static site, so there is no server to run the
+      // clock and no service account to write as. That falls under canIssue()
+      // below, which is the point: inventing a "system" writer would mean a
+      // rule that any client claiming to be the system could reach, and the
+      // status is only ever a record. Every gate in the app derives the lapse
+      // for itself (app.js §2), so a permit that was never stamped is still
+      // treated as auto-rejected — nothing here is load-bearing for safety.
+      //
       // Update paths (audit fields stay locked on every non-Issuer path):
       //  • Issuer/Admin — full authority (records approval/closure/rejection…).
       //  • Requester editing their own draft/submitted permit — the new status

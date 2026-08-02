@@ -22,6 +22,7 @@ database (Firestore, with built-in offline cache and auto-sync).
 | Roles | Requester · Issuer · Isolator · Admin |
 | Isolation | Separate NRCC-ISO certificates: Issuer assigns → electrician confirms → permits activate; de-isolation confirmed the same way |
 | Safety logic | Shared isolation (multi-crew), last-permit-closes rule, trial-run sub-workflow |
+| Auto-rejection | A permit left undecided past its deadline lapses instead of waiting forever — see below |
 
 ## The one file you must edit
 
@@ -76,6 +77,48 @@ of a modified client that lies about the signer's role.
 Add a check whenever you change a safety rule — the point of these files is that
 the next person can change the code without having to rediscover why it is the
 way it is.
+
+## Auto-rejection
+
+A permit that nobody decides on does not sit in the queue forever. Two rules
+apply, **whichever falls first**:
+
+1. **Its own planned end passes** while it is still waiting. A submitted permit
+   must carry a planned end or be explicitly open-ended, so this uses the
+   requester's own dates rather than an invented number.
+2. **A fixed timeout**, which exists only for the open-ended permits rule 1
+   cannot reach — 72 h awaiting approval, 48 h awaiting isolation by default.
+   Both are editable in **Admin → Configuration**, and both are generous enough
+   to survive a weekend on purpose: a threshold that fires on ordinary permits
+   is one everybody learns to ignore.
+
+The permit then takes the `expired` status and is labelled **Auto-rejected**
+everywhere — never "Rejected". A rejection carries a person, a name and a
+reason; a timeout carries none of the three, and recording one as the other puts
+a safety decision in the audit trail that nobody made.
+
+Two things are worth knowing before changing any of this:
+
+- **A permit holding a lockout is never auto-rejected.** Rejecting an
+  `awaitingIsolation` permit by hand decides whether physical locks stay on:
+  while the certificate is still `assigned` the locks were never applied, so it
+  is cancelled — but at any later status an Isolator has signed that they ARE
+  on, and rejection dispatches somebody to remove them. Automation only ever
+  takes the first branch, and only when no other crew shares the lockout.
+  Anything else shows an **Auto-reject held** flag and waits for a person.
+- **It is derived, not scheduled.** There is no server here, so nothing runs the
+  clock. Every gate works the lapse out for itself, and the status is written
+  opportunistically when an Issuer or Admin opens such a permit — the record,
+  not the mechanism. A permit that was never stamped still behaves as
+  auto-rejected.
+
+Recovery: an Issuer can **Reinstate** within 24 h (a new planned end is
+required — it restarts the clock rather than granting an exemption), and anyone
+can **Raise a new permit from this** to copy the description, equipment,
+checklist and PPE across. Dates and gas readings are never copied; they are the
+two things that had gone stale.
+
+Checks live in `tests/auto-reject.mjs`.
 
 ## Scaling later (designed for it)
 
