@@ -2258,12 +2258,22 @@ async function viewNewPermit(m) {
     const s = await getDoc(doc(db, "permits", cloneId)).catch(() => null);
     if (!s || !s.exists()) return go("permits");
     cloning = { id: cloneId, ...s.data() };
+    // Confined Space Entry is Admin-only to raise (see visibleTypes below) —
+    // the clone shortcut must not be a back door around that.
+    if (cloning.type === "confined" && !isAdmin()) {
+      toast("Only an Admin can raise a new Confined Space Entry permit.", "err");
+      return go("detail", { id: cloneId });
+    }
   }
   // What the form is filled from — the draft being edited, or the permit being
   // copied. `editing` stays null when cloning, so the save path creates a new
   // permit with a new number rather than writing over the old one.
   const source = editing || cloning;
-  let type = source ? (cfg.permitTypes.find((t) => t.code === source.type) || cfg.permitTypes[0]) : cfg.permitTypes[0];
+  // Confined Space Entry is restricted to Admins in the picker below — this is
+  // a UI convenience only, not a security boundary (see firestore.rules for
+  // what is actually enforced).
+  const visibleTypes = cfg.permitTypes.filter((t) => t.code !== "confined" || isAdmin());
+  let type = source ? (cfg.permitTypes.find((t) => t.code === source.type) || visibleTypes[0]) : visibleTypes[0];
   let prefilled = false;
   const draw = () => {
     const deptOpts = cfg.departments.map((d) => `<option>${esc(d.name)}</option>`).join("");
@@ -2271,7 +2281,7 @@ async function viewNewPermit(m) {
     ${cloning ? `<div class="info-box">Copied from <span class="mono">${esc(cloning.permitNo || "")}</span>${cloning.status === "expired" ? ", which was auto-rejected" : ""}. <b>Check the dates${type.requiresGasTest ? " and take a fresh gas test" : ""}</b> — they are not carried over. This will be raised as a new permit with its own number.</div>` : ""}
     <div class="card ${TYPE_CLASS[type.code]}">
       <h3>Permit type</h3><div class="csub">Choose the kind of work — the form adapts to it.</div>
-      <div class="cols cols-4">${cfg.permitTypes.map((t) => `
+      <div class="cols cols-4">${visibleTypes.map((t) => `
         <button class="navitem ${t.code === type.code ? "active" : ""}" data-type="${t.code}" style="border:1px solid var(--line);justify-content:center;text-align:center">
           <span class="dot" style="background:${TYPE_DOT[t.code]}"></span>${esc(t.name)}</button>`).join("")}</div>
     </div>
@@ -2816,8 +2826,11 @@ async function viewPermitDetail(m) {
   if (p.status === "submitted" && isIssuer && !arDead) actions += `<button class="btn btn-success" id="approve">Approve</button>`;
   if (["submitted", "awaitingIsolation"].includes(p.status) && isIssuer) actions += `<button class="btn btn-danger" id="reject">Reject</button>`;
   if (arReinstatable) actions += `<button class="btn btn-accent" id="reinstate">Reinstate</button>`;
-  // Anyone who can raise a permit can raise the replacement, without retyping it.
-  if ((arDead || p.status === "expired") && (isOwner || isIssuer)) actions += `<button class="btn btn-ghost" id="clonePermit">Raise a new permit from this</button>`;
+  // Anyone who can raise a permit can raise the replacement, without retyping it —
+  // except Confined Space Entry, which is Admin-only to raise (cosmetic gate,
+  // see viewNewPermit's visibleTypes / clone guard for the matching checks).
+  if ((arDead || p.status === "expired") && (isOwner || isIssuer) && (p.type !== "confined" || isAdmin()))
+    actions += `<button class="btn btn-ghost" id="clonePermit">Raise a new permit from this</button>`;
   if (["draft"].includes(p.status) && isOwner) actions += `<button class="btn btn-ghost" id="editDraft">Edit</button><button class="btn btn-accent" id="submitNow">Submit for approval</button>`;
   // The requester signs off that the work is finished and the equipment is safe
   // to return to service. The Issuer can only close after de-isolation.
