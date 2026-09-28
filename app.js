@@ -2438,7 +2438,10 @@ async function viewNewPermit(m) {
         if (source.validity?.openEnded) { $("#vopen").checked = true; syncOpen(); }
         else if (source.validity?.plannedEnd) $("#vend").value = String(source.validity.plannedEnd).slice(0, 16);
       }
-      (source.checklist || []).forEach((c, i) => { const el = $(`[data-chk="${i}"]`); if (el) el.checked = !!c.checked; });
+      // Matched by wording, not position: Admins can reorder or reword a type's
+      // checklist, and a tick must never land on a hazard nobody confirmed.
+      const ticked = new Set((source.checklist || []).filter((c) => c.checked).map((c) => c.item));
+      type.checklist.forEach((c, i) => { const el = $(`[data-chk="${i}"]`); if (el) el.checked = ticked.has(c); });
       const ppeSet = new Set(source.ppe || []);
       $$("[data-ppe]").forEach((el) => { el.checked = ppeSet.has(el.value); });
       if (type.requiresIsolation && (source.isolationPoints || []).length) {
@@ -4163,6 +4166,11 @@ async function viewAdmin(m) {
       <textarea id="cDepts" rows="4">${esc((State.config.departments || []).map((d) => d.name).join("\n"))}</textarea>
       <div class="section-title">PPE options</div>
       <textarea id="cPpe" rows="3">${esc((State.config.ppeList || []).join("\n"))}</textarea>
+      <div class="section-title">Hazard checklists (one item per line — shown on the New Permit form for each type)</div>
+      <div class="csub">Changes apply to permits raised from now on. Permits already raised keep the checklist they were raised with.</div>
+      <div class="cols cols-2">${(State.config.permitTypes || DEFAULT_CONFIG.permitTypes).map((t) => `
+        <div><div class="section-title" style="margin-top:.4rem">${esc(t.name)}</div>
+          <textarea data-cl="${esc(t.code)}" rows="5">${esc((t.checklist || []).join("\n"))}</textarea></div>`).join("")}</div>
       <div class="section-title">Job Titles (one per line — order is preserved; used in sign-up and user management)</div>
       <textarea id="cTitles" rows="6">${esc(jobTitles().join("\n"))}</textarea>
       <div class="section-title">Auto-rejection</div>
@@ -4217,6 +4225,13 @@ async function viewAdmin(m) {
     const ppeList = $("#cPpe").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const jobTitlesList = $("#cTitles").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const departments = $("#cDepts").value.split(/\n/).map((s) => s.trim()).filter(Boolean).map((name) => ({ name }));
+    const permitTypes = (State.config.permitTypes || DEFAULT_CONFIG.permitTypes).map((t) => {
+      const el = $(`[data-cl="${t.code}"]`);
+      if (!el) return t;
+      return { ...t, checklist: [...new Set(el.value.split(/\n/).map((s) => s.trim()).filter(Boolean))] };
+    });
+    const emptyType = permitTypes.find((t) => !t.checklist?.length);
+    if (emptyType) return toast(`${emptyType.name} needs at least one hazard-checklist item.`, "err");
     // Blank or nonsense hours fall back to the built-in default rather than to
     // zero — a zero here would auto-reject every permit the moment it was raised.
     const hrs = (el, dflt) => { const n = parseInt($(el).value, 10); return Number.isFinite(n) && n >= 0 ? n : dflt; };
@@ -4227,8 +4242,8 @@ async function viewAdmin(m) {
       reinstateHours: hrs("#cArRe", AUTO_REJECT_DEFAULT.reinstateHours)
     };
     try {
-      await updateDoc(doc(db, "config", "app"), { lines, areas, ppeList, departments, jobTitles: jobTitlesList, autoReject });
-      State.config = { ...State.config, lines, areas, ppeList, departments, jobTitles: jobTitlesList, autoReject };
+      await updateDoc(doc(db, "config", "app"), { lines, areas, ppeList, departments, permitTypes, jobTitles: jobTitlesList, autoReject });
+      State.config = { ...State.config, lines, areas, ppeList, departments, permitTypes, jobTitles: jobTitlesList, autoReject };
       toast("Configuration saved", "ok");
     } catch (e) { toast(e.message, "err"); }
   };
