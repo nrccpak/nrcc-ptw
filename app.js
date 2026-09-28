@@ -62,9 +62,9 @@ const DEFAULT_CONFIG = {
   lines: ["Line 1", "Line 2", "Common"],
   areas: ["Crusher", "Stacker", "Raw Mill + Pre-heater", "Kiln", "Cooler", "Cement Mill", "Transport", "Grinding", "Silo", "Packing Plant"],
   departments: [
-    { name: "Maintenance", subUnits: ["Mechanical", "PPM", "Electrical", "Instrument / PLC"] },
-    { name: "Production", subUnits: [] },
-    { name: "Quality Control", subUnits: [] }
+    { name: "Maintenance" },
+    { name: "Production" },
+    { name: "Quality Control" }
   ],
   ppeList: ["Helmet", "Safety shoes", "Gloves", "Eye protection", "Ear protection", "Face shield", "Respirator", "Full body harness", "FR coverall", "Insulating gloves"],
   jobTitles: [...DEFAULT_JOB_TITLES],
@@ -2298,11 +2298,8 @@ async function viewNewPermit(m) {
 
     <div class="card">
       <h3>Work details</h3>
-      <div class="grid-2">
-        <label class="field"><span>Requesting department <span class="req">*</span></span>
-          <select id="dept">${deptOpts}</select></label>
-        <label class="field"><span>Sub-unit</span><select id="subunit"></select></label>
-      </div>
+      <label class="field"><span>Requesting department <span class="req">*</span></span>
+        <select id="dept">${deptOpts}</select></label>
       <label class="field"><span>Work description <span class="req">*</span></span>
         <textarea id="desc" placeholder="Describe the work to be carried out…"></textarea></label>
       <label class="field"><span>Specific location / note</span><input type="text" id="loc" placeholder="e.g. motor NDE bearing"></label>
@@ -2354,10 +2351,6 @@ async function viewNewPermit(m) {
     const vopenEl = $("#vopen"), vendEl = $("#vend");
     const syncOpen = () => { vendEl.disabled = vopenEl.checked; if (vopenEl.checked) vendEl.value = ""; };
     vopenEl.onchange = syncOpen; syncOpen();
-    // dept → subunit
-    const fillSub = () => { const d = cfg.departments.find((x) => x.name === $("#dept").value);
-      $("#subunit").innerHTML = `<option value="">—</option>` + (d?.subUnits || []).map((s) => `<option>${esc(s)}</option>`).join(""); };
-    $("#dept").onchange = fillSub; fillSub();
     // equipment search
     const eqSearch = $("#eqSearch"), eqResults = $("#eqResults");
     eqSearch.addEventListener("input", debounce(() => {
@@ -2435,8 +2428,6 @@ async function viewNewPermit(m) {
     if (source && !prefilled) {
       prefilled = true;
       if (source.requestingDepartment?.department) $("#dept").value = source.requestingDepartment.department;
-      fillSub();
-      if (source.requestingDepartment?.subUnit) $("#subunit").value = source.requestingDepartment.subUnit;
       $("#desc").value = source.workDescription || "";
       $("#loc").value = source.location || "";
       // A clone keeps "valid from = now" and an empty planned end. Carrying the
@@ -2530,7 +2521,7 @@ async function viewNewPermit(m) {
     }
 
     const finalize = async () => {
-      const requestingDepartment = { department: $("#dept").value, subUnit: $("#subunit").value || null };
+      const requestingDepartment = { department: $("#dept").value };
       const validity = { start: $("#vstart").value || nowISO(), openEnded: open, plannedEnd: open ? null : ($("#vend").value || null), extendedTo: editing?.validity?.extendedTo ?? null };
       // Saving a DRAFT stays optimistic — it is the requester's own scratch copy,
       // queueing it offline loses nothing and the app is meant to work in the
@@ -2904,7 +2895,7 @@ async function viewPermitDetail(m) {
         ${kv("Equipment", `<span class="mono">${esc(p.equipmentTag)}</span> ${equip ? "· " + esc(equip.line) + " / " + esc(equip.area) : ""}`)}
         ${p.isoNo ? kv("Isolation cert.", `<a href="#" data-isolink class="mono">${esc(p.isoNo)}</a>`) : ""}
         ${kv("Requester", personHTML(p.requester?.name, p.requester))}
-        ${kv("Department", esc(p.requestingDepartment?.department || "—") + (p.requestingDepartment?.subUnit ? " · " + esc(p.requestingDepartment.subUnit) : ""))}
+        ${kv("Department", esc(p.requestingDepartment?.department || "—"))}
         ${kv("Work", esc(p.workDescription))}
         ${p.location ? kv("Location", esc(p.location)) : ""}
         ${kv("Valid from", fmt(p.validity?.start))}
@@ -4168,8 +4159,8 @@ async function viewAdmin(m) {
         <div><div class="section-title">Lines</div><textarea id="cLines" rows="4">${esc((State.config.lines || []).join("\n"))}</textarea></div>
         <div><div class="section-title">Areas</div><textarea id="cAreas" rows="6">${esc((State.config.areas || []).join("\n"))}</textarea></div>
       </div>
-      <div class="section-title">Departments (format: Department: sub, sub, sub)</div>
-      <textarea id="cDepts" rows="4">${esc((State.config.departments || []).map((d) => d.name + (d.subUnits?.length ? ": " + d.subUnits.join(", ") : "")).join("\n"))}</textarea>
+      <div class="section-title">Departments</div>
+      <textarea id="cDepts" rows="4">${esc((State.config.departments || []).map((d) => d.name).join("\n"))}</textarea>
       <div class="section-title">PPE options</div>
       <textarea id="cPpe" rows="3">${esc((State.config.ppeList || []).join("\n"))}</textarea>
       <div class="section-title">Job Titles (one per line — order is preserved; used in sign-up and user management)</div>
@@ -4225,9 +4216,7 @@ async function viewAdmin(m) {
     const areas = $("#cAreas").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const ppeList = $("#cPpe").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
     const jobTitlesList = $("#cTitles").value.split(/\n/).map((s) => s.trim()).filter(Boolean);
-    const departments = $("#cDepts").value.split(/\n/).map((s) => s.trim()).filter(Boolean).map((ln) => {
-      const [name, subs] = ln.split(":"); return { name: name.trim(), subUnits: (subs || "").split(",").map((x) => x.trim()).filter(Boolean) };
-    });
+    const departments = $("#cDepts").value.split(/\n/).map((s) => s.trim()).filter(Boolean).map((name) => ({ name }));
     // Blank or nonsense hours fall back to the built-in default rather than to
     // zero — a zero here would auto-reject every permit the moment it was raised.
     const hrs = (el, dflt) => { const n = parseInt($(el).value, 10); return Number.isFinite(n) && n >= 0 ? n : dflt; };
@@ -4302,7 +4291,7 @@ function printPermit(p, equip, iso) {
         ${row("Equipment", esc(p.equipmentTag) + (equip ? " · " + esc(equip.line) + " / " + esc(equip.area) : ""))}
         ${p.isoNo ? row("Isolation certificate", esc(p.isoNo)) : ""}
         ${row("Requester", personHTML(p.requester?.name, p.requester))}
-        ${row("Department", esc(p.requestingDepartment?.department || "—") + (p.requestingDepartment?.subUnit ? " · " + esc(p.requestingDepartment.subUnit) : ""))}
+        ${row("Department", esc(p.requestingDepartment?.department || "—"))}
         ${row("Work", esc(p.workDescription))}
         ${row("Valid from", fmt(p.validity?.start))}
         ${row("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
