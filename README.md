@@ -19,7 +19,8 @@ database (Firestore, with built-in offline cache and auto-sync).
 | Database | Firestore with offline persistence (auto-sync when online) |
 | App type | Installable PWA — works on phone and desktop |
 | Permit types (v1) | General/Cold, Hot Work, Electrical Isolation (LOTO), Confined Space |
-| Roles | Requester · Issuer · Isolator · Admin |
+| Roles | Requester · Issuer · Isolator · Safety · Admin |
+| Safety role | Sees the Issuer's plant-wide dashboard and every permit, and raises permits like a Requester. Approves, isolates and edits nothing — the security rules treat it as a Requester, so no rules change was needed |
 | Isolation | Separate NRCC-ISO certificates: Issuer assigns → electrician confirms → permits activate; de-isolation confirmed the same way |
 | Safety logic | Shared isolation (multi-crew), last-permit-closes rule, trial-run sub-workflow |
 | Auto-rejection | A permit left undecided past its deadline lapses instead of waiting forever — see below |

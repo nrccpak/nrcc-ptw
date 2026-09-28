@@ -1709,7 +1709,7 @@ function trialTasks(isolations, permits) {
 // everybody's business — a live machine is a hazard whether or not you are the
 // one who has to act on it. The rest is offered to the roles that can act.
 function trialTasksFor(tasks, role) {
-  const runs = ["issuer", "admin", "isolator"].includes(role);
+  const runs = ["issuer", "admin", "isolator", "safety"].includes(role);
   return (tasks || []).filter((t) => t.kind === "reIsolate" || runs);
 }
 
@@ -1873,12 +1873,16 @@ async function viewDashboard(m) {
   const isolated = equip.filter((e) => e.isolationStatus === "isolated");
   const energisedEq = equip.filter((e) => e.isolationStatus === "trialRun");
   const isIssuer = ["issuer", "admin"].includes(State.profile.role);
-  const overdue = (isIssuer ? permits : mine).filter(isOverdue);
+  // Safety watches the whole plant exactly as an Issuer does, but acts on none
+  // of it — so it gets every plant-wide section and none of the "your" queues.
+  const isSafety = State.profile.role === "safety";
+  const plantWide = isIssuer || isSafety;
+  const overdue = (plantWide ? permits : mine).filter(isOverdue);
   // The other half of the Issuer's queue. A permit whose crew has signed off
   // and whose lockout (if any) is already removed needs nothing but closure —
   // but the permit sits in "active" until then, so it used to be reachable
   // only by searching the register. Surfaced here exactly like approvals.
-  const awaitingClosure = isIssuer ? active.filter((p) => permitStage(p, isoMap) === "awaitingClosure") : [];
+  const awaitingClosure = plantWide ? active.filter((p) => permitStage(p, isoMap) === "awaitingClosure") : [];
 
   const me = State.profile.id;
   const isAdmin = State.profile.role === "admin";
@@ -1943,6 +1947,11 @@ async function viewDashboard(m) {
       // confirming the work is finished, and the locks actually coming off.
       stat(awaitingClosure.length, "Awaiting your closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } },
         queueState(awaitingClosure, (p) => laterOf(p.workCompletion?.timestamp, p.isolationRef ? isoMap.get(p.isolationRef)?.removedAt : null)))
+    // The same two counts, but not Safety's to act on: no "your" and no queue
+    // colour (see `stat` — the colour is reserved for tiles the viewer can act on).
+    : isSafety
+    ? stat(pending.length, "Awaiting approval", ICON.newdoc, { view: "permits", params: { status: "submitted" } }) +
+      stat(awaitingClosure.length, "Awaiting closure", ICON.doccheck, { view: "permits", params: { status: "stage:awaitingClosure" } })
     : isIso
     ? stat(pendingIso.length, "Pending isolation", ICON.lockplus, { view: "isolations", params: { status: "assigned" } },
         queueState(pendingIso, (i) => i.assignedAt || i.createdAt)) +
@@ -1988,10 +1997,10 @@ async function viewDashboard(m) {
   if (myConsent.length) html += `<div class="warn-box" id="trialConsentBanner" style="cursor:pointer">
     <b>${myConsent.length} trial run(s) are waiting on your crew to clear.</b> Open the permit and confirm your people are clear of the equipment, or refuse.</div>`;
 
-  if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. Review and extend or close them.</div>`;
+  if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. ${isSafety ? "An Issuer must extend or close them." : "Review and extend or close them."}</div>`;
 
   const tasks = isoAll.filter((i) =>
-    (i.status === "assigned" && (isIssuer || isIso || i.assignedTo?.uid === me)) ||
+    (i.status === "assigned" && (plantWide || isIso || i.assignedTo?.uid === me)) ||
     (i.status === "removalPending" && (isIso || isAdmin || i.removalAssignedTo?.uid === me)) ||
     (readyForDeiso.has(i.id) && (isIso || isAdmin)));
   if (tasks.length) {
@@ -2016,7 +2025,7 @@ async function viewDashboard(m) {
       </tbody></table></div>`;
   }
 
-  if (isIssuer && pending.length) {
+  if (plantWide && pending.length) {
     html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>Awaiting approval</h3></div>
       <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Requester</th><th></th></tr></thead><tbody>
       ${pending.map((p) => permitRow(p)).join("")}</tbody></table></div>`;
@@ -2039,12 +2048,12 @@ async function viewDashboard(m) {
   // precisely the order that hides a forgotten permit, and with the 12-row cap
   // hides it completely. It is now ordered by what is waiting on them.
   // Copy before sorting; `active` and `mine` are both used above.
-  const listed = isIssuer ? [...active].sort(byWorkAge(isoMap)) : [...mine].sort(byOwnAttention);
+  const listed = plantWide ? [...active].sort(byWorkAge(isoMap)) : [...mine].sort(byOwnAttention);
   const shown = listed.slice(0, DASH_ROWS);
-  const moreNav = isIssuer ? { view: "permits", params: { status: "activeAll" } } : { view: "permits", params: { mine: true } };
-  html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${isIssuer ? "Active work" : "My permits"}</h3></div>
-    <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th><th>${isIssuer ? "Live for" : "Waiting"}</th></tr></thead><tbody>
-    ${shown.map((p) => permitRow(p, true, isoMap, !isIssuer)).join("") || `<tr><td colspan="6" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
+  const moreNav = plantWide ? { view: "permits", params: { status: "activeAll" } } : { view: "permits", params: { mine: true } };
+  html += `<div class="card pad0"><div style="padding:1rem 1.3rem;border-bottom:1px solid var(--line)"><h3>${plantWide ? "Active work" : "My permits"}</h3></div>
+    <table class="tbl"><thead><tr><th>Permit</th><th>Type</th><th>Equipment</th><th>Status</th><th>Requester</th><th>${plantWide ? "Live for" : "Waiting"}</th></tr></thead><tbody>
+    ${shown.map((p) => permitRow(p, true, isoMap, !plantWide)).join("") || `<tr><td colspan="6" class="empty">Nothing yet — raise a permit to get started.</td></tr>`}
     ${listed.length > shown.length ? `<tr class="row more-row" role="button" tabindex="0" data-nav='${esc(JSON.stringify(moreNav))}'><td colspan="6">Showing ${shown.length} of ${listed.length} · View all</td></tr>` : ""}
     </tbody></table></div>`;
   const host = $("#dash");
@@ -4196,7 +4205,7 @@ async function viewAdmin(m) {
       <td><select data-dp="${u.id}">${optionList(departmentNames(), u.department || "")}</select></td>
       <td><input type="text" data-en="${u.id}" value="${esc(u.employeeNumber || "")}" placeholder="EMP-…" style="min-width:110px"></td>
       <td><select data-role="${u.id}" ${u.id === State.profile.id ? "disabled" : ""}>
-        ${["requester", "issuer", "admin", "isolator"].map((r) => `<option ${u.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></td>
+        ${["requester", "issuer", "admin", "isolator", "safety"].map((r) => `<option ${u.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></td>
       <td><label class="checkline" style="padding:0"><input type="checkbox" data-active="${u.id}" ${u.active ? "checked" : ""} ${u.id === State.profile.id ? "disabled" : ""}></label></td>
       <td style="white-space:nowrap"><button class="btn btn-ghost btn-sm" data-saveu="${u.id}">Save</button>
         ${u.email ? `<button class="btn btn-ghost btn-sm" data-resetu="${esc(u.email)}">Reset PW</button>` : ""}
