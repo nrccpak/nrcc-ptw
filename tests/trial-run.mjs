@@ -335,7 +335,7 @@ console.log("\nEnergised equipment is everybody's business; the rest is role wor
   const c = (id, trialRun, over = {}) => ({ ...cert(trialRun, over), id });
   const tasks = trialTasks([c("C1", trial("requested")), c("C2", trial("approved")),
                             c("C3", trial("energised"), { status: "trialRun" })], permits);
-  for (const role of ["issuer", "admin", "isolator"])
+  for (const role of ["issuer", "admin", "isolator", "safety"])
     check(`${role} sees all three`, trialTasksFor(tasks, role).length === 3);
   const asCrew = trialTasksFor(tasks, "requester");
   // A live machine is a hazard whether or not you are the one who acts on it.
