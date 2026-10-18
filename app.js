@@ -1361,6 +1361,9 @@ const Notify = {
       if (!p.isolationRef && isIssuer) out.push({ sig, text: `Work complete under ${no} on ${tag} — ready to close.`, ...to });
       else if (p.isolationRef && isIsolator) out.push({ sig: sig + ":deiso", text: `Work complete under ${no} — de-isolation needed on ${tag}.`, ...to });
     }
+    // E5b — an Administrator signed the work off in the requester's place
+    if (p.workCompletion?.forced && owner && p.workCompletion.by !== me)
+      out.push({ sig: `p:${p.id}:wcforced:${p.workCompletion.timestamp || ""}`, text: `Permit ${no} was marked work-complete by ${p.workCompletion.name || "an Administrator"} on your behalf.`, ...to });
     // E7 — closed → Requester
     if (p.status === "closed" && owner && p.closure?.by !== me)
       out.push({ sig: `p:${p.id}:closed`, text: `Permit ${no} closed — ${tag} returned to service.`, ...to });
@@ -2838,6 +2841,11 @@ async function viewPermitDetail(m) {
   // The requester signs off that the work is finished and the equipment is safe
   // to return to service. The Issuer can only close after de-isolation.
   if (["active", "extended"].includes(p.status) && isOwner && !p.workCompletion) actions += `<button class="btn btn-success" id="workdone">Confirm work complete</button>`;
+  // Administrator override: the requester is unavailable (shift change, leave, left
+  // site) and the permit would otherwise sit open for ever, blocking the equipment.
+  // Only records the sign-off — de-isolation by an Isolator and the Issuer's close
+  // still follow, so no lock is touched and nothing is closed by this action.
+  if (["active", "extended"].includes(p.status) && isAdmin() && !isOwner && !p.workCompletion) actions += `<button class="btn btn-danger" id="forcedone">Force work complete (Admin)</button>`;
   if (awaitingDeiso && deisoReady && isIsoOrAdmin) actions += `<button class="btn btn-accent" id="godeiso">Go to de-isolation</button>`;
   if (["active", "extended"].includes(p.status) && isIssuer) {
     // Once work is complete AND the equipment is de-isolated the permit is
@@ -2898,7 +2906,7 @@ async function viewPermitDetail(m) {
     ${trialAt === "approved" ? `<div class="warn-box"><b>Trial run authorised</b> by ${personHTML(isoDoc.trialRun.issuerApproval?.name, isoDoc.trialRun.issuerApproval)} · ${fmt(isoDoc.trialRun.issuerApproval?.at)}.
       <b>The equipment is still isolated.</b> An Isolator must remove the locks before it is energised${isIsoOrAdmin ? " — use <b>De-isolate for trial run</b> when every crew is confirmed clear." : "."}</div>` : ""}
     ${p.status === "awaitingIsolation" ? `<div class="warn-box"><b>Awaiting isolation.</b> Certificate <span class="mono">${esc(p.isoNo || "")}</span> is assigned to <b>${personHTML(isoDoc?.assignedTo?.name, isoDoc?.assignedTo)}</b> — the permit activates automatically when the isolation is confirmed.</div>` : ""}
-    ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed."}</div>` : ""}
+    ${["active", "extended"].includes(p.status) && !p.workCompletion ? `<div class="warn-box"><b>Awaiting work-completion confirmation.</b> ${isOwner ? "When the job is finished, tap <b>Confirm work complete</b> to confirm the equipment is safe to return to service." : "The requester must confirm the work is complete and the equipment is safe before the permit can be closed." + (isAdmin() ? " If the requester is unavailable, use <b>Force work complete (Admin)</b>." : "")}</div>` : ""}
     ${awaitingDeiso ? `<div class="warn-box"><b>Work complete — awaiting de-isolation.</b> Confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)} · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} <b>Locks are still on.</b> ${deisoReady ? `An Isolator must de-isolate <span class="mono">${esc(p.equipmentTag || "")}</span> on certificate <a href="#" data-isolink3 class="mono">${esc(p.isoNo || p.isolationRef)}</a> before this permit can be closed.` : `<b>This is expected, not a fault.</b> ${esc(p.equipmentTag || "")} is on a <b>shared isolation</b> with ${siblings.length} other permit(s)${siblingsWorking ? ` — <b>${siblingsWorking} still in progress</b>` : ""}. The locks stay ON until every crew confirms work complete. See <b>Other permits on this isolation</b> below.`}</div>` : ""}
     ${["active", "extended"].includes(p.status) && p.workCompletion && deisolated ? `<div class="ok-box"><b>Work complete${p.isolationRef ? " and equipment de-isolated" : ""} — confirmed by ${personHTML(p.workCompletion.name, p.workCompletion)}</b> · ${fmt(p.workCompletion.timestamp)}.${p.workCompletion.remarks ? " " + esc(p.workCompletion.remarks) : ""} The Issuer may now close the permit.</div>` : ""}
 
@@ -2913,7 +2921,7 @@ async function viewPermitDetail(m) {
         ${kv("Valid from", fmt(p.validity?.start))}
         ${kv("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
         ${p.approval ? kv("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
-        ${p.workCompletion ? kv("Work completed", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
+        ${p.workCompletion ? kv(p.workCompletion.forced ? "Work completed (forced by Admin)" : "Work completed", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
         ${p.closure ? kv("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
       </div>
       <div class="card"><h3>Hazard checklist</h3>
@@ -3051,6 +3059,7 @@ async function viewPermitDetail(m) {
     };
   });
   $("#workdone") && ($("#workdone").onclick = () => confirmWorkComplete(p, equip));
+  $("#forcedone") && ($("#forcedone").onclick = () => forceWorkComplete(p));
   $("#close") && ($("#close").onclick = () => closePermit(p, equip));
   /* ---- trial run ---- */
   const tag = esc(p.equipmentTag || equip?.tag || "the equipment");
@@ -3527,6 +3536,43 @@ async function confirmWorkComplete(p, equip) {
       });
       closeModal(); toast(isolated ? "Work complete — equipment can now be de-isolated" : "Work complete — Issuer can now close the permit", "ok"); go("detail", { id: p.id });
     } catch (e) { toast(e.message || "Could not confirm work completion", "err"); }
+  };
+}
+
+// Administrator override of the requester's work-completion sign-off. The record
+// is the same shape as a normal sign-off (so every downstream gate behaves
+// identically) but is stamped `forced` with a mandatory reason, so it can never
+// be mistaken for the requester's own confirmation.
+async function forceWorkComplete(p) {
+  modal({ title: "Force work complete (Admin)", wide: true, body: `
+    <div class="danger-box"><b>Administrator override.</b> You are signing off permit <b class="mono">${esc(p.permitNo)}</b> on <b>${esc(p.equipmentTag || "")}</b> in place of the requester, ${esc(p.requester?.name || "the requester")}. This is recorded against your name and shown on the permit and its print-out.</div>
+    <div class="info-box">This only records that the work is finished. ${p.isolationRef ? "An Isolator must still de-isolate the equipment, and an Issuer must then close the permit." : "An Issuer can then close the permit."}</div>
+    <label class="field"><span>Why can the requester not close this permit? <span class="req">*</span></span><textarea id="fwReason" placeholder="Requester off site / on leave / unreachable since…; who confirmed the work is finished"></textarea></label>
+    <label class="checkline"><input type="checkbox" id="fwAck"> I have confirmed the work under this permit is finished, personnel and tools are clear, and <b>${esc(p.equipmentTag || "the equipment")}</b> is safe to return to service.</label>`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok>Force work complete</button>` });
+  $("[data-c]").onclick = closeModal;
+  $("[data-ok]").onclick = async () => {
+    const reason = $("#fwReason").value.trim();
+    if (reason.length < 10) return toast("Give the reason the requester cannot close this permit", "err");
+    if (!$("#fwAck").checked) return toast("Tick the confirmation statement", "err");
+    try {
+      await lifecycleTx("forced work completion", async (tx) => {
+        const ref = doc(db, "permits", p.id);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) gate("This permit no longer exists.");
+        const cur = snap.data();
+        if (!isAdmin()) gate("Only an Administrator can force work completion.");
+        if (!["active", "extended"].includes(cur.status))
+          gate(`This permit is now ${STATUS_LABEL[cur.status] || cur.status} — work completion was not recorded.`);
+        if (cur.workCompletion) gate("Work completion has already been recorded for this permit.");
+        tx.update(ref, {
+          workCompletion: { by: State.profile.id, name: State.profile.name, ...myMeta(), remarks: reason, safeToReturn: true,
+                            forced: true, forcedReason: reason, timestamp: nowISO() },
+          updatedAt: nowISO()
+        });
+      });
+      closeModal(); toast("Work complete recorded by Administrator", "ok"); go("detail", { id: p.id });
+    } catch (e) { toast(e.message || "Could not force work completion", "err"); }
   };
 }
 
@@ -4320,7 +4366,7 @@ function printPermit(p, equip, iso) {
         ${row("Valid from", fmt(p.validity?.start))}
         ${row("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
         ${p.approval ? row("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
-        ${p.workCompletion ? row("Work completed / safe to return", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
+        ${p.workCompletion ? row(p.workCompletion.forced ? "Work completed / safe to return (FORCED by Admin)" : "Work completed / safe to return", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
         ${p.closure ? row("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp)) : ""}
       </table>
       <div style="margin-top:14px;font-weight:800;color:#2A6F97;font-size:13px">HAZARD CHECKLIST</div>
