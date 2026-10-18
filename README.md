@@ -24,6 +24,7 @@ database (Firestore, with built-in offline cache and auto-sync).
 | Isolation | Separate NRCC-ISO certificates: Issuer assigns → electrician confirms → permits activate; de-isolation confirmed the same way |
 | Safety logic | Shared isolation (multi-crew), last-permit-closes rule, trial-run sub-workflow |
 | Auto-rejection | A permit left undecided past its deadline lapses instead of waiting forever — see below |
+| Admin force-close | When nobody is available, an Admin can ask to force work-complete, de-isolation or closure; an Issuer must approve — see below |
 
 ## The one file you must edit
 
@@ -120,6 +121,44 @@ checklist and PPE across. Dates and gas readings are never copied; they are the
 two things that had gone stale.
 
 Checks live in `tests/auto-reject.mjs`.
+
+## Admin force-close
+
+Sometimes nobody who should finish a permit is available — the requester has
+left, the Isolator is off shift, the Issuer cannot be reached — and the permit
+stays open with the equipment locked out. An **Administrator** can ask to finish
+it, under controls:
+
+- **Three separate steps, in order:** force work-complete → force de-isolation →
+  force close. The permit page offers only the next one.
+- **Waiting period:** nothing is allowed until **10 days** after the permit's
+  last activity (`FORCE_MIN_WAIT_DAYS` in `app.js`; `864000000` ms in
+  `firestore.rules` — change both). The clock is fixed when the first request is
+  raised, so the three steps do not each restart it.
+- **Conditions:** a category (person unavailable / emergency / other), a written
+  reason of at least 20 characters, and a safety checklist the Admin must tick
+  (area safe, people out, tools removed, locks and tags verified; for
+  de-isolation also "safe to re-energise").
+- **Second approver:** the request changes nothing by itself. An **Issuer**
+  (never the Admin who asked) reviews it, and approving is what performs the
+  action. Rejecting needs a comment; the Admin can withdraw a pending request.
+- **Shared lockouts:** de-isolation waits for every other crew on the
+  certificate to be work-complete, and is refused while a trial run is in
+  progress.
+- **Notified:** Issuers when it is raised; the permit's original Requester and
+  Issuer at every stage (the notification bell).
+- **Audit:** every request is kept in `forceRequests`, shown on the permit under
+  *Force actions*, and forced records carry a red **FORCED** / **FORCE CLOSED**
+  badge. The register filters *force request waiting* and *force-closed / forced
+  steps* find them.
+
+**Deploy the new `firestore.rules`** — until you do, the permit page still
+opens but force requests are refused. Admin remains the system superuser in the
+rules, so the workflow is a control on the app and the audit trail, not a lock on
+a hand-modified client held by an Admin.
+
+Checks: `tests/force-close.mjs` (logic) and `tests/rules-force-close.mjs`
+(security rules; add it to the emulator command above).
 
 ## Scaling later (designed for it)
 

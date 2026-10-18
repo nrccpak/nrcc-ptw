@@ -832,9 +832,9 @@ onAuthStateChanged(auth, async (user) => {
       State.profile = profile;
       // Start the listeners BEFORE the first render so the views can be served
       // from memory, and before Notify — which subscribes to them.
-      Store.start(["permits", "isolations", "equipment"]);
+      Store.start(["permits", "isolations", "equipment", "forceRequests"]);
       // Any collection changing offers the current list view a redraw.
-      ["permits", "isolations", "equipment"].forEach((c) => Store.onChange(c, () => LiveView.ping()));
+      ["permits", "isolations", "equipment", "forceRequests"].forEach((c) => Store.onChange(c, () => LiveView.ping()));
       renderApp();
       Notify.start();          // live in-app assignment alerts
     } else {
@@ -1283,6 +1283,7 @@ const Notify = {
     this._unlockAudio();
     this._watch("permits", (d) => this.permitEvents(d));
     this._watch("isolations", (d) => this.isoEvents(d));
+    this._watch("forceRequests", (d) => this.forceEvents(d));
     // Overdue is time-based (no doc change), so re-check on a light timer.
     this._timer = setInterval(() => this._recheckOverdue(), 5 * 60 * 1000);
     this.badge();
@@ -1406,6 +1407,26 @@ const Notify = {
     if (i.status === "removed" && ids.length && (role === "issuer" || role === "admin") && i.removalConfirmedBy?.uid !== me) {
       const dest = ids.length === 1 ? { view: "detail", params: { id: ids[0] } } : { view: "isodetail", params: { id: i.id } };
       out.push({ sig: `i:${i.id}:removed:${i.removedAt || ""}`, text: `De-isolation complete on ${tag} (${no}) — permit${ids.length > 1 ? "s" : ""} can now be closed.`, ...dest });
+    }
+    return out;
+  },
+
+  // Admin force-close. The Issuers who must decide it are told when it is
+  // raised; the permit's own Requester and original Issuer are told at every
+  // stage, since it is their permit being finished without them.
+  forceEvents(r) {
+    const me = State.profile?.id, role = State.profile?.role;
+    const no = r.permitNo || r.permitId, act = FORCE_ACTIONS[r.action]?.noun || "force action";
+    const to = { view: "detail", params: { id: r.permitId } };
+    const involved = me === r.permitRequesterUid || me === r.permitIssuerUid;
+    const out = [];
+    if (r.status === "pending") {
+      if (role === "issuer" && me !== r.requestedBy?.uid)
+        out.push({ sig: `f:${r.id}:pending`, text: `Administrator ${r.requestedBy?.name || ""} asks to ${act} on ${no} — your approval is needed.`, ...to });
+      else if (involved && me !== r.requestedBy?.uid)
+        out.push({ sig: `f:${r.id}:pending`, text: `Administrator ${r.requestedBy?.name || ""} has asked to ${act} on your permit ${no}. An Issuer must approve it.`, ...to });
+    } else if ((r.status === "approved" || r.status === "rejected") && (involved || me === r.requestedBy?.uid) && me !== r.decision?.by) {
+      out.push({ sig: `f:${r.id}:${r.status}`, text: `Request to ${act} on ${no} was ${r.status} by ${r.decision?.name || "an Issuer"}.${r.decision?.comment ? " " + r.decision.comment : ""}`, ...to });
     }
     return out;
   },
@@ -1997,6 +2018,13 @@ async function viewDashboard(m) {
   if (myConsent.length) html += `<div class="warn-box" id="trialConsentBanner" style="cursor:pointer">
     <b>${myConsent.length} trial run(s) are waiting on your crew to clear.</b> Open the permit and confirm your people are clear of the equipment, or refuse.</div>`;
 
+  // Force-close requests wait on an Issuer; everyone who can see the plant sees
+  // that one is open, but only an Issuer is asked to act.
+  const forceOpen = plantWide ? permits.filter((p) => p.forcePending) : [];
+  if (forceOpen.length) html += `<div class="danger-box" id="forceBanner" style="cursor:pointer">
+    <b>${forceOpen.length} force-close request(s) waiting</b> — ${esc(forceOpen.map((p) => p.permitNo).join(", "))}.
+    ${State.profile.role === "issuer" ? "An Administrator has asked to finish these permits without their crews. Review and decide." : "Waiting for an Issuer's decision."}</div>`;
+
   if (overdue.length) html += `<div class="danger-box" id="overdueBanner" style="cursor:pointer"><b>${overdue.length} permit(s) overdue</b> — the planned end has passed. ${isSafety ? "An Issuer must extend or close them." : "Review and extend or close them."}</div>`;
 
   const tasks = isoAll.filter((i) =>
@@ -2067,6 +2095,7 @@ async function viewDashboard(m) {
     t.onclick = nav;
     t.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nav(); } };
   });
+  const fb = $("#forceBanner"); if (fb) fb.onclick = () => go("permits", { status: "forcePending" });
   const ob = $("#overdueBanner"); if (ob) ob.onclick = () => go("permits", { status: "overdue" });
   const tb = $("#trialBanner"); if (tb) tb.onclick = () => go("equipment", { status: "trialRun" });
   const cb = $("#trialConsentBanner"); if (cb) cb.onclick = () => go("permits", { mine: true, status: "activeAll" });
@@ -2134,7 +2163,9 @@ async function viewPermits(m) {
         <option value="awaitingRequester">awaiting requester</option>
         ${["draft", "submitted", "awaitingIsolation", "active", "extended", "closed", "rejected"].map((s) => `<option>${s}</option>`).join("")}
         <option value="overdue">overdue</option>
-        <option value="autoRejected">auto-rejected</option></select>
+        <option value="autoRejected">auto-rejected</option>
+        <option value="forcePending">force request waiting</option>
+        <option value="forced">force-closed / forced steps</option></select>
       <select id="fDept"><option value="">All departments</option></select>
       <label class="mine-toggle"><input type="checkbox" id="fMine"> My permits</label>
     </div>
@@ -2168,6 +2199,8 @@ async function viewPermits(m) {
         // Not a stage: it spans a draft (never submitted) and a live permit
         // whose crew has not signed off, which is a status the stages do not
         // reach. Useful to an Issuer too — it answers "who has not signed off?"
+        : fs === "forcePending" ? !!p.forcePending
+        : fs === "forced" ? !!(p.closure?.forced || p.workCompletion?.forced)
         : fs === "awaitingRequester" ? awaitsRequester(p)
         : fs.startsWith("stage:") ? permitStage(p, isoMap) === fs.slice(6)
         : fs === "activeAll" ? ["active", "extended"].includes(p.status) : p.status === fs)) &&
@@ -2180,7 +2213,7 @@ async function viewPermits(m) {
         <td><span class="mono">${esc(p.permitNo)}</span></td>
         <td><span class="type-pill"><span class="dot" style="background:${TYPE_DOT[p.type]}"></span>${esc(p.typeName)}</span></td>
         <td>${esc(p.equipmentTag)}</td><td>${esc(p.requestingDepartment?.department || "—")}</td>
-        <td>${badge(p.status)}${stageChip(permitStage(p, isoMap))}${isOverdue(p) ? " " + overdueChip() : ""}${autoRejectChip(autoRejectState(p, isoMap, arPol))}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
+        <td>${badge(p.status)}${stageChip(permitStage(p, isoMap))}${isOverdue(p) ? " " + overdueChip() : ""}${autoRejectChip(autoRejectState(p, isoMap, arPol))}${forceChip(p)}${p.forcePending ? ` <span class="chip chip-force">FORCE REQUEST</span>` : ""}</td><td>${esc(p.requester?.name)}</td><td>${fmtDate(p.createdAt)}</td></tr>`).join("")
       || `<tr><td colspan="7" class="empty">No permits match.</td></tr>`}</tbody></table>`;
     bindPermitRows();
   };
@@ -2752,11 +2785,16 @@ async function viewPermitDetail(m) {
   // Equipment, certificate and the sibling-permit list all hang off the permit
   // we just loaded but not off each other, so fetch them concurrently rather
   // than paying a separate round trip for each.
-  const [eqSnap, isoSnap, sharedPermits] = await Promise.all([
+  const [eqSnap, isoSnap, sharedPermits, forceAll] = await Promise.all([
     getDoc(doc(db, "equipment", p.equipmentRef)).catch(() => null),
     p.isolationRef ? getDoc(doc(db, "isolations", p.isolationRef)).catch(() => null) : null,
-    p.isolationRef ? fetchPermits() : null
+    p.isolationRef ? fetchPermits() : null,
+    // Older deployments may not have the rules for this collection yet; the
+    // permit page must still open.
+    fetchAll("forceRequests").catch(() => [])
   ]);
+  const forceReqs = forceAll.filter((r) => r.permitId === id).sort((a, b) => (b.requestedAt || "").localeCompare(a.requestedAt || ""));
+  const forcePend = p.forcePending ? forceReqs.find((r) => r.id === p.forcePending.requestId) || null : null;
   const equip = eqSnap && eqSnap.exists() ? { id: eqSnap.id, ...eqSnap.data() } : null;
   const isoDoc = isoSnap && isoSnap.exists() ? { id: isoSnap.id, ...isoSnap.data() } : null;
   // Trial-run state comes off the CERTIFICATE, so every crew sharing the
@@ -2845,6 +2883,18 @@ async function viewPermitDetail(m) {
     if (!(p.workCompletion && deisolated)) actions += `<button class="btn btn-ghost" id="extend">Extend</button>`;
     if (p.workCompletion && deisolated) actions += `<button class="btn btn-primary" id="close">Close permit</button>`;
   }
+  // Admin force-close: only the NEXT step of the hand-back is offered, and not
+  // while a request is already waiting. Whether it may proceed yet (waiting
+  // period, other crews) is explained inside the dialog, not by hiding the
+  // button — an Admin who cannot see the option cannot learn why it is closed.
+  const iAmAdmin = isAdmin();
+  const forceNext = !["active", "extended"].includes(p.status) || p.forcePending ? null
+    : !p.workCompletion ? "workComplete" : !deisolated ? "deisolate" : "close";
+  if (iAmAdmin && forceNext) actions += `<button class="btn btn-danger" id="forceGo" data-fa="${forceNext}">${esc(FORCE_ACTIONS[forceNext].label)}</button>`;
+  if (forcePend && State.profile.role === "issuer" && forcePend.requestedBy?.uid !== State.profile.id)
+    actions += `<button class="btn btn-danger" id="forceDecide">Review force request</button>`;
+  if (forcePend && iAmAdmin && forcePend.requestedBy?.uid === State.profile.id)
+    actions += `<button class="btn btn-ghost" id="forceWithdraw">Withdraw force request</button>`;
   // Trial run. Each role sees only its own step: the crew asks, the other crews
   // clear, the Issuer authorises, the Isolator takes the locks out and puts
   // them back. Nobody is offered someone else's step.
@@ -2870,8 +2920,17 @@ async function viewPermitDetail(m) {
 
   $("#pd").innerHTML = `
     <div class="page-head"><div><div class="kick">Permit · ${esc(p.typeName)}</div>
-      <h2 style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}${trialChip(isoDoc)}${autoRejectChip(arState)}</h2></div>
+      <h2 style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap"><span class="mono" style="font-size:1.1rem">${esc(p.permitNo)}</span> ${badge(p.status)}${trialChip(isoDoc)}${autoRejectChip(arState)}${forceChip(p, isoDoc)}</h2></div>
       <div class="actions">${actions}</div></div>
+
+    ${forcePend ? `<div class="danger-box"><b>Force request waiting — ${esc(FORCE_ACTIONS[forcePend.action]?.label || forcePend.action)}.</b>
+      Raised by Administrator ${personHTML(forcePend.requestedBy?.name, forcePend.requestedBy)} · ${fmt(forcePend.requestedAt)}.
+      <div style="margin-top:.35rem"><b>${esc(FORCE_CATEGORIES[forcePend.category] || forcePend.category)}:</b> ${esc(forcePend.reason)}</div>
+      <div style="margin-top:.35rem">Nothing has changed yet. ${State.profile.role === "issuer" && forcePend.requestedBy?.uid !== State.profile.id
+        ? "An Issuer's approval is what carries it out — use <b>Review force request</b>."
+        : "An Issuer other than the Administrator must approve it before anything happens."}</div></div>` : ""}
+    ${p.closure?.forced ? `<div class="danger-box"><b>Force closed.</b> This permit was closed by an Administrator override, not by its Requester and Issuer.
+      <div style="margin-top:.35rem">${forcedByText(p.closure.forced)} · ${fmt(p.closure.timestamp)}</div></div>` : ""}
 
     ${p.rejection ? `<div class="danger-box"><b>Rejected.</b> ${esc(p.rejection.reason || "")} <span style="color:var(--muted)">— ${personHTML(p.rejection.byName, p.rejection)}, ${fmt(p.rejection.timestamp)}</span></div>` : ""}
     ${arDead || p.status === "expired" ? `<div class="danger-box"><b>Auto-rejected.</b> This permit was never approved — ${esc(AUTO_REJECT_RULE[arState?.rule || p.autoReject?.rule] || "it ran out of time")}${arState ? ` (${esc(fmt(new Date(arState.at).toISOString()))})` : p.autoReject?.at ? ` (${esc(fmt(p.autoReject.at))})` : ""}.
@@ -2913,8 +2972,8 @@ async function viewPermitDetail(m) {
         ${kv("Valid from", fmt(p.validity?.start))}
         ${kv("Valid to", p.validity?.openEnded ? "Open (while active)" : fmt(p.validity?.extendedTo || p.validity?.plannedEnd))}
         ${p.approval ? kv("Approved by", personHTML(p.approval.issuerName, p.approval) + " · " + fmt(p.approval.timestamp)) : ""}
-        ${p.workCompletion ? kv("Work completed", personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
-        ${p.closure ? kv("Closed by", personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
+        ${p.workCompletion ? kv("Work completed", (p.workCompletion.forced ? `<span class="chip chip-force">FORCED</span> ` : "") + personHTML(p.workCompletion.name, p.workCompletion) + " · " + fmt(p.workCompletion.timestamp) + (p.workCompletion.remarks ? " · " + esc(p.workCompletion.remarks) : "")) : ""}
+        ${p.closure ? kv("Closed by", (p.closure.forced ? `<span class="chip chip-force">FORCED</span> ` : "") + personHTML(p.closure.name, p.closure) + " · " + fmt(p.closure.timestamp) + (p.closure.remarks ? " · " + esc(p.closure.remarks) : "")) : ""}
       </div>
       <div class="card"><h3>Hazard checklist</h3>
         ${(() => { const u = (p.checklist || []).filter((c) => !c.checked).length;
@@ -2943,6 +3002,15 @@ async function viewPermitDetail(m) {
           <td>${esc(s.requester?.name || "—")}</td>
           <td>${badge(s.status)}${isOverdue(s) ? " " + overdueChip() : ""}</td>
           <td>${workChip(s)}</td></tr>`).join("")}
+      </tbody></table></div>` : ""}
+
+    ${forceReqs.length ? `<div class="card"><h3>Force actions (${forceReqs.length})</h3>
+      <table class="tbl"><thead><tr><th>Action</th><th>Status</th><th>Raised by</th><th>Reason</th><th>Decision</th></tr></thead><tbody>
+        ${forceReqs.map((r) => `<tr><td>${esc(FORCE_ACTIONS[r.action]?.label || r.action)}</td>
+          <td><span class="chip ${r.status === "approved" ? "chip-force" : ""}">${esc({ pending: "Waiting", approved: "Carried out", rejected: "Rejected", void: "Withdrawn" }[r.status] || r.status)}</span></td>
+          <td>${personHTML(r.requestedBy?.name, r.requestedBy)}<div class="help">${fmt(r.requestedAt)}</div></td>
+          <td><b>${esc(FORCE_CATEGORIES[r.category] || r.category)}:</b> ${esc(r.reason)}</td>
+          <td>${r.decision ? personHTML(r.decision.name, r.decision) + `<div class="help">${fmt(r.decision.at)}${r.decision.comment ? " · " + esc(r.decision.comment) : ""}</div>` : "—"}</td></tr>`).join("")}
       </tbody></table></div>` : ""}
 
     ${trialHistoryHTML(isoDoc, p)}
@@ -3051,6 +3119,14 @@ async function viewPermitDetail(m) {
     };
   });
   $("#workdone") && ($("#workdone").onclick = () => confirmWorkComplete(p, equip));
+  $("#forceGo") && ($("#forceGo").onclick = () => forceDialog(p, isoDoc, onCert, $("#forceGo").dataset.fa));
+  $("#forceDecide") && ($("#forceDecide").onclick = () => forceDecideDialog(forcePend, p, crewIds));
+  $("#forceWithdraw") && ($("#forceWithdraw").onclick = () => confirmBoxHTML("Withdraw force request",
+    `<p>Withdraw the request to <b>${esc(FORCE_ACTIONS[forcePend.action]?.noun || "force")}</b> on <b>${esc(p.permitNo)}</b>? Nothing has been changed on the permit.</p>`,
+    "Withdraw request", async () => {
+      await forceWithdraw({ requestId: forcePend.id });
+      closeModal(); toast("Force request withdrawn"); go("detail", { id });
+    }));
   $("#close") && ($("#close").onclick = () => closePermit(p, equip));
   /* ---- trial run ---- */
   const tag = esc(p.equipmentTag || equip?.tag || "the equipment");
@@ -3844,6 +3920,292 @@ const trialEnergise   = (o) => lifecycleTx("trial run de-isolation", (tx) => txT
 const trialComplete   = (o) => lifecycleTx("trial run sign-off", (tx) => txTrialComplete(tx, { ...o, actor: actorStamp(), at: nowISO() }));
 const trialReIsolate  = (o) => lifecycleTx("re-isolation",        (tx) => txTrialReIsolate(tx, { ...o, actor: actorStamp(), at: nowISO() }));
 
+/* ---------- Admin force-close ----------
+   Sometimes nobody who should finish a permit is available: the requester has
+   left, the Isolator is off shift, the Issuer cannot be reached. Without a way
+   out the permit stays open and the equipment stays locked out indefinitely.
+   This is that way out — and because it overrides the people who normally sign
+   each step, it is deliberately slow and doubly signed:
+
+     - ONLY an Admin can ask, and only for the NEXT step of the hand-back:
+       work complete → de-isolation → close. Each is its own request.
+     - Nothing is allowed until FORCE_MIN_WAIT_DAYS after the permit's last
+       activity. The clock is anchored when the first request is raised and
+       carried on the permit, so the three steps do not each restart it.
+     - A reason, a category and a safety checklist are mandatory.
+     - A DIFFERENT person, holding the Issuer role, must approve. The approval
+       is what performs the action; the Admin's request alone changes nothing.
+     - The Requester and the permit's original Issuer are told at every stage
+       (see Notify.forceEvents), and everything is kept on forceRequests/{id}.
+
+   Every precondition is re-read inside the transaction (see lifecycleTx), and
+   the cores take `actor` and `nowMs` as arguments rather than reading State or
+   the clock, so tests/force-close.mjs can drive the shipped code directly. */
+const FORCE_MIN_WAIT_DAYS = 10;
+const FORCE_REASON_MIN = 20;
+const FORCE_ACTIONS = {
+  workComplete: { label: "Force work complete", noun: "force work-complete" },
+  deisolate: { label: "Force de-isolation", noun: "force de-isolation" },
+  close: { label: "Force close permit", noun: "force closure" }
+};
+const FORCE_CATEGORIES = {
+  unavailable: "Person unavailable / off shift",
+  emergency: "Emergency",
+  other: "Other"
+};
+const FORCE_CHECKS = [
+  "Work area inspected and confirmed safe",
+  "All personnel accounted for and out of the area",
+  "Tools and materials removed",
+  "All locks and tags verified removed or accounted for"
+];
+const FORCE_CHECK_DEISO = "Equipment confirmed safe to re-energise";
+function forceChecklist(action) {
+  return action === "deisolate" ? [...FORCE_CHECKS, FORCE_CHECK_DEISO] : FORCE_CHECKS.slice();
+}
+
+// The latest timestamp that shows someone touched this permit or its lockout.
+function forceLastActivity(p, iso) {
+  const stamps = [p?.updatedAt, p?.createdAt, p?.submittedAt, p?.approval?.timestamp, p?.workCompletion?.timestamp,
+    iso?.assignedAt, iso?.confirmedAt, iso?.removalAssignedAt,
+    iso?.trialRun?.requestedAt, iso?.trialRun?.deisolatedAt, iso?.trialRun?.reIsolatedAt, iso?.trialRun?.completedAt]
+    .map((s) => Date.parse(s)).filter((n) => !isNaN(n));
+  return stamps.length ? Math.max(...stamps) : null;
+}
+// Once a first request has fixed the anchor it stays fixed: a forced step
+// writes the permit, which would otherwise count as fresh activity.
+function forceAnchorMs(p, iso) {
+  const a = p?.force?.anchorMs;
+  return typeof a === "number" && isFinite(a) ? a : forceLastActivity(p, iso);
+}
+function forceWait(p, iso, nowMs) {
+  const a = forceAnchorMs(p, iso);
+  // No timestamp at all means the waiting period cannot be shown to have passed.
+  if (a == null) return { ok: false, anchorMs: null, readyAt: null, msLeft: null };
+  const readyAt = a + FORCE_MIN_WAIT_DAYS * 86400000;
+  return { ok: nowMs >= readyAt, anchorMs: a, readyAt, msLeft: Math.max(0, readyAt - nowMs) };
+}
+
+// Why this force action cannot be raised (or executed) right now, or null.
+// `permits` is every permit on the certificate; `iso` carries its id.
+function forceGate(action, p, iso, permits, nowMs, { ignorePending = false } = {}) {
+  if (!FORCE_ACTIONS[action]) return "Unrecognised force action.";
+  if (!["active", "extended"].includes(p.status))
+    return `This permit is now ${STATUS_LABEL[p.status] || p.status} — only an active or extended permit can be forced.`;
+  if (p.forcePending && !ignorePending) return "A force request is already waiting for an Issuer's decision on this permit.";
+  const w = forceWait(p, iso, nowMs);
+  if (!w.ok) return w.readyAt == null
+    ? "This permit has no recorded activity date, so the waiting period cannot be shown to have passed."
+    : `Too soon — force actions open ${FORCE_MIN_WAIT_DAYS} days after the permit's last activity (${Math.ceil(w.msLeft / 86400000)} more day(s)).`;
+  if (action === "workComplete") return p.workCompletion ? "Work completion is already on record for this permit." : null;
+  if (!p.workCompletion) return "Work must be marked complete first — force work-complete before this step.";
+  if (action === "deisolate") {
+    if (!p.isolationRef || !iso) return "This permit has no isolation to remove.";
+    if (iso.status === "removed") return "The equipment has already been de-isolated.";
+    const hold = handbackHold(iso, "de-isolating");
+    if (hold) return hold;
+    if (!["active", "removalPending"].includes(iso.status))
+      return `The isolation certificate is ${STATUS_LABEL[iso.status] || iso.status} — it cannot be de-isolated from here.`;
+    if (iso.status === "active" && !isoReadyForDeiso(iso, permits))
+      return "Other permits on this lockout are not work-complete yet — force-complete or close those first.";
+    return null;
+  }
+  // close
+  if (iso && iso.status === "trialRun") return "Re-isolate after the trial run before closing.";
+  if (p.isolationRef && iso && iso.status !== "removed") return "De-isolate the equipment first (force de-isolation if no Isolator is available).";
+  return null;
+}
+
+// Admin raises the request. Nothing about the permit's state changes — it is
+// only flagged as having a request waiting, so there can be just one at a time.
+async function txForceRequest(tx, o) {
+  const pRef = doc(db, "permits", o.permitId);
+  const pSnap = await tx.get(pRef);
+  if (!pSnap.exists()) gate("This permit no longer exists.");
+  const p = pSnap.data();
+  let iso = null, crew = [];
+  if (p.isolationRef) {
+    const iSnap = await tx.get(doc(db, "isolations", p.isolationRef));
+    if (iSnap.exists()) {
+      iso = { id: p.isolationRef, ...iSnap.data() };
+      crew = await txReadCrew(tx, iso.id, iso, o.knownIds);
+    }
+  }
+  if (o.actor?.role !== "admin") gate("Only an Administrator can request a force action.");
+  if (!FORCE_CATEGORIES[o.category]) gate("Choose a reason category.");
+  const reason = String(o.reason || "").trim();
+  if (reason.length < FORCE_REASON_MIN) gate(`Give a written reason of at least ${FORCE_REASON_MIN} characters.`);
+  const need = forceChecklist(o.action);
+  if (!need.every((c) => (o.checks || []).includes(c))) gate("Every item on the safety checklist must be confirmed.");
+  const block = forceGate(o.action, p, iso, crew, o.nowMs);
+  if (block) gate(block);
+  const anchorMs = forceWait(p, iso, o.nowMs).anchorMs;
+  tx.set(doc(db, "forceRequests", o.id), {
+    permitId: o.permitId, permitNo: p.permitNo || null, equipmentTag: p.equipmentTag || null,
+    action: o.action, category: o.category, reason, checks: need,
+    status: "pending", prevStatus: p.status, isolationRef: p.isolationRef || null,
+    anchorMs,
+    permitRequesterUid: p.requester?.uid || null, permitRequesterName: p.requester?.name || null,
+    permitIssuerUid: p.approval?.issuerUid || null, permitIssuerName: p.approval?.issuerName || null,
+    requestedBy: o.actor, requestedAt: o.at, decision: null
+  });
+  tx.update(pRef, {
+    forcePending: { requestId: o.id, action: o.action, at: o.at },
+    // Only fixed once: the first request in a chain decides when the clock started.
+    ...(typeof p.force?.anchorMs === "number" ? {} : { "force.anchorMs": anchorMs })
+  });
+}
+
+// The Issuer decides. Approving is the act that performs the force action.
+async function txForceDecide(tx, o) {
+  const rRef = doc(db, "forceRequests", o.requestId);
+  const rSnap = await tx.get(rRef);
+  if (!rSnap.exists()) gate("This request no longer exists.");
+  const r = rSnap.data();
+  const pRef = doc(db, "permits", r.permitId);
+  const pSnap = await tx.get(pRef);
+  if (!pSnap.exists()) gate("This permit no longer exists.");
+  const p = pSnap.data();
+  let iso = null, crew = [], eqSnap = null, isoRef = null, eqRef = null;
+  if (p.isolationRef) {
+    isoRef = doc(db, "isolations", p.isolationRef);
+    const iSnap = await tx.get(isoRef);
+    if (iSnap.exists()) {
+      iso = { id: p.isolationRef, ...iSnap.data() };
+      crew = await txReadCrew(tx, iso.id, iso, o.knownIds);
+      if (r.action === "deisolate" && p.equipmentRef) {
+        eqRef = doc(db, "equipment", p.equipmentRef);
+        eqSnap = await tx.get(eqRef);
+      }
+    }
+  }
+  if (!["approve", "reject"].includes(o.decision)) gate("Unrecognised decision — nothing was recorded.");
+  if (o.actor?.role !== "issuer") gate("Only an Issuer can decide a force request.");
+  if (o.actor.uid === r.requestedBy?.uid) gate("You cannot decide your own request.");
+  if (r.status !== "pending") gate(`This request is already ${r.status}.`);
+  if (p.forcePending?.requestId !== o.requestId) gate("This is no longer the pending request for the permit.");
+  const comment = String(o.comment || "").trim();
+  if (o.decision === "reject" && !comment) gate("Give a reason for rejecting the request.");
+  const decision = { by: o.actor.uid, name: o.actor.name, role: o.actor.role, jobTitle: o.actor.jobTitle || "",
+    department: o.actor.department || "", employeeNumber: o.actor.employeeNumber || "", comment, at: o.at };
+
+  if (o.decision === "reject") {
+    tx.update(rRef, { status: "rejected", decision });
+    tx.update(pRef, { forcePending: null });
+    return;
+  }
+  // The world may have moved since the request was raised: re-run every gate,
+  // except the "one at a time" flag, which is this request itself.
+  const block = forceGate(r.action, p, iso, crew, o.nowMs, { ignorePending: true });
+  if (block) gate(`${block} The request was not carried out — reject it, or ask the Administrator to withdraw it.`);
+  if (o.nowMs < (r.anchorMs ?? Infinity) + FORCE_MIN_WAIT_DAYS * 86400000)
+    gate(`Too soon — the ${FORCE_MIN_WAIT_DAYS}-day waiting period has not passed.`);
+
+  const forced = { requestId: o.requestId, action: r.action, category: r.category, reason: r.reason,
+    requestedBy: r.requestedBy, approvedBy: decision, at: o.at };
+  const admin = r.requestedBy;
+  const note = `FORCED by Administrator ${admin.name} (approved by Issuer ${decision.name}) — ${r.reason}`;
+  if (r.action === "workComplete") {
+    tx.update(pRef, { forcePending: null, updatedAt: o.at,
+      workCompletion: { ...admin, by: admin.uid, remarks: note, safeToReturn: true, timestamp: o.at, forced } });
+  } else if (r.action === "deisolate") {
+    tx.update(isoRef, { status: "removed", removedAt: o.at, removalConfirmedBy: admin, removalNote: note, forced });
+    if (eqSnap && eqSnap.exists() && eqSnap.data().activeIsolationId === iso.id)
+      tx.update(eqRef, { isolationStatus: "available", activeIsolationId: null, updatedAt: o.at });
+    tx.update(pRef, { forcePending: null, updatedAt: o.at });
+  } else {
+    tx.update(pRef, { forcePending: null, updatedAt: o.at, status: "closed",
+      closure: { ...admin, by: admin.uid, remarks: note, timestamp: o.at, forced } });
+  }
+  tx.update(rRef, { status: "approved", decision, executedAt: o.at });
+}
+
+// The Admin takes their own request back.
+async function txForceWithdraw(tx, o) {
+  const rRef = doc(db, "forceRequests", o.requestId);
+  const rSnap = await tx.get(rRef);
+  if (!rSnap.exists()) gate("This request no longer exists.");
+  const r = rSnap.data();
+  const pRef = doc(db, "permits", r.permitId);
+  const pSnap = await tx.get(pRef);
+  if (o.actor?.uid !== r.requestedBy?.uid) gate("Only the Administrator who raised the request can withdraw it.");
+  if (r.status !== "pending") gate(`This request is already ${r.status}.`);
+  tx.update(rRef, { status: "void" });
+  if (pSnap.exists() && pSnap.data().forcePending?.requestId === o.requestId) tx.update(pRef, { forcePending: null });
+}
+
+const forceRequest  = (o) => lifecycleTx("force request", (tx) => txForceRequest(tx, { ...o, id: uid(), actor: actorStamp(), at: nowISO(), nowMs: Date.now() }));
+const forceDecide   = (o) => lifecycleTx("force decision", (tx) => txForceDecide(tx, { ...o, actor: actorStamp(), at: nowISO(), nowMs: Date.now() }));
+const forceWithdraw = (o) => lifecycleTx("force withdrawal", (tx) => txForceWithdraw(tx, { ...o, actor: actorStamp() }));
+
+// What each forced record looks like on screen.
+function forceChip(p, iso) {
+  if (p?.closure?.forced) return `<span class="chip chip-force" title="Closed by an Administrator override, approved by an Issuer">FORCE CLOSED</span>`;
+  if (p?.workCompletion?.forced || iso?.forced) return `<span class="chip chip-force" title="A step was completed by an Administrator override">FORCED STEP</span>`;
+  return "";
+}
+function forcedByText(f) {
+  return f ? `Admin ${esc(f.requestedBy?.name || "")} · approved by Issuer ${esc(f.approvedBy?.name || "")} · ${esc(f.reason || "")}` : "";
+}
+
+// Admin: raise a force request for the next hand-back step.
+function forceDialog(p, iso, crew, action) {
+  const info = FORCE_ACTIONS[action];
+  const block = forceGate(action, p, iso, crew, Date.now());
+  const checks = forceChecklist(action);
+  const tag = esc(p.equipmentTag || "the equipment");
+  const effect = {
+    workComplete: `Records work as complete on <b>${esc(p.permitNo)}</b> although the requester has not.`,
+    deisolate: `Records the locks on <b>${tag}</b> as removed and returns it to <b>Available</b>. Nobody is sent to remove them — they must already be off.`,
+    close: `Closes <b>${esc(p.permitNo)}</b> without its Requester or Issuer.`
+  }[action];
+  modal({ title: info.label, wide: true, body: `
+    <div class="danger-box"><b>This overrides the people who normally sign this step.</b> ${effect}</div>
+    <div class="info-box">It does not happen when you submit. An <b>Issuer</b> (not you) must review and approve it, and the Requester and original Issuer are told. Nothing is allowed until ${FORCE_MIN_WAIT_DAYS} days after the permit's last activity.</div>
+    ${block ? `<div class="warn-box"><b>Not possible yet.</b> ${esc(block)}</div>` : ""}
+    <label class="field"><span>Reason category <span class="req">*</span></span>
+      <select id="fcCat"><option value="">Select…</option>${Object.entries(FORCE_CATEGORIES).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("")}</select></label>
+    <label class="field"><span>Written reason <span class="req">*</span></span>
+      <textarea id="fcWhy" placeholder="Who is unavailable, what was tried, why this cannot wait (min ${FORCE_REASON_MIN} characters)"></textarea></label>
+    <div class="section-title">Safety checklist — tick every item</div>
+    ${checks.map((c, i) => `<label class="checkline"><input type="checkbox" data-fck="${i}"> ${esc(c)}</label>`).join("")}`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-danger" data-ok ${block ? "disabled" : ""}>Send for Issuer approval</button>` });
+  $("[data-c]").onclick = closeModal;
+  $("[data-ok]").onclick = async () => {
+    const category = $("#fcCat").value, reason = $("#fcWhy").value.trim();
+    if (!category) return toast("Choose a reason category", "err");
+    if (reason.length < FORCE_REASON_MIN) return toast(`Give a written reason of at least ${FORCE_REASON_MIN} characters`, "err");
+    if (!checks.every((_, i) => $(`[data-fck="${i}"]`).checked)) return toast("Tick every item on the safety checklist", "err");
+    try {
+      await forceRequest({ permitId: p.id, action, category, reason, checks, knownIds: crew.map((x) => x.id) });
+      closeModal(); toast("Sent to the Issuers for approval — nothing has changed yet", "ok"); go("detail", { id: p.id });
+    } catch (e) { toast(e.message || "Could not send the request", "err"); }
+  };
+}
+
+// Issuer: approve (which carries it out) or reject.
+function forceDecideDialog(r, p, knownIds) {
+  const info = FORCE_ACTIONS[r.action];
+  modal({ title: "Review force request", wide: true, body: `
+    <div class="danger-box"><b>${esc(info?.label || r.action)}</b> on <span class="mono">${esc(p.permitNo)}</span> · ${esc(p.equipmentTag || "")}.
+      Approving <b>carries it out immediately</b>.</div>
+    <div class="info-box">Raised by Administrator ${personHTML(r.requestedBy?.name, r.requestedBy)} · ${fmt(r.requestedAt)}.
+      <div style="margin-top:.35rem"><b>${esc(FORCE_CATEGORIES[r.category] || r.category)}:</b> ${esc(r.reason)}</div></div>
+    <div class="section-title">Confirmed by the Administrator</div>
+    ${(r.checks || []).map((c) => `<div class="checkline">☑ ${esc(c)}</div>`).join("")}
+    <label class="field" style="margin-top:.8rem"><span>Your comment (required to reject)</span><textarea id="fdCom"></textarea></label>`,
+    footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn btn-ghost" data-rej>Reject</button><button class="btn btn-danger" data-ok>Approve &amp; carry out</button>` });
+  $("[data-c]").onclick = closeModal;
+  const decide = async (decision) => {
+    try {
+      await forceDecide({ requestId: r.id, decision, comment: $("#fdCom").value.trim(), knownIds });
+      closeModal(); toast(decision === "approve" ? "Approved and carried out" : "Request rejected", "ok"); go("detail", { id: p.id });
+    } catch (e) { toast(e.message || "Could not record the decision", "err"); }
+  };
+  $("[data-rej]").onclick = () => decide("reject");
+  $("[data-ok]").onclick = () => decide("approve");
+}
+
 // HTML-body confirm variant
 function confirmBoxHTML(title, bodyHtml, okLabel, onOk, danger = false) {
   modal({ title, body: bodyHtml, footer: `<button class="btn btn-ghost" data-c>Cancel</button><button class="btn ${danger ? "btn-danger" : "btn-primary"}" data-ok>${esc(okLabel)}</button>` });
@@ -4494,7 +4856,8 @@ async function viewIsolationDetail(m) {
         ${kv("Assigned to", iso.assignedTo ? personHTML(iso.assignedTo.name, iso.assignedTo) + " · " + fmt(iso.assignedAt) : "—")}
         ${kv("Isolation confirmed", iso.confirmedBy ? personHTML(iso.confirmedBy.name, iso.confirmedBy) + " · " + fmt(iso.confirmedAt) : "—")}
         ${iso.removalAssignedTo ? kv("De-isolation assigned", personHTML(iso.removalAssignedTo.name, iso.removalAssignedTo) + " · " + fmt(iso.removalAssignedAt)) : ""}
-        ${kv("De-isolation confirmed", iso.removalConfirmedBy ? personHTML(iso.removalConfirmedBy.name, iso.removalConfirmedBy) + " · " + fmt(iso.removedAt) : "—")}
+        ${kv("De-isolation confirmed", (iso.forced ? `<span class="chip chip-force">FORCED</span> ` : "") + (iso.removalConfirmedBy ? personHTML(iso.removalConfirmedBy.name, iso.removalConfirmedBy) + " · " + fmt(iso.removedAt) : "—"))}
+        ${iso.forced ? kv("Forced by", forcedByText(iso.forced)) : ""}
       </div>
       <div class="card"><h3>Attached permits</h3>
         <div class="attached-list">${attached.map((p) => `<div class="a" data-pl="${p.id}" style="cursor:pointer"><span class="mono">${esc(p.permitNo)}</span> ${esc(p.typeName)} ${badge(p.status)}</div>`).join("") || "<div class='help'>None</div>"}</div>

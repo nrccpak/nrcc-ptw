@@ -258,6 +258,58 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // ---- force requests (Admin force-close, second Issuer approves) ----
+    // The Admin raises a request; an Issuer — never the same person — decides
+    // it, and the app performs the action in that same transaction. What the
+    // rules guarantee here: who may raise and decide, that the reason and
+    // checklist are present, that the permit is live, and that the waiting
+    // period has passed by SERVER time. The anchor (the permit's last activity)
+    // is carried on the request as milliseconds because rules cannot parse the
+    // ISO strings the rest of the app stores. 864000000 ms = 10 days = the
+    // FORCE_MIN_WAIT_DAYS constant in app.js; change both together.
+    //
+    // Not enforced here: that an Admin cannot write a permit directly. Admin is
+    // the system superuser throughout these rules (canIssue), so the force
+    // workflow is a control on the app and the audit trail, not a lock on a
+    // modified client held by an Admin.
+    match /forceRequests/{id} {
+      allow read: if isActive();
+      allow create: if isActive() && isAdmin()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.requestedBy.uid == request.auth.uid
+        && request.resource.data.get('decision', null) == null
+        && request.resource.data.action in ['workComplete', 'deisolate', 'close']
+        && request.resource.data.category in ['unavailable', 'emergency', 'other']
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() >= 20
+        && request.resource.data.checks is list
+        && request.resource.data.checks.size() >= 4
+        && request.resource.data.anchorMs is number
+        && request.time.toMillis() >= request.resource.data.anchorMs + 864000000
+        && request.resource.data.permitId is string
+        && exists(/databases/$(database)/documents/permits/$(request.resource.data.permitId))
+        && get(/databases/$(database)/documents/permits/$(request.resource.data.permitId)).data.status in ['active', 'extended'];
+      allow update: if isActive() && resource.data.status == 'pending' && (
+        // An Issuer other than the Admin who asked decides it.
+        (isIssuer()
+          && resource.data.requestedBy.uid != request.auth.uid
+          && request.resource.data.status in ['approved', 'rejected']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'decision', 'executedAt'])
+          && request.resource.data.decision.by == request.auth.uid
+          && (request.resource.data.status == 'rejected'
+                ? request.resource.data.decision.comment.size() > 0
+                : request.time.toMillis() >= resource.data.anchorMs + 864000000))
+        ||
+        // The Admin may take their own pending request back.
+        (isAdmin()
+          && resource.data.requestedBy.uid == request.auth.uid
+          && request.resource.data.status == 'void'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+      );
+      // The record is never deleted, by anyone.
+      allow delete: if false;
+    }
+
     // ---- permits ----
     match /permits/{id} {
       allow read: if isActive();

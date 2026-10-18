@@ -368,3 +368,6 @@ table.tbl tr.more-row:focus-visible td{box-shadow:inset 0 0 0 2px var(--steel)}
   #print-area{display:block !important}
 }
 #print-area{display:none}
+
+/* Admin force-close: a step finished by override, not by the people who normally sign it. */
+.chip-force{background:var(--red-soft);border-color:#E9B8B8;color:#9b2c2c;font-weight:700;letter-spacing:.03em}
